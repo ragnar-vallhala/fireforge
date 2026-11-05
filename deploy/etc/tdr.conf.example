@@ -30,6 +30,9 @@ max_disk_mb = 0
 default_job_memory_mb = 1024
 # auto | required | off
 cgroups = auto
+# Run job processes as this unprivileged user (e.g. fireforge-job).
+# Empty = same user as tdrd (development only). See docs/design/phase1.md §11.
+job_user =
 
 [paths]
 state_dir = /var/lib/fireforge

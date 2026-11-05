@@ -437,4 +437,126 @@ BOOST_AUTO_TEST_CASE(cgroups_required_and_off) {
     BOOST_CHECK(!make_linux_supervisor(io, off)->cgroups_enabled());
 }
 
+// ---- run_as -------------------------------------------------------------
+
+namespace {
+
+RunAs current_identity() {
+    RunAs r;
+    r.uid = ::getuid();
+    r.gid = ::getgid();
+    int n = ::getgroups(0, nullptr);
+    BOOST_REQUIRE(n >= 0);
+    r.groups.resize(static_cast<std::size_t>(n));
+    BOOST_REQUIRE(::getgroups(n, r.groups.data()) == n);
+    return r;
+}
+
+// Value of "Key:\t..." in /proc/self/status-like content.
+std::string status_field(const std::string& status, const std::string& key) {
+    std::istringstream in(status);
+    for (std::string line; std::getline(in, line);) {
+        if (line.rfind(key + ":", 0) == 0) {
+            auto v = line.substr(key.size() + 1);
+            auto b = v.find_first_not_of(" \t");
+            return b == std::string::npos ? "" : v.substr(b);
+        }
+    }
+    return "<missing>";
+}
+
+bool have_setid_caps() {
+    auto st = tdr::supervisor::detail::read_file("/proc/self/status").value_or("");
+    std::uint64_t eff = std::strtoull(status_field(st, "CapEff").c_str(), nullptr, 16);
+    return (eff >> 6 & 1) && (eff >> 7 & 1);  // CAP_SETGID=6, CAP_SETUID=7
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(run_as_same_user_hardens) {
+    Fixture f;
+    auto s = f.spec({"sh", "-c", "cat /proc/self/status; echo umask=$(umask)"});
+    s.run_as = current_identity();
+    auto info = f.run(s);
+    BOOST_CHECK(info.kind == ExitKind::kExited);
+    BOOST_CHECK_EQUAL(info.exit_code, 0);
+    auto out = slurp(s.stdout_path);
+    BOOST_CHECK_EQUAL(status_field(out, "NoNewPrivs"), "1");
+    BOOST_CHECK_EQUAL(status_field(out, "CapEff"), "0000000000000000");
+    BOOST_CHECK_EQUAL(status_field(out, "CapPrm"), "0000000000000000");
+    BOOST_CHECK_EQUAL(status_field(out, "CapInh"), "0000000000000000");
+    BOOST_CHECK_EQUAL(status_field(out, "CapAmb"), "0000000000000000");
+    BOOST_CHECK(out.find("umask=0007") != std::string::npos);
+    // Without run_as nothing changes.
+    auto plain = f.spec({"sh", "-c", "cat /proc/self/status"});
+    f.run(plain);
+    BOOST_CHECK_EQUAL(status_field(slurp(plain.stdout_path), "NoNewPrivs"), "0");
+}
+
+BOOST_AUTO_TEST_CASE(run_as_other_user_without_privileges_fails) {
+    if (have_setid_caps() || ::geteuid() == 0) {
+        BOOST_TEST_MESSAGE("skipped: process holds CAP_SETUID/CAP_SETGID");
+        return;
+    }
+    Fixture f;
+    auto s = f.spec({"true"});
+    s.run_as = RunAs{65534, 65534, {65534}};
+    bool called = false;
+    auto r = f.sup->launch(s, [&](const ExitInfo&) { called = true; });
+    BOOST_REQUIRE(!r.has_value());
+    BOOST_TEST_MESSAGE("error: " << r.error());
+    BOOST_CHECK(r.error().find("setgroups") != std::string::npos || r.error().find("setuid") != std::string::npos);
+    BOOST_CHECK(r.error().find("Operation not permitted") != std::string::npos);
+    f.io.restart();
+    f.io.poll();
+    BOOST_CHECK(!called);
+    BOOST_CHECK_EQUAL(f.sup->running_count(), 0u);
+}
+
+// Needs CAP_SETUID + CAP_SETGID (+ CAP_KILL), e.g.
+//   sudo setcap cap_setuid,cap_setgid,cap_kill+ep <test binary>
+//   tools/capped <test binary> -t 'supervisor/run_as*'
+BOOST_AUTO_TEST_CASE(run_as_nobody_with_privileges) {
+    if (!have_setid_caps()) {
+        BOOST_TEST_MESSAGE("skipped: needs CAP_SETUID + CAP_SETGID");
+        return;
+    }
+    Fixture f;
+    auto s = f.spec({"sh", "-c", "id -u; id -g; id -G; cat /proc/self/status"});
+    s.working_dir = "/";  // the temp dir's ancestors are 0700
+    s.run_as = RunAs{65534, 65534, {65534}};
+    auto info = f.run(s);
+    BOOST_CHECK_EQUAL(info.exit_code, 0);
+    auto out = slurp(s.stdout_path);
+    std::istringstream in(out);
+    std::string uid, gid, groups;
+    std::getline(in, uid);
+    std::getline(in, gid);
+    std::getline(in, groups);
+    BOOST_CHECK_EQUAL(uid, "65534");
+    BOOST_CHECK_EQUAL(gid, "65534");
+    BOOST_CHECK_EQUAL(groups, "65534");
+    BOOST_CHECK_EQUAL(status_field(out, "CapEff"), "0000000000000000");
+    BOOST_CHECK_EQUAL(status_field(out, "CapPrm"), "0000000000000000");
+    BOOST_CHECK_EQUAL(status_field(out, "CapAmb"), "0000000000000000");
+    BOOST_CHECK_EQUAL(status_field(out, "NoNewPrivs"), "1");
+
+    // Cancel and timeout still kill a child owned by another uid.
+    auto c = f.spec({"sleep", "30"});
+    c.working_dir = "/";
+    c.run_as = RunAs{65534, 65534, {65534}};
+    auto r = f.start(c);
+    f.sup->cancel(c.attempt_id, 1s);
+    f.wait(r);
+    BOOST_CHECK(r->info.kind == ExitKind::kCancelled);
+
+    auto t = f.spec({"sh", "-c", "trap '' TERM; sleep 30"});
+    t.working_dir = "/";
+    t.run_as = RunAs{65534, 65534, {65534}};
+    t.timeout = 1s;
+    auto tr = f.start(t);
+    f.wait(tr);
+    BOOST_CHECK(tr->info.kind == ExitKind::kTimedOut);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

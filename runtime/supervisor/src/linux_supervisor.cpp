@@ -18,7 +18,10 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <fcntl.h>
+#include <grp.h>
+#include <linux/capability.h>
 #include <linux/close_range.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -111,7 +114,20 @@ std::expected<std::string, std::string> resolve_program(const std::string& name,
 }
 
 // Stages reported by the child through the CLOEXEC error pipe.
-enum ChildStage : int { kStageSetpgid = 1, kStageCgroup, kStageDup, kStageChdir, kStageRlimit, kStageExec };
+enum ChildStage : int {
+    kStageSetpgid = 1,
+    kStageCgroup,
+    kStageDup,
+    kStageChdir,
+    kStageRlimit,
+    kStageExec,
+    kStageSetgroups,
+    kStageSetgid,
+    kStageSetuid,
+    kStageVerifyIds,
+    kStageDropCaps,
+    kStageNoNewPrivs,
+};
 
 const char* stage_name(int stage) {
     switch (stage) {
@@ -121,14 +137,59 @@ const char* stage_name(int stage) {
         case kStageChdir: return "chdir";
         case kStageRlimit: return "setrlimit";
         case kStageExec: return "execvp";
+        case kStageSetgroups: return "setgroups";
+        case kStageSetgid: return "setgid";
+        case kStageSetuid: return "setuid";
+        case kStageVerifyIds: return "verify-ids";
+        case kStageDropCaps: return "drop-caps";
+        case kStageNoNewPrivs: return "no_new_privs";
     }
     return "child setup";
+}
+
+// LaunchSpec::run_as, flattened by the parent before fork.
+struct ChildIdentity {
+    bool active = false;      // run_as set: harden (drop caps, no_new_privs, umask)
+    bool switch_ids = false;  // uid/gid differ from ours: setgroups/setresgid/setresuid
+    uid_t uid = 0;
+    gid_t gid = 0;
+    const gid_t* groups = nullptr;
+    std::size_t ngroups = 0;
+};
+
+// Switches identity and drops privileges. Raw syscalls on purpose: the glibc
+// wrappers of set*id broadcast to all threads (setxid machinery), which we
+// neither need (the child has one thread) nor want between fork and exec.
+// Returns 0 or the failing stage (errno set).
+int child_drop_privileges(const ChildIdentity& id) {
+    if (id.switch_ids) {
+        if (::syscall(SYS_setgroups, id.ngroups, id.groups) < 0) return kStageSetgroups;
+        if (::syscall(SYS_setresgid, id.gid, id.gid, id.gid) < 0) return kStageSetgid;
+        if (::syscall(SYS_setresuid, id.uid, id.uid, id.uid) < 0) return kStageSetuid;
+    }
+    if (::getuid() != id.uid || ::geteuid() != id.uid || ::getgid() != id.gid || ::getegid() != id.gid) {
+        errno = EPERM;
+        return kStageVerifyIds;
+    }
+    // Ambient first (systemd AmbientCapabilities= would otherwise survive
+    // exec), then permitted/effective/inheritable to empty. A non-root daemon
+    // keeps its permitted caps across setresuid, so this is not redundant.
+    if (::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0 && errno != EINVAL) return kStageDropCaps;
+    struct __user_cap_header_struct hdr{};
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid = 0;
+    struct __user_cap_data_struct data[2]{};
+    if (::syscall(SYS_capset, &hdr, data) < 0) return kStageDropCaps;
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return kStageNoNewPrivs;
+    ::umask(0007);
+    return 0;
 }
 
 // Child side of fork(): only async-signal-safe calls, everything prepared by
 // the parent. Never returns.
 [[noreturn]] void child_exec(int err_fd, int in_fd, int out_fd, int errf_fd, const char* cgroup_procs, const char* cwd,
-                             std::uint64_t rlimit_as, const char* prog, char* const* argv, char* const* envp) {
+                             std::uint64_t rlimit_as, const ChildIdentity& ident, const char* prog, char* const* argv,
+                             char* const* envp) {
     auto fail = [err_fd](int stage) {
         int msg[2] = {stage, errno};
         ssize_t n = ::write(err_fd, msg, sizeof msg);
@@ -153,6 +214,10 @@ const char* stage_name(int stage) {
         ::sigaction(s, &dfl, nullptr);  // EINVAL for glibc-reserved signals is fine
     }
     if (::dup2(in_fd, 0) < 0 || ::dup2(out_fd, 1) < 0 || ::dup2(errf_fd, 2) < 0) fail(kStageDup);
+    // After the cgroup join (the job uid cannot write daemon-owned cgroup files).
+    if (ident.active) {
+        if (int stage = child_drop_privileges(ident)) fail(stage);
+    }
     if (::chdir(cwd) < 0) fail(kStageChdir);
     if (rlimit_as > 0) {
         struct rlimit rl{rlimit_as, rlimit_as};
@@ -236,11 +301,38 @@ private:
     std::expected<fs::path, std::string> create_cgroup(const LaunchSpec& spec);
     static void remove_cgroup(const fs::path& cg);
 
+    // killpg / kill that warn (once per supervisor) on EPERM: a child running
+    // as another uid can only be signalled with CAP_KILL. cgroup.kill does not
+    // need it. Return false only on EPERM.
+    bool signal_group(pid_t pgid, int sig);
+    bool signal_pid(pid_t pid, int sig);
+    void note_kill_eperm(pid_t pid);
+
     asio::io_context& io_;
     SupervisorOptions opts_;
     fs::path jobs_dir_;
     std::map<std::string, AttemptPtr> attempts_;
+    bool eperm_warned_ = false;
 };
+
+void LinuxSupervisor::note_kill_eperm(pid_t pid) {
+    if (eperm_warned_) return;
+    eperm_warned_ = true;
+    log_warn("supervisor: not permitted to signal pid {} (job runs as another user and tdrd lacks CAP_KILL?); {}", pid,
+             cgroups_enabled() ? "relying on cgroup.kill" : "without cgroups the job may survive cancel/timeout");
+}
+
+bool LinuxSupervisor::signal_group(pid_t pgid, int sig) {
+    if (::killpg(pgid, sig) == 0 || errno != EPERM) return true;
+    note_kill_eperm(pgid);
+    return false;
+}
+
+bool LinuxSupervisor::signal_pid(pid_t pid, int sig) {
+    if (::kill(pid, sig) == 0 || errno != EPERM) return true;
+    note_kill_eperm(pid);
+    return false;
+}
 
 std::expected<fs::path, std::string> LinuxSupervisor::create_cgroup(const LaunchSpec& spec) {
     fs::path cg = jobs_dir_ / spec.attempt_id;
@@ -335,6 +427,19 @@ std::expected<ProcessHandle, std::string> LinuxSupervisor::launch(const LaunchSp
     }
     std::uint64_t rlimit_as = cgroups_enabled() ? 0 : spec.limits.memory_bytes;
 
+    ChildIdentity ident;
+    std::vector<gid_t> groups;
+    if (spec.run_as) {
+        ident.active = true;
+        ident.uid = spec.run_as->uid;
+        ident.gid = spec.run_as->gid;
+        ident.switch_ids = ident.uid != ::getuid() || ident.uid != ::geteuid() || ident.gid != ::getgid() ||
+                           ident.gid != ::getegid();
+        groups = spec.run_as->groups;
+        ident.groups = groups.data();
+        ident.ngroups = groups.size();
+    }
+
     int pipefd[2];
     if (::pipe2(pipefd, O_CLOEXEC) < 0) {
         int e = errno;
@@ -351,7 +456,7 @@ std::expected<ProcessHandle, std::string> LinuxSupervisor::launch(const LaunchSp
     }
     if (pid == 0) {
         child_exec(wr.fd, in->fd, out->fd, err_file->fd, cg_procs.empty() ? nullptr : cg_procs.c_str(), cwd.c_str(),
-                   rlimit_as, prog->c_str(), argv.data(), envp.data());
+                   rlimit_as, ident, prog->c_str(), argv.data(), envp.data());
     }
     auto start = Clock::now();
     wr.reset();
@@ -366,14 +471,26 @@ std::expected<ProcessHandle, std::string> LinuxSupervisor::launch(const LaunchSp
     } while (n < 0 && errno == EINTR);
     if (n > 0 || pidfd < 0) {
         // Child setup / exec failed (or we cannot watch it): reap and report.
+        bool reaped = true;
         if (n <= 0) {
-            ::kill(pid, SIGKILL);
-        }
-        int status = 0;
-        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+            // The child already exec'd (possibly as another uid): kill via the
+            // cgroup if signalling is not permitted, and don't block forever.
+            if (!signal_pid(pid, SIGKILL) && !cg.empty()) detail::write_file(cg / "cgroup.kill", "1");
+            reaped = false;
+            for (int i = 0; i < 1000 && !reaped; ++i) {  // ~5 s
+                int status = 0;
+                pid_t w = ::waitpid(pid, &status, WNOHANG);
+                if (w == pid || (w < 0 && errno != EINTR)) reaped = true;
+                else std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (!reaped) log_warn("supervisor: unwatchable child pid {} could not be killed; leaving it", pid);
+        } else {
+            int status = 0;
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+            }
         }
         if (pidfd >= 0) ::close(pidfd);
-        remove_cgroup(cg);
+        if (reaped) remove_cgroup(cg);
         if (n > 0) return std::unexpected(std::format("{}: {}", stage_name(msg[0]), std::strerror(msg[1])));
         return std::unexpected(errno_msg("pidfd_open", pidfd_err));
     }
@@ -480,7 +597,7 @@ void LinuxSupervisor::on_pidfd_readable(const AttemptPtr& a) {
 
     // Kill whatever is left of the job (grandchildren), then wait until it is gone.
     if (!a->cgroup.empty()) detail::write_file(a->cgroup / "cgroup.kill", "1");
-    ::killpg(a->pid, SIGKILL);
+    signal_group(a->pid, SIGKILL);
     drain(a);
 }
 
@@ -489,7 +606,7 @@ void LinuxSupervisor::drain(const AttemptPtr& a) {
     if (!empty && a->drain_rounds < 1000) {  // ~5 s
         if (a->drain_rounds++ % 20 == 19) {  // re-kill now and then (catches late forks)
             if (!a->cgroup.empty()) detail::write_file(a->cgroup / "cgroup.kill", "1");
-            ::killpg(a->pid, SIGKILL);
+            signal_group(a->pid, SIGKILL);
         }
         a->drain_timer.expires_after(std::chrono::milliseconds(5));
         a->drain_timer.async_wait([this, a](const boost::system::error_code& ec) {
@@ -514,14 +631,15 @@ void LinuxSupervisor::begin_kill(const AttemptPtr& a, ExitKind reason, std::chro
     if (a->exited || a->kill_reason) return;
     a->kill_reason = reason;
     a->timeout_timer.cancel();
-    ::killpg(a->pid, SIGTERM);
+    bool delivered = signal_group(a->pid, SIGTERM);
     if (!a->cgroup.empty()) {
         // Also reach processes that left the process group.
         auto procs = detail::read_file(a->cgroup / "cgroup.procs").value_or("");
         std::istringstream in(procs);
-        for (long p; in >> p;) ::kill(static_cast<pid_t>(p), SIGTERM);
+        for (long p; in >> p;) delivered = signal_pid(static_cast<pid_t>(p), SIGTERM) && delivered;
     }
-    if (grace.count() <= 0) {
+    // SIGTERM not permitted: a grace period is pointless, go straight to cgroup.kill.
+    if (grace.count() <= 0 || (!delivered && !a->cgroup.empty())) {
         hard_kill(a);
         return;
     }
@@ -534,7 +652,7 @@ void LinuxSupervisor::begin_kill(const AttemptPtr& a, ExitKind reason, std::chro
 
 void LinuxSupervisor::hard_kill(const AttemptPtr& a) {
     if (!a->cgroup.empty()) detail::write_file(a->cgroup / "cgroup.kill", "1");
-    ::killpg(a->pid, SIGKILL);
+    signal_group(a->pid, SIGKILL);
 }
 
 void LinuxSupervisor::cancel(const std::string& attempt_id, std::chrono::seconds grace) {
@@ -548,8 +666,8 @@ bool LinuxSupervisor::kill_orphan(const ProcessHandle& handle) {
     if (handle.pid > 0) {
         auto ticks = read_start_ticks(handle.pid);
         if (ticks && *ticks == handle.start_ticks) {
-            ::killpg(handle.pid, SIGKILL);
-            ::kill(handle.pid, SIGKILL);
+            signal_group(handle.pid, SIGKILL);
+            signal_pid(handle.pid, SIGKILL);
             killed = true;
             log_info("supervisor: killed orphan pid {}", handle.pid);
         }

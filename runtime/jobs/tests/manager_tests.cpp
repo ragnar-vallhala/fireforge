@@ -1,3 +1,6 @@
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <boost/test/unit_test.hpp>
 
 #include "fakes.hpp"
@@ -20,6 +23,7 @@ struct Fixture {
     std::unique_ptr<JobManager> mgr;
     std::vector<std::pair<std::string, v1::JobState>> events;
     std::vector<std::pair<std::string, std::string>> cancel_notes;
+    std::optional<tdr::supervisor::RunAs> run_as;  // applied by make()
 
     explicit Fixture(Capacity cap = {4, 4 * kGiB, 2}, bool keep = false) { make(cap, keep); }
 
@@ -32,6 +36,7 @@ struct Fixture {
         o.worker_socket = tmp.path / "worker.sock";
         o.cancel_grace = std::chrono::seconds(3);
         o.keep_work_dirs = keep;
+        o.run_as = run_as;
         mgr = std::make_unique<JobManager>(io, journal, store, sup, o);
         mgr->set_state_listener([this](const std::string& id, v1::JobState s) { events.emplace_back(id, s); });
         mgr->set_cancel_notifier(
@@ -733,6 +738,123 @@ BOOST_FIXTURE_TEST_CASE(destroyed_manager_ignores_late_callbacks, Fixture) {
     mgr.reset();
     pump();  // must not touch the destroyed manager
     BOOST_TEST(sup.launches.size() == 1u);
+}
+
+// ---- restricted job user (section 11) ----------------------------------------------
+
+namespace {
+
+struct DirInfo {
+    unsigned mode;
+    gid_t gid;
+};
+
+DirInfo dir_info(const fs::path& p) {
+    struct stat st{};
+    BOOST_REQUIRE_MESSAGE(::stat(p.c_str(), &st) == 0, "stat " + p.string());
+    return {static_cast<unsigned>(st.st_mode & 07777), st.st_gid};
+}
+
+// Our own primary group: chown to it needs no privileges.
+tdr::supervisor::RunAs self_run_as() { return {::getuid(), ::getgid(), {::getgid()}}; }
+
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(run_as_dirs_env_and_copy_ingest, Fixture) {
+    run_as = self_run_as();
+    make({4, 4 * kGiB, 2});
+    const std::string in = store.add("input-data");
+    auto s = spec();
+    s.add_input_artifacts(in);
+    (*s.mutable_command()->mutable_env())["FIREFORGE_JOB_ID"] = "spoofed";
+    auto id = submit(s);
+    BOOST_REQUIRE_EQUAL(sup.launches.size(), 1u);
+    const auto& ls = launch(0);
+    const fs::path dir = ls.working_dir;
+
+    BOOST_REQUIRE(ls.run_as.has_value());
+    BOOST_TEST(ls.run_as->uid == ::getuid());
+    BOOST_TEST(ls.run_as->gid == ::getgid());
+    BOOST_TEST((ls.run_as->groups == std::vector<gid_t>{::getgid()}));
+    BOOST_TEST(ls.env.at("HOME") == dir.string());
+    BOOST_TEST(ls.env.at("FIREFORGE_JOB_ID") == id);  // daemon-set FIREFORGE_* win
+
+    const std::pair<fs::path, unsigned> expected[] = {
+        {dir.parent_path(), 02750u}, {dir, 02770u}, {dir / "outputs", 02770u},
+        {dir / "checkpoints", 02770u}, {dir / "inputs", 02750u},
+    };
+    for (const auto& [p, mode] : expected) {
+        auto info = dir_info(p);
+        BOOST_TEST(info.mode == mode, p.string() << std::oct << " mode " << info.mode << " != " << mode);
+        BOOST_TEST(info.gid == ::getgid());
+    }
+    // Inputs were materialized before inputs/ was made read-only for the group.
+    BOOST_TEST(read_file(dir / "inputs" / in.substr(18)) == "input-data");
+
+    write_file(outdir(0) / "a.txt", "alpha");
+    sup.exit_code(0, 0);
+    pump();
+    BOOST_TEST(state(id) == v1::COMPLETED);
+    BOOST_REQUIRE_EQUAL(store.ingests.size(), 1u);
+    BOOST_TEST(!store.ingests[0].move_source);
+    BOOST_TEST(!fs::exists(dir));  // cleanup still works
+}
+
+BOOST_FIXTURE_TEST_CASE(run_as_job_env_may_override_home, Fixture) {
+    run_as = self_run_as();
+    make({4, 4 * kGiB, 2});
+    auto s = spec();
+    (*s.mutable_command()->mutable_env())["HOME"] = "/custom/home";
+    submit(s);
+    BOOST_TEST(launch(0).env.at("HOME") == "/custom/home");
+}
+
+BOOST_FIXTURE_TEST_CASE(no_run_as_unchanged, Fixture) {
+    auto id = submit(spec());
+    const auto& ls = launch(0);
+    BOOST_TEST(!ls.run_as.has_value());
+    BOOST_TEST(!ls.env.contains("HOME"));
+    for (const auto& p : {ls.working_dir.parent_path(), ls.working_dir, ls.working_dir / "inputs",
+                          ls.working_dir / "outputs", ls.working_dir / "checkpoints"}) {
+        BOOST_TEST((dir_info(p).mode & 02000u) == 0u, p.string() << " has setgid");
+    }
+    write_file(outdir(0) / "a.txt", "alpha");
+    sup.exit_code(0, 0);
+    pump();
+    BOOST_TEST(state(id) == v1::COMPLETED);
+    BOOST_REQUIRE_EQUAL(store.ingests.size(), 1u);
+    BOOST_TEST(store.ingests[0].move_source);
+}
+
+BOOST_FIXTURE_TEST_CASE(run_as_foreign_group_is_setup_error, Fixture) {
+    if (::geteuid() == 0) {
+        BOOST_TEST_MESSAGE("skipped: root may chown to any group");
+        return;
+    }
+    // A gid we are not a member of.
+    std::vector<gid_t> mine(static_cast<std::size_t>(::getgroups(0, nullptr)));
+    mine.resize(static_cast<std::size_t>(::getgroups(static_cast<int>(mine.size()), mine.data())));
+    mine.push_back(::getegid());
+    gid_t foreign = 0;
+    while (std::ranges::find(mine, foreign) != mine.end()) ++foreign;
+
+    run_as = tdr::supervisor::RunAs{::getuid(), foreign, {foreign}};
+    make({4, 4 * kGiB, 2});
+    auto r = mgr->submit(spec(2));
+    BOOST_REQUIRE(r.has_value());
+    std::vector<v1::JobState> seen;
+    mgr->set_state_listener([&](const std::string&, v1::JobState st) { seen.push_back(st); });
+    pump();
+
+    BOOST_TEST(sup.launches.empty());
+    BOOST_TEST(state(*r) == v1::FAILED);
+    const auto& rec = journal.jobs.at(*r);
+    BOOST_TEST(rec.attempts_used == 2u);
+    BOOST_TEST(rec.last_error.find("chown") != std::string::npos, rec.last_error);
+    BOOST_TEST(rec.last_error.find("group " + std::to_string(foreign)) != std::string::npos, rec.last_error);
+    BOOST_TEST(std::ranges::count(seen, v1::RETRY_PENDING) == 1);
+    for (auto& [aid, a] : journal.attempts) BOOST_TEST(a.state == AttemptState::kFailed);
+    BOOST_TEST(mgr->usage().allocated.jobs == 0u);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

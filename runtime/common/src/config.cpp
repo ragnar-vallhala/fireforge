@@ -119,7 +119,8 @@ std::expected<Config, std::string> config_from_ini(const IniFile& ini) {
                        {"max_jobs", num(c.resources.max_jobs)},
                        {"max_disk_mb", num(c.resources.max_disk_mb)},
                        {"default_job_memory_mb", num(c.resources.default_job_memory_mb)},
-                       {"cgroups", str(c.resources.cgroups)}}},
+                       {"cgroups", str(c.resources.cgroups)},
+                       {"job_user", str(c.resources.job_user)}}},
         {"paths", {{"state_dir", path(c.paths.state_dir)}, {"log_file", path(c.paths.log_file)}}},
         {"log", {{"level", str(c.log_level)}}},
     };

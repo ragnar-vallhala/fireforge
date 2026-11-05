@@ -12,7 +12,12 @@ RestartSec=2
 Delegate=yes
 User=fireforge
 Group=fireforge
+# Jobs run as job_user (tdr.conf). tdrd needs these to start and stop them;
+# every job process drops all capabilities before exec (phase1.md §11).
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_KILL
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_KILL
 StateDirectory=fireforge
+StateDirectoryMode=0711
 LogsDirectory=fireforge
 NoNewPrivileges=yes
 ProtectSystem=strict

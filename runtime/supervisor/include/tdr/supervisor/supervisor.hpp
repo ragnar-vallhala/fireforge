@@ -32,6 +32,19 @@ struct ResourceLimits {
     std::uint64_t max_pids = 4096;      // cgroup pids.max
 };
 
+// Run the child as a separate unprivileged user (Description.md §19).
+// Requires the daemon to hold CAP_SETUID + CAP_SETGID (and CAP_KILL to signal
+// the child). In the child, after setpgid and joining the cgroup and before
+// exec: setgroups(groups), setgid(gid), setuid(uid), verify, then drop every
+// capability (ambient cleared, capset to empty), set PR_SET_NO_NEW_PRIVS and
+// umask 0007. If uid/gid equal the daemon's own ids, the id switch is skipped
+// but the hardening still applies (lets it be tested without privileges).
+struct RunAs {
+    uid_t uid = 0;
+    gid_t gid = 0;                  // primary group
+    std::vector<gid_t> groups;      // supplementary groups; usually {gid}
+};
+
 struct LaunchSpec {
     std::string attempt_id;                 // unique key for cancel() and the cgroup name
     std::vector<std::string> argv;          // argv[0] looked up in PATH
@@ -41,6 +54,7 @@ struct LaunchSpec {
     fs::path stderr_path;
     ResourceLimits limits;
     std::chrono::seconds timeout{0};        // 0 = none. On expiry: SIGTERM, grace, SIGKILL
+    std::optional<RunAs> run_as;            // nullopt = run as the daemon's user
 };
 
 enum class ExitKind {

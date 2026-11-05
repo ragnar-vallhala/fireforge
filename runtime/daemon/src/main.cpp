@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -28,6 +30,8 @@
 #include "tdr/journal/journal.hpp"
 #include "tdr/protocol/envelope.hpp"
 #include "tdr/supervisor/supervisor.hpp"
+
+#include "job_user.hpp"
 
 namespace asio = boost::asio;
 namespace fs = std::filesystem;
@@ -106,6 +110,9 @@ public:
                 throw std::runtime_error("socket path too long (max 107 bytes): " + s.native());
         }
 
+        std::optional<tdrd::JobUser> job_user;
+        if (!cfg_.resources.job_user.empty()) job_user = setup_job_user();
+
         // Supervisor first: with cgroups it moves this process into <root>/daemon.
         tdr::supervisor::SupervisorOptions sopts;
         sopts.cgroups = res_.cgroups;
@@ -119,6 +126,7 @@ public:
         mopts.default_job_memory_bytes = res_.default_job_memory;
         mopts.work_root = cfg_.work_dir();
         mopts.worker_socket = cfg_.worker_socket();
+        if (job_user) mopts.run_as = tdr::supervisor::RunAs{job_user->uid, job_user->gid, {job_user->gid}};
         manager_ = std::make_unique<tdr::jobs::JobManager>(io_, *journal_, *store_, *supervisor_, mopts);
         manager_->set_cancel_notifier([this](const std::string& attempt, const std::string& reason) {
             notify_cancel(attempt, reason);
@@ -136,6 +144,11 @@ public:
             tdr::ipc::Handlers{[this](auto& c, Frame f) { on_ctl_frame(c, std::move(f)); }, {}});
         worker_server_->start();
         ctl_server_->start();
+        if (job_user) {
+            // Jobs may connect to the worker socket, never to the control socket.
+            check(tdrd::set_group_mode(cfg_.worker_socket(), job_user->gid, 0660));
+            check(tdrd::set_mode(cfg_.ctl_socket(), 0660));
+        }
 
         manager_->recover();
 
@@ -151,6 +164,7 @@ public:
         tdr::log_info("tdrd {} node={} cpus={} memory={}MiB max_jobs={} cgroups={} state_dir={}", TDR_VERSION,
                       node_name(), res_.capacity.cpu_cores, res_.capacity.memory_bytes / kMiB, res_.capacity.jobs,
                       supervisor_->cgroups_enabled() ? "on" : "off", cfg_.paths.state_dir.string());
+        if (job_user) tdr::log_info("jobs run as user {} (uid {}, gid {})", job_user->name, job_user->uid, job_user->gid);
         io_.run();
 
         // Tear down in reverse order of construction; servers first so no
@@ -162,6 +176,25 @@ public:
     }
 
 private:
+    static void check(std::expected<void, std::string> r) {
+        if (!r) throw std::runtime_error(r.error());
+    }
+
+    // phase1.md §11: validate the job user, join its group, and lock down
+    // state_dir so the job user can reach only work/ and the worker socket.
+    tdrd::JobUser setup_job_user() {
+        auto u = tdrd::resolve_job_user(cfg_.resources.job_user);
+        if (!u) throw std::runtime_error(u.error());
+        check(tdrd::join_group(u->gid));
+        check(tdrd::set_mode(cfg_.work_dir(), 0711));
+        check(tdrd::set_mode(cfg_.run_dir(), 0711));
+        check(tdrd::set_mode(cfg_.artifacts_dir(), 0700));
+        check(tdrd::set_mode(cfg_.journal_path().parent_path(), 0700));
+        check(tdrd::check_traversable(cfg_.work_dir(), *u));
+        check(tdrd::check_traversable(cfg_.run_dir(), *u));
+        return *u;
+    }
+
     std::string node_name() const { return cfg_.node.name.empty() ? hostname() : cfg_.node.name; }
 
     // ---- worker socket ----------------------------------------------------

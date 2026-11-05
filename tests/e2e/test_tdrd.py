@@ -25,16 +25,23 @@ SDK_ENV = ["--env", f"PYTHONPATH={ROOT / 'sdk/python'}"]
 
 
 class Daemon:
-    def __init__(self, state: Path):
+    def __init__(self, state: Path, tdrd: Path = TDRD, config: Path | None = None):
         self.state = state
         self.sock = state / "run/ctl.sock"
         self.proc = None
+        self.tdrd = tdrd
+        self.config = config
 
     def start(self):
         self.log = open(self.state.parent / "tdrd.log", "ab")
-        self.proc = subprocess.Popen([str(TDRD), "--state-dir", str(self.state), "--log-level", "debug"],
-                                     stdout=self.log, stderr=self.log)
+        args = [str(self.tdrd), "--state-dir", str(self.state), "--log-level", "debug"]
+        if self.config:
+            args += ["--config", str(self.config)]
+        self.proc = subprocess.Popen(args, stdout=self.log, stderr=self.log)
         for _ in range(200):
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"tdrd exited with {self.proc.returncode}: " +
+                                   (self.state.parent / "tdrd.log").read_text()[-2000:])
             if self.sock.exists():
                 try:
                     self.ctl("node")

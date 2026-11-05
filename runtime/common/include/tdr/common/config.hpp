@@ -46,6 +46,7 @@ struct Config {
         std::uint64_t max_disk_mb = 0;       // 0 = unlimited
         std::uint64_t default_job_memory_mb = 1024;  // when a job requests 0
         std::string cgroups = "auto";        // "auto" | "required" | "off"
+        std::string job_user;                // run jobs as this user; "" = daemon's user (phase1.md §11)
     } resources;
 
     struct Paths {

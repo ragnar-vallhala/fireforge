@@ -246,3 +246,58 @@ run for minutes to days, so durability wins and `synchronous=FULL` stays.
   `waitpid(-1)` SIGCHLD handler or set `PR_SET_CHILD_SUBREAPER` in tdrd.
 - `tdrd` binds an attempt to the worker connection that completed HELLO;
   PROGRESS/RESULT from any other connection are rejected.
+
+---
+
+## 11. Restricted job user
+
+Decided 2026-11-05: job children run as a separate unprivileged user so they
+cannot modify stored artifacts (which are hard-linked into `inputs/`), talk to
+the control socket, or touch other jobs' files.
+
+**Identities** (production names; configurable):
+
+| Who | User | Groups |
+|---|---|---|
+| tdrd | `fireforge` | `fireforge`, plus `fireforge-job` (added by tdrd itself at startup via setgroups) |
+| job children | `fireforge-job` | `fireforge-job` |
+
+**Config:** `[resources] job_user = fireforge-job`. Empty (default) = jobs run
+as the daemon's user (development). The job group is the user's primary group.
+tdrd refuses to start if `job_user` is root, equals the daemon's user, or
+the daemon lacks `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` (unless euid 0).
+
+**Permissions:**
+
+| Path | Owner:group | Mode | Job can |
+|---|---|---|---|
+| `artifacts/sha256/**` | fireforge:fireforge | 0444 | read (not chmod: not owner) |
+| `work/` , `run/` | fireforge | 0711 | traverse only |
+| `run/ctl.sock` | fireforge:fireforge | 0660 | nothing |
+| `run/worker.sock` | fireforge:fireforge-job | 0660 | connect |
+| `work/<job>/` | fireforge:fireforge-job | 02750 | traverse |
+| `work/<job>/<attempt>/`, `outputs/`, `checkpoints/` | fireforge:fireforge-job | 02770 | read/write |
+| `work/<job>/<attempt>/inputs/` | fireforge:fireforge-job | 02750 | read |
+| `stdout.log`, `stderr.log` | fireforge | 0640 | (written via inherited fds) |
+
+The setgid bit makes job-created files inherit group `fireforge-job`; the
+job's umask is 0007, so the daemon (a group member) can read outputs and
+clean up. Outputs are **copied** into the store (never moved), so every store
+file is a fresh daemon-owned 0444 file. A job that makes its own files
+unreadable (e.g. 0600) fails at commit with a permission error.
+
+tdrd checks at startup that the job user can traverse every ancestor of
+`state_dir` (o+x, or group/owner match) and refuses to start otherwise.
+
+**Child hardening** (in the child, after setpgid + cgroup join, before exec):
+setgroups → setgid → setuid → verify ids → clear ambient caps → capset(empty)
+→ `PR_SET_NO_NEW_PRIVS` → umask 0007. Clearing ambient caps matters: under
+systemd `AmbientCapabilities=` would otherwise pass CAP_SETUID to the job.
+
+**Killing:** the daemon signals processes of another uid, which needs
+CAP_KILL (cgroup.kill works without it, the fallback killpg does not).
+
+**systemd:** `User=fireforge`, `AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_KILL`,
+`CapabilityBoundingSet=` the same. **Dev:** `sudo tools/setup-job-user.sh`
+creates the user and installs a capability-enabled copy of tdrd at
+`build/caps/tdrd` (re-run with `--caps-only` after rebuilding).

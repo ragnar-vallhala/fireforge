@@ -59,6 +59,16 @@ struct ManagerOptions {
     fs::path worker_socket;                    // passed to children as FIREFORGE_IPC_SOCKET
     std::chrono::seconds cancel_grace{10};
     bool keep_work_dirs = false;               // keep attempt dirs after success (debugging)
+
+    // Restricted job user (docs/design/phase1.md §11). When set:
+    //  - LaunchSpec.run_as = this, and HOME = the attempt dir
+    //  - <work>/<job_id>          group run_as->gid, mode 02750
+    //    attempt dir, outputs/, checkpoints/   group gid, mode 02770
+    //    inputs/                  group gid, mode 02750 (job can read, not add/remove)
+    //  - outputs are ingested with move_source=false (copied: the file is
+    //    owned by the job user, so the store copy must be a new daemon-owned file)
+    //  - cleanup failures (job made a dir unwritable) are logged, not fatal
+    std::optional<supervisor::RunAs> run_as;
 };
 
 struct Usage {

@@ -10,12 +10,17 @@
 #include "tdr/jobs/jobs.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <compare>
+#include <cstring>
 #include <map>
 #include <set>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <boost/asio/post.hpp>
 
@@ -60,6 +65,21 @@ bool constant_time_equal(std::string_view a, std::string_view b) {
         diff |= static_cast<unsigned char>(a[i] ^ b[i]);
     }
     return diff == 0;
+}
+
+// Restricted job user (phase1.md section 11): give `path` group `gid` and set
+// `mode` explicitly (create_directories is subject to the process umask).
+// Returns an error message, or "" on success.
+std::string restrict_dir(const fs::path& path, gid_t gid, mode_t mode) {
+    if (::chown(path.c_str(), static_cast<uid_t>(-1), gid) != 0) {
+        int err = errno;
+        return std::format("chown {}: {} (is tdrd in group {}?)", path.string(), std::strerror(err), gid);
+    }
+    if (::chmod(path.c_str(), mode) != 0) {
+        int err = errno;
+        return std::format("chmod {:o} {}: {}", static_cast<unsigned>(mode), path.string(), std::strerror(err));
+    }
+    return {};
 }
 
 std::uint32_t max_attempts(const v1::JobSpec& spec) {
@@ -318,6 +338,25 @@ struct JobManager::Impl {
                 f.set_path(dest.string());
                 a.inputs.push_back(std::move(f));
             }
+            // Restricted job user: ownership and modes are applied after the
+            // inputs are materialized, so inputs/ ends up 02750 (the job can
+            // read but not add or remove files). The job dir may already exist
+            // from an earlier attempt; re-applying is harmless.
+            if (opts.run_as && setup_error.empty()) {
+                const gid_t gid = opts.run_as->gid;
+                const std::pair<fs::path, mode_t> dirs[] = {
+                    {a.dir.parent_path(), 02750},  {a.dir, 02770},
+                    {a.dir / "outputs", 02770},    {a.dir / "checkpoints", 02770},
+                    {a.dir / "inputs", 02750},
+                };
+                for (const auto& [path, mode] : dirs) {
+                    setup_error = restrict_dir(path, gid, mode);
+                    if (!setup_error.empty()) {
+                        setup_error = "work dir setup: " + setup_error;
+                        break;
+                    }
+                }
+            }
         } catch (const fs::filesystem_error& e) {
             setup_error = std::string("work dir setup: ") + e.what();
         }
@@ -361,6 +400,10 @@ struct JobManager::Impl {
         supervisor::LaunchSpec ls;
         ls.attempt_id = attempt_id;
         ls.argv.assign(rec->spec.command().argv().begin(), rec->spec.command().argv().end());
+        // Env precedence: HOME (restricted job user only; the job user cannot
+        // write the daemon's home) is a default that the job's own env may
+        // override. FIREFORGE_* are set last and always win.
+        if (opts.run_as) ls.env["HOME"] = a.dir.string();
         for (const auto& [k, v] : rec->spec.command().env()) ls.env[k] = v;
         ls.env["FIREFORGE_IPC_SOCKET"] = opts.worker_socket.string();
         ls.env["FIREFORGE_JOB_ID"] = job_id;
@@ -376,6 +419,7 @@ struct JobManager::Impl {
         ls.limits.cpu_cores = a.reserved.cpu_cores;
         ls.limits.memory_bytes = a.reserved.memory_bytes;
         ls.timeout = std::chrono::seconds(static_cast<std::int64_t>(rec->spec.policy().timeout_seconds()));
+        ls.run_as = opts.run_as;
 
         auto handle = sup.launch(ls, [this, w = std::weak_ptr<char>(alive), attempt_id](
                                          const supervisor::ExitInfo& info) {
@@ -529,7 +573,9 @@ struct JobManager::Impl {
 
         std::vector<std::string> ids;
         for (const auto& f : *files) {
-            auto meta = store.ingest(f.path, f.media_type, job_id, /*move_source=*/true);
+            // With a restricted job user the output file is owned by the job
+            // user, so it is copied: the store file must be a new daemon-owned file.
+            auto meta = store.ingest(f.path, f.media_type, job_id, /*move_source=*/!opts.run_as.has_value());
             if (!meta) {
                 std::string err = "ingest " + f.path.filename().string() + ": " + meta.error();
                 journal.finish_attempt(a.id, AttemptState::kFailed, 0, 0, err);
@@ -559,8 +605,11 @@ struct JobManager::Impl {
         notify(job_id, v1::COMPLETED);
 
         if (!opts.keep_work_dirs) {
+            // Not fatal: a job (especially under a restricted job user) can
+            // leave files the daemon cannot remove.
             std::error_code ec;
             fs::remove_all(a.dir, ec);
+            if (ec) log_warn("job {}: cleanup of {} failed: {}", job_id, a.dir.string(), ec.message());
             fs::remove(a.dir.parent_path(), ec);  // job dir, only if now empty
         }
     }
