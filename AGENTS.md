@@ -1,7 +1,8 @@
 # Agent Guidelines
 
 FireForge: distributed materials-discovery platform. Vision: `Description.md`.
-Current work: Phase 1 (TDR local job execution), design in `docs/design/phase1.md`.
+Phase 1 (TDR local job execution, `docs/design/phase1.md`) is done.
+Current work: Phase 2 (control plane: nodes + campaigns), design in `docs/design/phase2.md`.
 
 ## Memory cap — mandatory
 
@@ -14,7 +15,8 @@ agents building in parallel.
 tools/build.sh [-B build/<name>] [-t <target>] [--test] [-R <ctest regex>]
 tools/pytest.sh [pytest args]
 tools/gen_proto.sh                 # regenerate Python protobuf code
-tools/e2e.sh [pytest args]         # real tdrd + tdrctl end-to-end tests
+tools/e2e.sh [pytest args]         # real tdrd + tdrctl + tdrcp end-to-end tests
+tools/pg.sh start|stop|psql|conninfo  # private dev Postgres in build/pg (no sudo)
 tools/capped <any other command>
 ```
 
@@ -27,24 +29,30 @@ tools/capped <any other command>
 
 ```
 proto/fireforge/tdr/v1/   protobuf contracts (envelope, job, local IPC)
+proto/fireforge/control/  control-plane API payloads (sent as proto3 JSON)
 runtime/<module>/         C++ TDR runtime: include/tdr/<module>/, src/, tests/
+runtime/tls, http, agent  mTLS/PKI, HTTPS server+client, tdrd control-plane agent
 runtime/daemon, ctl       tdrd and tdrctl executables
+control/db, api, server   tdrcp: Postgres repository, API handlers, executable
 sdk/python/fireforge/     Python worker SDK (tests in sdk/python/tests)
 docs/design/              design docs
 deploy/                   systemd unit, example config
 tools/                    build / cap scripts
-control/, science/        later phases
+science/                  later phases
 ```
 
 ## Conventions
 
 - C++23, g++ 13, CMake + Ninja. Dependencies come from system packages only:
-  Boost 1.83 (Asio, JSON, Test, program_options), protobuf 3.21, SQLite, OpenSSL.
+  Boost 1.83 (Asio, Beast, JSON, Test, program_options), protobuf 3.21, SQLite,
+  OpenSSL, libpq (PostgreSQL 16).
   No network fetches in the build.
 - Public headers under `runtime/*/include/tdr/` are the contracts between
   modules. Don't change another module's header; if a change is unavoidable,
   keep it minimal and record it in `docs/design/phase1.md`.
 - New `.cpp` files in `src/` and `tests/` are picked up automatically (glob).
+- Postgres tests use throwaway clusters (`tdr::cpdb::testing::TempCluster`),
+  never the system server.
 - Tests: Boost.Test (`BOOST_AUTO_TEST_CASE`) in `runtime/<module>/tests/`, no
   `BOOST_TEST_MODULE` (it lives in `runtime/testing/test_main.cpp`).
 - Single-threaded daemon: module code runs on one io_context thread and needs no locks.

@@ -1,0 +1,173 @@
+// Control-plane API payloads (docs/design/phase2.md §3).
+// Sent over HTTPS as proto3 JSON with original field names.
+
+syntax = "proto3";
+
+package fireforge.control.v1;
+
+// ---- nodes ----------------------------------------------------------------
+
+message NodeAddress {
+  string type = 1;      // "lan" | "tailscale" | "public"
+  string address = 2;   // IPv4 or IPv6 literal, or a hostname
+  uint32 port = 3;
+}
+
+message NodeResources {
+  uint32 cpu_cores = 1;
+  uint64 memory_bytes = 2;
+  uint64 disk_bytes = 3;
+  uint32 gpu_count = 4;
+}
+
+// 0 in any max_* field means "no central limit" (the local tdr.conf cap applies).
+message ResourcePolicy {
+  uint64 version = 1;          // bumped on every change; starts at 1
+  string profile = 2;          // "" | "small" | "medium" | "compute" | "gpu"
+  uint32 max_cpu_cores = 3;
+  uint64 max_memory_bytes = 4;
+  uint32 max_jobs = 5;
+  uint64 max_disk_bytes = 6;
+  uint32 max_gpus = 7;
+  int64 updated_unix_ms = 8;
+  string updated_by = 9;
+}
+
+enum NodeHealth {
+  NODE_HEALTH_UNSPECIFIED = 0;
+  ONLINE = 1;
+  STALE = 2;
+  OFFLINE = 3;
+}
+
+message RegisterRequest {
+  string name = 1;                     // must equal the client cert CN
+  string daemon_version = 2;
+  repeated NodeAddress addresses = 3;
+  NodeResources physical = 4;          // detected hardware
+  NodeResources configured = 5;        // local tdr.conf caps
+  repeated string capabilities = 6;    // e.g. "cpu", "gpu:cuda", "cgroups", "job-user"
+}
+
+message RegisterReply {
+  string node_id = 1;
+  ResourcePolicy policy = 2;
+  uint32 heartbeat_interval_seconds = 3;
+  int64 server_time_unix_ms = 4;
+}
+
+message Heartbeat {
+  string node_id = 1;
+  int64 sent_unix_ms = 2;
+  string daemon_version = 3;
+  NodeResources capacity = 4;          // effective caps after policy
+  NodeResources allocated = 5;
+  double cpu_utilization = 6;          // 0..1, whole machine
+  uint64 memory_available_bytes = 7;
+  uint64 disk_available_bytes = 8;
+  uint32 running_jobs = 9;
+  uint32 queued_jobs = 10;
+  uint64 failed_jobs = 11;
+  uint64 policy_version = 12;          // version the node has applied
+  repeated NodeAddress addresses = 13; // may change (DHCP, Tailscale up/down)
+}
+
+message HeartbeatReply {
+  ResourcePolicy policy = 1;           // set only when version != applied policy_version
+  uint32 heartbeat_interval_seconds = 2;
+  int64 server_time_unix_ms = 3;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string name = 2;
+  NodeHealth health = 3;
+  repeated NodeAddress addresses = 4;
+  repeated string capabilities = 5;
+  string daemon_version = 6;
+  NodeResources physical = 7;
+  NodeResources configured = 8;
+  ResourcePolicy policy = 9;
+  Heartbeat last_heartbeat = 10;
+  int64 registered_unix_ms = 11;
+  int64 last_seen_unix_ms = 12;
+  string cert_fingerprint = 13;        // SHA-256 of the client cert DER, hex
+  string offline_reason = 14;
+}
+
+message NodeList { repeated NodeInfo nodes = 1; }
+
+// PATCH semantics: unset fields keep their value. `profile` (if set) is
+// applied first, then any explicit fields.
+message UpdateLimitsRequest {
+  optional string profile = 1;
+  optional uint32 max_cpu_cores = 2;
+  optional uint64 max_memory_bytes = 3;
+  optional uint32 max_jobs = 4;
+  optional uint64 max_disk_bytes = 5;
+  optional uint32 max_gpus = 6;
+}
+
+message OfflineRequest { string reason = 1; }
+
+message NodeEvent {
+  int64 at_unix_ms = 1;
+  NodeHealth from = 2;
+  NodeHealth to = 3;
+  string reason = 4;
+}
+message NodeEventList { repeated NodeEvent events = 1; }
+
+// ---- campaigns --------------------------------------------------------------
+
+enum CampaignState {
+  CAMPAIGN_STATE_UNSPECIFIED = 0;
+  DRAFT = 1;
+  ACTIVE = 2;
+  PAUSED = 3;
+  COMPLETED = 4;
+  ARCHIVED = 5;
+}
+
+message Campaign {
+  string campaign_id = 1;
+  string name = 2;
+  string description = 3;
+  string domain = 4;               // e.g. "thermoelectric"
+  CampaignState state = 5;
+  string parameters_json = 6;      // must be valid JSON ("" = {})
+  string created_by = 7;           // admin cert CN
+  int64 created_unix_ms = 8;
+  int64 updated_unix_ms = 9;
+}
+
+message CreateCampaignRequest {
+  string name = 1;
+  string description = 2;
+  string domain = 3;
+  string parameters_json = 4;
+}
+
+message UpdateCampaignRequest {
+  optional string description = 1;
+  CampaignState state = 2;         // UNSPECIFIED = unchanged
+  optional string parameters_json = 3;
+}
+
+message CampaignList { repeated Campaign campaigns = 1; }
+
+// ---- audit / errors ---------------------------------------------------------
+
+message AuditEntry {
+  int64 at_unix_ms = 1;
+  string actor = 2;        // "<role>:<CN>"
+  string action = 3;       // e.g. "node.limits", "campaign.update"
+  string target = 4;       // node_id / campaign_id
+  string details_json = 5;
+}
+message AuditList { repeated AuditEntry entries = 1; }
+
+message ApiError {
+  string code = 1;         // "bad_request" | "forbidden" | "not_found" | "conflict" | "internal" | ...
+  string message = 2;
+}

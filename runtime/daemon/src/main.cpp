@@ -1,11 +1,13 @@
-// tdrd — FireForge TDR daemon (Phase 1: standalone local execution).
+// tdrd — FireForge TDR daemon (Phase 1 local execution + Phase 2 control-plane agent).
 //
 // Wiring only: config -> supervisor (first, it may move this process into a
-// cgroup) -> journal -> artifact store -> JobManager -> two Unix sockets.
+// cgroup) -> journal -> artifact store -> JobManager -> two Unix sockets
+// -> NodeAgent (only when [control] address is set; phase2.md §7).
 // Everything runs on one io_context thread.
 
 #include <csignal>
 #include <cstdio>
+#include <fstream>
 #include <filesystem>
 #include <iostream>
 #include <expected>
@@ -15,6 +17,7 @@
 #include <unordered_map>
 
 #include <unistd.h>
+#include <sys/statvfs.h>
 #include <sys/sysinfo.h>
 
 #include <boost/asio/io_context.hpp>
@@ -22,6 +25,7 @@
 #include <boost/program_options.hpp>
 
 #include "fireforge/tdr/v1/local.pb.h"
+#include "tdr/agent/agent.hpp"
 #include "tdr/artifacts/store.hpp"
 #include "tdr/common/common.hpp"
 #include "tdr/common/config.hpp"
@@ -30,6 +34,7 @@
 #include "tdr/journal/journal.hpp"
 #include "tdr/protocol/envelope.hpp"
 #include "tdr/supervisor/supervisor.hpp"
+#include "tdr/tls/tls.hpp"
 
 #include "job_user.hpp"
 
@@ -151,15 +156,29 @@ public:
         }
 
         manager_->recover();
+        if (!cfg_.control.address.empty()) start_agent(job_user.has_value());
 
         asio::signal_set signals(io_, SIGINT, SIGTERM);
-        signals.async_wait([this](const boost::system::error_code& ec, int sig) {
+        std::function<void(const boost::system::error_code&, int)> on_signal =
+            [this, &signals, &on_signal](const boost::system::error_code& ec, int sig) {
             if (ec) return;
-            tdr::log_info("signal {}: shutting down (running jobs are recovered on next start)", sig);
-            ctl_server_->stop();
-            worker_server_->stop();
-            io_.stop();
-        });
+            auto finish = [this] {
+                ctl_server_->stop();
+                worker_server_->stop();
+                io_.stop();
+            };
+            if (stopping_ || !agent_) {
+                tdr::log_info("signal {}: shutting down (running jobs are recovered on next start)", sig);
+                return finish();
+            }
+            // Tell the control plane we're going away (bounded), then stop.
+            // A second signal stops immediately.
+            stopping_ = true;
+            tdr::log_info("signal {}: going offline, then shutting down (running jobs are recovered on next start)", sig);
+            signals.async_wait(on_signal);
+            agent_->stop(finish);
+        };
+        signals.async_wait(on_signal);
 
         tdr::log_info("tdrd {} node={} cpus={} memory={}MiB max_jobs={} cgroups={} state_dir={}", TDR_VERSION,
                       node_name(), res_.capacity.cpu_cores, res_.capacity.memory_bytes / kMiB, res_.capacity.jobs,
@@ -171,6 +190,8 @@ public:
         // callback reaches a destroyed manager.
         ctl_server_.reset();
         worker_server_.reset();
+        agent_.reset();
+        control_client_.reset();
         manager_.reset();
         return 0;
     }
@@ -196,6 +217,90 @@ private:
     }
 
     std::string node_name() const { return cfg_.node.name.empty() ? hostname() : cfg_.node.name; }
+
+    // ---- control plane (phase2.md §7) --------------------------------------
+    void start_agent(bool has_job_user) {
+        if (cfg_.control.scheme != "https")
+            throw std::runtime_error("control.scheme must be https, got '" + cfg_.control.scheme + "'");
+        auto ctx = tdr::tls::make_client_context({cfg_.tls.ca_file, cfg_.tls.cert_file, cfg_.tls.key_file});
+        auto ident = tdr::tls::read_identity(cfg_.tls.cert_file);
+        if (!ident) throw std::runtime_error(cfg_.tls.cert_file.string() + ": " + ident.error());
+        if (ident->role != tdr::tls::Role::kNode)
+            throw std::runtime_error(cfg_.tls.cert_file.string() + ": not a node certificate");
+        if (ident->name != node_name())
+            throw std::runtime_error(std::format("node certificate is for '{}' but node.name is '{}'", ident->name,
+                                                 node_name()));
+
+        tdr::http::ClientOptions copts;
+        copts.host = cfg_.control.address;
+        copts.port = cfg_.control.port;
+        copts.verify_host = cfg_.control.address;
+        control_url_ = std::format("https://{}:{}", cfg_.control.address, cfg_.control.port);
+        control_client_ = tdr::agent::make_https_control_client(io_, ctx, copts);
+
+        tdr::agent::AgentOptions aopts;
+        auto& reg = aopts.registration;
+        reg.set_name(node_name());
+        reg.set_daemon_version(TDR_VERSION);
+        for (auto& a : tdr::agent::detect_addresses(cfg_.network.listen_port, cfg_.network.tailscale,
+                                                    cfg_.node.advertise_address))
+            *reg.add_addresses() = std::move(a);
+        *reg.mutable_physical() = tdr::agent::detect_physical(cfg_.paths.state_dir);
+        auto* conf = reg.mutable_configured();
+        conf->set_cpu_cores(res_.capacity.cpu_cores);
+        conf->set_memory_bytes(res_.capacity.memory_bytes);
+        conf->set_disk_bytes(cfg_.resources.max_disk_mb * kMiB);
+        conf->set_gpu_count(reg.physical().gpu_count());
+        reg.add_capabilities("cpu");
+        if (reg.physical().gpu_count() > 0) reg.add_capabilities("gpu:nvidia");
+        if (supervisor_->cgroups_enabled()) reg.add_capabilities("cgroups");
+        if (has_job_user) reg.add_capabilities("job-user");
+        aopts.local_capacity = res_.capacity;
+        aopts.policy_cache = cfg_.policy_cache();
+
+        tdr::agent::AgentHooks hooks;
+        hooks.apply_capacity = [this](const tdr::jobs::Capacity& cap) {
+            auto old = manager_->capacity();
+            manager_->set_capacity(cap);
+            if (old.cpu_cores != cap.cpu_cores || old.memory_bytes != cap.memory_bytes || old.jobs != cap.jobs)
+                tdr::log_info("capacity now cpus={} memory={}MiB max_jobs={}", cap.cpu_cores, cap.memory_bytes / kMiB,
+                              cap.jobs);
+        };
+        hooks.fill_stats = [this](tdr::agent::cv1::Heartbeat& hb) { fill_heartbeat(hb); };
+
+        agent_ = std::make_unique<tdr::agent::NodeAgent>(io_, *control_client_, std::move(aopts), std::move(hooks));
+        agent_->start();
+        tdr::log_info("control plane {} (node cert '{}')", control_url_, ident->name);
+    }
+
+    void fill_heartbeat(tdr::agent::cv1::Heartbeat& hb) {
+        auto u = manager_->usage();
+        auto cap = manager_->capacity();
+        hb.mutable_capacity()->set_cpu_cores(cap.cpu_cores);
+        hb.mutable_capacity()->set_memory_bytes(cap.memory_bytes);
+        hb.mutable_capacity()->set_disk_bytes(cfg_.resources.max_disk_mb * kMiB);
+        hb.mutable_allocated()->set_cpu_cores(u.allocated.cpu_cores);
+        hb.mutable_allocated()->set_memory_bytes(u.allocated.memory_bytes);
+        hb.set_running_jobs(u.running);
+        hb.set_queued_jobs(u.queued);
+        hb.set_failed_jobs(journal_->failed_job_count());
+        hb.set_cpu_utilization(cpu_sampler_.sample());
+        hb.set_memory_available_bytes(mem_available());
+        struct statvfs vfs {};
+        if (statvfs(cfg_.paths.state_dir.c_str(), &vfs) == 0)
+            hb.set_disk_available_bytes(static_cast<std::uint64_t>(vfs.f_bavail) * vfs.f_frsize);
+    }
+
+    static std::uint64_t mem_available() {
+        std::ifstream in("/proc/meminfo");
+        std::string key;
+        std::uint64_t kb = 0;
+        std::string unit;
+        while (in >> key >> kb >> unit) {
+            if (key == "MemAvailable:") return kb * 1024;
+        }
+        return 0;
+    }
 
     // ---- worker socket ----------------------------------------------------
     void on_worker_frame(const std::shared_ptr<Connection>& c, Frame f) {
@@ -295,14 +400,32 @@ private:
                 a->set_memory_bytes(cap.memory_bytes);
                 a->set_jobs(cap.jobs);
             };
-            fill(st.mutable_capacity(), res_.capacity);
+            fill(st.mutable_capacity(), manager_->capacity());
             fill(st.mutable_allocated(), u.allocated);
             st.set_running_jobs(u.running);
             st.set_queued_jobs(u.queued);
             st.set_failed_jobs(journal_->failed_job_count());
             st.set_cgroups_enabled(supervisor_->cgroups_enabled());
             st.set_started_unix_ms(started_ms_);
+            if (agent_) {
+                st.set_control_state(tdr::agent::to_string(agent_->state()));
+                st.set_node_id(agent_->node_id());
+                if (auto pol = agent_->policy()) st.set_policy_version(pol->version());
+                st.set_last_heartbeat_ok_unix_ms(agent_->last_heartbeat_ok_ms());
+                st.set_control_url(control_url_);
+                st.set_last_control_error(agent_->last_error());
+            } else {
+                st.set_control_state("standalone");
+            }
             return reply(c, f, v1::CTL_NODE_STATUS_REPLY, st);
+        }
+        case v1::CTL_PEERS: {
+            v1::PeerList list;
+            if (agent_) {
+                *list.mutable_peers() = agent_->peers().nodes();
+                list.set_refreshed_unix_ms(agent_->peers_refreshed_ms());
+            }
+            return reply(c, f, v1::CTL_PEERS_REPLY, list);
         }
         default:
             return reply_error(c, f, v1::UNSUPPORTED, "unsupported message type on control socket");
@@ -319,6 +442,11 @@ private:
     std::unique_ptr<tdr::jobs::JobManager> manager_;
     std::unique_ptr<tdr::ipc::UnixServer> worker_server_;
     std::unique_ptr<tdr::ipc::UnixServer> ctl_server_;
+    std::unique_ptr<tdr::agent::IControlClient> control_client_;
+    std::unique_ptr<tdr::agent::NodeAgent> agent_;
+    tdr::agent::CpuSampler cpu_sampler_;
+    std::string control_url_;
+    bool stopping_ = false;
     std::unordered_map<std::uint64_t, std::string> attempt_by_conn_;
     std::unordered_map<std::string, std::weak_ptr<Connection>> conn_by_attempt_;
 };

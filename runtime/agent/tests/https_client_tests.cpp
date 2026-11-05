@@ -1,0 +1,228 @@
+// make_https_control_client against a real HttpsServer with mTLS (same io_context).
+#include <google/protobuf/util/json_util.h>
+
+#include <boost/test/unit_test.hpp>
+#include <chrono>
+
+#include "tdr/agent/agent.hpp"
+#include "tdr/common/common.hpp"
+#include "tdr/tls/tls.hpp"
+
+namespace asio = boost::asio;
+namespace tls = tdr::tls;
+namespace http = tdr::http;
+using namespace std::chrono_literals;
+using namespace tdr::agent;
+
+namespace {
+
+struct Pki {
+    fs::path dir = fs::temp_directory_path() / tdr::new_id("agent-pki");
+    Pki() {
+        fs::create_directories(dir);
+        must(tls::create_ca(dir, "ca"));
+        tls::IssueOptions s;
+        s.role = tls::Role::kServer;
+        s.name = "cp";
+        s.ip_sans = {"127.0.0.1"};
+        must(tls::issue(dir, s, dir / "cp.key", dir / "cp.crt"));
+        tls::IssueOptions n;
+        n.name = "node-a";
+        must(tls::issue(dir, n, dir / "node.key", dir / "node.crt"));
+    }
+    ~Pki() {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+    static void must(const std::expected<void, std::string>& r) {
+        if (!r) throw std::runtime_error(r.error());
+    }
+};
+
+std::string json_of(const google::protobuf::Message& m) {
+    std::string s;
+    google::protobuf::util::JsonPrintOptions o;
+    o.preserve_proto_field_names = true;
+    (void)google::protobuf::util::MessageToJsonString(m, &s, o);
+    return s;
+}
+
+struct Rig {
+    Pki pki;
+    asio::io_context io;
+    http::Router router;
+    std::unique_ptr<http::HttpsServer> server;
+    std::unique_ptr<IControlClient> client;
+    std::vector<std::string> seen;  // "METHOD path body"
+    cv1::RegisterRequest last_register;
+    bool fail_list = false;
+
+    Rig() {
+        router.add("POST", "/api/v1/nodes/register", [this](http::Request& r) {
+            seen.push_back("register " + r.peer.value_or(tls::Identity{}).name);
+            google::protobuf::util::JsonParseOptions po;
+            po.ignore_unknown_fields = true;
+            if (!google::protobuf::util::JsonStringToMessage(r.body, &last_register, po).ok()) {
+                return http::error_response(400, "bad_request", "bad json");
+            }
+            cv1::RegisterReply rep;
+            rep.set_node_id("ff-node-00000000000000aa");
+            rep.mutable_policy()->set_version(3);
+            rep.mutable_policy()->set_max_jobs(1);
+            rep.set_heartbeat_interval_seconds(10);
+            return http::Response{200, json_of(rep) + R"(                                     )"};
+        });
+        router.add("POST", "/api/v1/nodes/heartbeat", [this](http::Request& r) {
+            seen.push_back("heartbeat");
+            if (r.body.find("ff-node-00000000000000aa") == std::string::npos) {
+                return http::error_response(404, "not_found", "unknown node");
+            }
+            return http::Response{200, R"({"heartbeat_interval_seconds": 10, "extra": true})"};
+        });
+        router.add("GET", "/api/v1/nodes", [this](http::Request&) {
+            seen.push_back("list");
+            if (fail_list) return http::Response{502, "gateway down", "text/plain"};
+            return http::Response{200, R"({"nodes": [{"node_id": "x", "name": "node-a"}]})"};
+        });
+        router.add("POST", "/api/v1/nodes/{id}/offline", [this](http::Request& r) {
+            seen.push_back("offline " + r.params.at("id") + " " + r.body);
+            return http::Response{200, "not json"};
+        });
+
+        http::ServerOptions so;
+        so.listen_address = "127.0.0.1";
+        so.port = 0;
+        tls::Credentials sc{pki.dir / "ca.crt", pki.dir / "cp.crt", pki.dir / "cp.key"};
+        server = std::make_unique<http::HttpsServer>(io, tls::make_server_context(sc), so,
+                                                     [this](http::Request& r) { return router.dispatch(r); });
+        server->start();
+        client = make_https_control_client(io, client_ctx(), options(server->bound_port()));
+    }
+    ~Rig() {
+        client.reset();
+        server->stop();
+        io.restart();
+        io.run_for(100ms);
+    }
+    std::shared_ptr<asio::ssl::context> client_ctx() const {
+        return tls::make_client_context({pki.dir / "ca.crt", pki.dir / "node.crt", pki.dir / "node.key"});
+    }
+    static http::ClientOptions options(std::uint16_t port) {
+        http::ClientOptions o;
+        o.host = "127.0.0.1";
+        o.port = port;
+        o.verify_host = "127.0.0.1";
+        o.timeout = 3000ms;
+        return o;
+    }
+    template <class Pred>
+    bool run_until(Pred pred, std::chrono::milliseconds timeout = 5000ms) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!pred()) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            if (io.stopped()) io.restart();
+            io.run_one_for(10ms);
+        }
+        return true;
+    }
+};
+
+}  // namespace
+
+BOOST_AUTO_TEST_SUITE(https_control_client)
+
+BOOST_AUTO_TEST_CASE(round_trips_and_errors) {
+    Rig rig;
+    cv1::RegisterRequest req;
+    req.set_name("node-a");
+    req.set_daemon_version("0.1.0");
+    req.add_capabilities("cpu");
+
+    std::optional<Result<cv1::RegisterReply>> reg;
+    rig.client->register_node(req, [&](Result<cv1::RegisterReply> r) { reg = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return reg.has_value(); }));
+    BOOST_REQUIRE_MESSAGE(reg->has_value(), (reg->has_value() ? "" : reg->error().message));
+    BOOST_TEST((*reg)->node_id() == "ff-node-00000000000000aa");
+    BOOST_TEST((*reg)->policy().version() == 3u);
+    BOOST_TEST(rig.last_register.name() == "node-a");
+    BOOST_TEST(rig.last_register.capabilities_size() == 1);
+    BOOST_TEST(rig.seen.at(0) == "register node-a");  // mTLS identity reached the server
+
+    std::optional<Result<cv1::HeartbeatReply>> hb;
+    cv1::Heartbeat h;
+    h.set_node_id("ff-node-unknown");
+    rig.client->heartbeat(h, [&](Result<cv1::HeartbeatReply> r) { hb = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return hb.has_value(); }));
+    BOOST_REQUIRE(!hb->has_value());
+    BOOST_TEST(hb->error().http_status == 404);
+    BOOST_TEST(hb->error().message == "unknown node");
+
+    hb.reset();
+    h.set_node_id("ff-node-00000000000000aa");
+    rig.client->heartbeat(h, [&](Result<cv1::HeartbeatReply> r) { hb = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return hb.has_value(); }));
+    BOOST_REQUIRE(hb->has_value());  // unknown field ignored
+    BOOST_TEST((*hb)->heartbeat_interval_seconds() == 10u);
+
+    std::optional<Result<cv1::NodeList>> list;
+    rig.client->list_nodes([&](Result<cv1::NodeList> r) { list = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return list.has_value(); }));
+    BOOST_REQUIRE(list->has_value());
+    BOOST_TEST((*list)->nodes_size() == 1);
+
+    list.reset();
+    rig.fail_list = true;
+    rig.client->list_nodes([&](Result<cv1::NodeList> r) { list = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return list.has_value(); }));
+    BOOST_REQUIRE(!list->has_value());
+    BOOST_TEST(list->error().http_status == 502);
+    BOOST_TEST(list->error().message == "gateway down");  // non-ApiError body passed through
+
+    std::optional<Result<cv1::NodeInfo>> off;
+    rig.client->offline("ff-node-00000000000000aa", "shutdown", [&](Result<cv1::NodeInfo> r) { off = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return off.has_value(); }));
+    BOOST_REQUIRE(!off->has_value());  // 2xx with a non-JSON body
+    BOOST_TEST(off->error().http_status == 200);
+    BOOST_TEST(off->error().message.starts_with("bad response"));
+    BOOST_TEST(rig.seen.back() == R"(offline ff-node-00000000000000aa {"reason":"shutdown"})");
+}
+
+BOOST_AUTO_TEST_CASE(transport_error_has_status_zero) {
+    Rig rig;
+    const auto port = rig.server->bound_port();
+    rig.server->stop();
+    auto dead = make_https_control_client(rig.io, rig.client_ctx(), Rig::options(port));
+    std::optional<Result<cv1::NodeList>> list;
+    dead->list_nodes([&](Result<cv1::NodeList> r) { list = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return list.has_value(); }));
+    BOOST_REQUIRE(!list->has_value());
+    BOOST_TEST(list->error().http_status == 0);
+    BOOST_TEST(!list->error().message.empty());
+}
+
+BOOST_AUTO_TEST_CASE(node_agent_end_to_end) {
+    Rig rig;
+    AgentOptions o;
+    o.registration.set_name("node-a");
+    o.registration.set_daemon_version("0.1.0");
+    o.local_capacity = {4, 8ull << 30, 4};
+    o.policy_cache = rig.pki.dir / "policy.json";
+    std::vector<tdr::jobs::Capacity> applied;
+    AgentHooks hooks;
+    hooks.apply_capacity = [&](const tdr::jobs::Capacity& c) { applied.push_back(c); };
+    NodeAgent agent(rig.io, *rig.client, o, hooks);
+    agent.start();
+    BOOST_REQUIRE(rig.run_until([&] { return agent.state() == ControlState::kConnected && agent.peers_refreshed_ms() > 0; }));
+    BOOST_TEST(agent.node_id() == "ff-node-00000000000000aa");
+    BOOST_REQUIRE(applied.size() == 2u);
+    BOOST_TEST(applied[1].jobs == 1u);
+    BOOST_TEST(fs::exists(o.policy_cache));
+    BOOST_TEST(agent.peers().nodes_size() == 1);
+
+    bool done = false;
+    agent.stop([&] { done = true; });
+    BOOST_REQUIRE(rig.run_until([&] { return done; }));
+    BOOST_TEST(rig.seen.back().starts_with("offline ff-node-00000000000000aa"));
+}
+
+BOOST_AUTO_TEST_SUITE_END()

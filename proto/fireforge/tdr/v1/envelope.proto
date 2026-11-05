@@ -61,6 +61,8 @@ enum MessageType {
   CTL_ACK = 0x1108;
   CTL_NODE_STATUS = 0x1109;        // NodeStatusRequest -> NodeStatus
   CTL_NODE_STATUS_REPLY = 0x110A;
+  CTL_PEERS = 0x110B;              // PeersRequest      -> PeerList (Phase 2)
+  CTL_PEERS_REPLY = 0x110C;
 
   // Any request may be answered with ERROR (payload: Error).
   ERROR = 0x7FFF;

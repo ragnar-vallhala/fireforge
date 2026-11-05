@@ -1,0 +1,22 @@
+[Unit]
+Description=FireForge control plane (tdrcp)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fireforge-cp
+Group=fireforge-cp
+ExecStart=/usr/local/bin/tdrcp --config /etc/fireforge/tdrcp.conf
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

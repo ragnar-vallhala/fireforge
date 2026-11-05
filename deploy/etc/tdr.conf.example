@@ -34,6 +34,12 @@ cgroups = auto
 # Empty = same user as tdrd (development only). See docs/design/phase1.md §11.
 job_user =
 
+[tls]
+# mTLS credentials for the control plane (issued with `tdrctl pki issue --role node`).
+ca_file = /etc/fireforge/certificates/ca.crt
+cert_file = /etc/fireforge/certificates/node.crt
+key_file = /etc/fireforge/node.key
+
 [paths]
 state_dir = /var/lib/fireforge
 # Empty = stderr only (captured by journald)

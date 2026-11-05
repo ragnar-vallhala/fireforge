@@ -107,6 +107,13 @@ public:
     std::vector<v1::JobStatus> list(v1::JobState state, std::size_t limit) const;
     Usage usage() const;
 
+    // Live node capacity (Phase 2: control-plane policy, phase2.md §4). Raising
+    // it starts queued work; lowering it only affects admission of new attempts
+    // (running jobs are never killed). New submits are validated against it;
+    // already-queued jobs that no longer fit stay queued until capacity grows.
+    void set_capacity(const Capacity& capacity);
+    Capacity capacity() const;
+
     // ---- worker IPC hooks (called by the daemon's worker-socket handler) ----
     // Validates attempt id + token and that the attempt is RUNNING. Returns the
     // task to send back, or an error string (daemon replies ERROR UNAUTHORIZED).

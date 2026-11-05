@@ -6,6 +6,7 @@ syntax = "proto3";
 package fireforge.tdr.v1;
 
 import "fireforge/tdr/v1/job.proto";
+import "fireforge/control/v1/control.proto";
 
 // ---------------------------------------------------------------------------
 // Worker protocol
@@ -112,6 +113,21 @@ message NodeStatus {
   uint64 failed_jobs = 7;
   bool cgroups_enabled = 8;
   int64 started_unix_ms = 9;
+
+  // Control plane (Phase 2). control_state: "standalone" | "registering" |
+  // "connected" | "disconnected".
+  string control_state = 10;
+  string node_id = 11;
+  uint64 policy_version = 12;
+  int64 last_heartbeat_ok_unix_ms = 13;
+  string control_url = 14;
+  string last_control_error = 15;
+}
+
+message PeersRequest {}
+message PeerList {
+  repeated fireforge.control.v1.NodeInfo peers = 1;
+  int64 refreshed_unix_ms = 2;    // 0 = never fetched
 }
 
 message Ack {}

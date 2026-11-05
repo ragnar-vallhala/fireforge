@@ -121,6 +121,9 @@ std::expected<Config, std::string> config_from_ini(const IniFile& ini) {
                        {"default_job_memory_mb", num(c.resources.default_job_memory_mb)},
                        {"cgroups", str(c.resources.cgroups)},
                        {"job_user", str(c.resources.job_user)}}},
+        {"tls", {{"ca_file", path(c.tls.ca_file)},
+                 {"cert_file", path(c.tls.cert_file)},
+                 {"key_file", path(c.tls.key_file)}}},
         {"paths", {{"state_dir", path(c.paths.state_dir)}, {"log_file", path(c.paths.log_file)}}},
         {"log", {{"level", str(c.log_level)}}},
     };

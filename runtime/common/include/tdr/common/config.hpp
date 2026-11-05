@@ -49,6 +49,13 @@ struct Config {
         std::string job_user;                // run jobs as this user; "" = daemon's user (phase1.md §11)
     } resources;
 
+    // mTLS to the control plane (phase2.md §2, §7). Required when control.address is set.
+    struct Tls {
+        std::filesystem::path ca_file = "/etc/fireforge/certificates/ca.crt";
+        std::filesystem::path cert_file = "/etc/fireforge/certificates/node.crt";
+        std::filesystem::path key_file = "/etc/fireforge/node.key";
+    } tls;
+
     struct Paths {
         std::filesystem::path state_dir = "/var/lib/fireforge";  // journal, artifacts, work, run
         std::filesystem::path log_file;      // empty = stderr only
@@ -63,6 +70,7 @@ struct Config {
     std::filesystem::path run_dir() const { return paths.state_dir / "run"; }
     std::filesystem::path ctl_socket() const { return run_dir() / "ctl.sock"; }
     std::filesystem::path worker_socket() const { return run_dir() / "worker.sock"; }
+    std::filesystem::path policy_cache() const { return paths.state_dir / "state" / "policy.json"; }
 };
 
 // Unknown sections/keys are an error (catches typos). Missing keys keep defaults.

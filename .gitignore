@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 /var/
 sdk/python/fireforge/tdr/v1/*_pb2.py
+sdk/python/fireforge/control/v1/*_pb2.py

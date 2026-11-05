@@ -15,6 +15,8 @@
 #include "tdr/ipc/ipc.hpp"
 #include "tdr/protocol/envelope.hpp"
 
+#include "remote.hpp"
+
 namespace v1 = ::fireforge::tdr::v1;
 using tdr::protocol::Frame;
 using tdr::protocol::make_frame;
@@ -31,13 +33,17 @@ commands:
   status JOB_ID [--json]
   list [--state STATE] [--limit N] [--json]
   cancel JOB_ID
-  node [--json]
+  node [--json]                 includes control-plane state (Phase 2)
+  peers [--json]                peer directory cached from the control plane
   wait JOB_ID [--timeout S]     exit 0 iff the job COMPLETED
+
+  pki ...                       local CA and certificates   (tdrctl pki --help)
+  cp ...                        control-plane admin (HTTPS)  (tdrctl cp --help)
 
 socket: --socket, else $TDR_SOCKET, else /var/lib/fireforge/run/ctl.sock
 )";
 
-struct UsageError : std::runtime_error { using std::runtime_error::runtime_error; };
+using tdrctl::UsageError;
 
 std::string to_json(const google::protobuf::Message& m) {
     google::protobuf::util::JsonPrintOptions o;
@@ -193,7 +199,35 @@ int cmd_node(Client& cl, const std::vector<std::string>& a) {
               << "memory:    " << mib(st.allocated().memory_bytes()) << "/" << mib(st.capacity().memory_bytes()) << " MiB allocated\n"
               << "jobs:      " << st.running_jobs() << " running (max " << st.capacity().jobs() << "), "
               << st.queued_jobs() << " queued, " << st.failed_jobs() << " failed total\n"
-              << "cgroups:   " << (st.cgroups_enabled() ? "on" : "off (rlimit fallback)") << "\n";
+              << "cgroups:   " << (st.cgroups_enabled() ? "on" : "off (rlimit fallback)") << "\n"
+              << "control:   " << (st.control_state().empty() ? "standalone" : st.control_state());
+    if (!st.control_url().empty()) std::cout << " (" << st.control_url() << ")";
+    std::cout << "\n";
+    if (!st.node_id().empty()) std::cout << "node_id:   " << st.node_id() << " (policy v" << st.policy_version() << ")\n";
+    if (st.last_heartbeat_ok_unix_ms() > 0) {
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+                       .count() - st.last_heartbeat_ok_unix_ms() / 1000;
+        std::cout << "heartbeat: " << age << " s ago\n";
+    }
+    if (!st.last_control_error().empty() && st.control_state() != "connected")
+        std::cout << "error:     " << st.last_control_error() << "\n";
+    return 0;
+}
+
+int cmd_peers(Client& cl, const std::vector<std::string>& a) {
+    v1::PeerList pl;
+    cl.call(v1::CTL_PEERS, v1::PeersRequest{}, v1::CTL_PEERS_REPLY).parse(pl);
+    if (!a.empty() && a[0] == "--json") { std::cout << to_json(pl); return 0; }
+    if (pl.refreshed_unix_ms() == 0) {
+        std::cout << "no peer directory yet (standalone, or not connected to the control plane)\n";
+        return 0;
+    }
+    for (const auto& n : pl.peers()) {
+        std::cout << n.name() << "  " << n.node_id() << "  "
+                  << ::fireforge::control::v1::NodeHealth_Name(n.health());
+        for (const auto& ad : n.addresses()) std::cout << "  " << ad.type() << "=" << ad.address() << ":" << ad.port();
+        std::cout << "\n";
+    }
     return 0;
 }
 
@@ -234,6 +268,8 @@ int main(int argc, char** argv) {
     std::string cmd = args[0];
     args.erase(args.begin());
     try {
+        if (cmd == "pki") return tdrctl::run_pki(args);
+        if (cmd == "cp") return tdrctl::run_cp(args);
         Client cl(socket);
         if (cmd == "submit") return cmd_submit(cl, args);
         if (cmd == "status") return cmd_status(cl, args);
@@ -241,6 +277,7 @@ int main(int argc, char** argv) {
         if (cmd == "cancel") return cmd_cancel(cl, args);
         if (cmd == "node") return cmd_node(cl, args);
         if (cmd == "wait") return cmd_wait(cl, args);
+        if (cmd == "peers") return cmd_peers(cl, args);
         throw UsageError("unknown command: " + cmd);
     } catch (const UsageError& e) {
         std::cerr << "tdrctl: " << e.what() << "\n\n" << kUsage;

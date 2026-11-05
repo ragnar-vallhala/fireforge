@@ -28,6 +28,7 @@ find_package(Boost 1.83 CONFIG REQUIRED COMPONENTS unit_test_framework program_o
 find_package(Protobuf REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(PostgreSQL REQUIRED)   # libpq (control plane)
 
 enable_testing()
 include(cmake/TdrModule.cmake)
@@ -44,7 +45,13 @@ add_subdirectory(runtime/journal)
 add_subdirectory(runtime/artifacts)
 add_subdirectory(runtime/supervisor)
 add_subdirectory(runtime/jobs)
+add_subdirectory(runtime/tls)
+add_subdirectory(runtime/http)
+add_subdirectory(runtime/agent)
+add_subdirectory(control/db)
+add_subdirectory(control/api)
 
 # Executables.
 add_subdirectory(runtime/daemon)
 add_subdirectory(runtime/ctl)
+add_subdirectory(control/server)

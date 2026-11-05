@@ -1,0 +1,25 @@
+# /etc/fireforge/tdrcp.conf — FireForge control plane (docs/design/phase2.md §8)
+
+[server]
+listen_address = 0.0.0.0
+port = 8080
+
+[tls]
+# Server cert issued with `tdrctl pki issue DIR --role server NAME --dns HOST --ip ADDR`.
+ca_file = /etc/fireforge/certificates/ca.crt
+cert_file = /etc/fireforge/certificates/server.crt
+key_file = /etc/fireforge/server.key
+
+[database]
+# libpq conninfo or URI.
+conninfo = postgresql:///fireforge
+
+[health]
+# Seconds. Nodes heartbeat every heartbeat_interval; STALE after stale_after
+# without one, OFFLINE after offline_after.
+heartbeat_interval = 10
+stale_after = 30
+offline_after = 90
+
+[log]
+level = info

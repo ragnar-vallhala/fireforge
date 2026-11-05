@@ -842,6 +842,13 @@ Usage JobManager::usage() const {
     return u;
 }
 
+void JobManager::set_capacity(const Capacity& capacity) {
+    impl_->opts.capacity = capacity;
+    impl_->request_schedule();
+}
+
+Capacity JobManager::capacity() const { return impl_->opts.capacity; }
+
 std::expected<v1::WorkerTask, std::string> JobManager::on_worker_hello(const v1::WorkerHello& hello) {
     return impl_->on_worker_hello(hello);
 }
