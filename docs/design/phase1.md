@@ -226,7 +226,8 @@ run for minutes to days, so durability wins and `synchronous=FULL` stays.
   running as the same user could chmod and modify one, corrupting the CAS.
   **Decided (2026-11-05):** fix with §19's restricted users. Job children run
   under a separate unprivileged uid (e.g. `fireforge-job`) that cannot chmod
-  store files owned by the daemon's uid. Planned, not yet implemented.
+  store files owned by the daemon's uid. Implemented (§11); enable with
+  `[resources] job_user`.
 - **Fallback mode (no cgroup delegation):** only memory (RLIMIT_AS) is
   enforced; CPU and pids are not, and a child calling `setsid()` escapes the
   group kill. **Decided (2026-11-05):** production nodes run `tdrd` under the
