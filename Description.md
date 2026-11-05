@@ -863,7 +863,7 @@ Security requirements:
 | 8 | Scientific integration | Complete thermoelectric workflow |
 | 9 | Discovery intelligence | Automated candidate discovery |
 
-Phase 1 design: [docs/design/phase1.md](docs/design/phase1.md).
+Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md).
 
 ## First Demonstration
 
@@ -916,13 +916,13 @@ Decided 2026-11-05.
 | 8 | Multi-node MPI | Built into TDR after Phase 6 (coordinated multi-node allocation and launch), not delegated to Slurm | Keeps one scheduler and one resource model |
 | 9 | In-house numerics | CUDA kernels for hot paths once profiling identifies them (e.g. phonon-phonon scattering sums) | Effort goes only where measurements justify it |
 | 10 | First campaign | Half-Heusler compounds | Small 3-atom cells, large combinatorial space, good high-temperature stability, rich literature for validation |
+| 11 | Control-plane implementation | C++ (`tdrcp`: Boost.Beast HTTPS + libpq), shared code with TDR | One toolchain, one protocol/TLS stack |
+| 12 | Node and peer authentication | mTLS with a private FireForge CA (TLS 1.3); node certs (`OU=node`) authenticate to the control plane and to peers | One trust root for control and peer traffic; works over LAN and Tailscale |
 
 **Still open:**
 
 - Exact hybrid push/pull policy (which jobs are pushed, and how push and pull interact).
-- Control-plane implementation language.
 - Artifact retention and garbage-collection policy.
-- Peer authentication mechanism (mTLS versus Noise).
 - cgroup delegation policy.
 
 # 22. Project Principles

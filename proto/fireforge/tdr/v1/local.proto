@@ -126,8 +126,10 @@ message NodeStatus {
 
 message PeersRequest {}
 message PeerList {
-  repeated fireforge.control.v1.NodeInfo peers = 1;
+  repeated fireforge.control.v1.NodeInfo peers = 1;            // directory
   int64 refreshed_unix_ms = 2;    // 0 = never fetched
+  repeated fireforge.control.v1.PeerReachability connections = 3;  // live link state (Phase 3)
+  uint32 listen_port = 4;         // bound peer port (0 = peer listener off)
 }
 
 message Ack {}

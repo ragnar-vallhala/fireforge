@@ -2,7 +2,8 @@
 //
 // Wiring only: config -> supervisor (first, it may move this process into a
 // cgroup) -> journal -> artifact store -> JobManager -> two Unix sockets
-// -> NodeAgent (only when [control] address is set; phase2.md §7).
+// -> NodeAgent (only when [control] address is set; phase2.md §7)
+// -> peer listener + PeerManager, started on the first directory (phase3.md).
 // Everything runs on one io_context thread.
 
 #include <csignal>
@@ -26,6 +27,8 @@
 
 #include "fireforge/tdr/v1/local.pb.h"
 #include "tdr/agent/agent.hpp"
+#include "tdr/peer/manager.hpp"
+#include "tdr/peer/transport.hpp"
 #include "tdr/artifacts/store.hpp"
 #include "tdr/common/common.hpp"
 #include "tdr/common/config.hpp"
@@ -175,6 +178,7 @@ public:
             // A second signal stops immediately.
             stopping_ = true;
             tdr::log_info("signal {}: going offline, then shutting down (running jobs are recovered on next start)", sig);
+            if (peers_) peers_->stop();
             signals.async_wait(on_signal);
             agent_->stop(finish);
         };
@@ -190,6 +194,9 @@ public:
         // callback reaches a destroyed manager.
         ctl_server_.reset();
         worker_server_.reset();
+        peers_.reset();
+        if (transport_) transport_->stop();
+        transport_.reset();
         agent_.reset();
         control_client_.reset();
         manager_.reset();
@@ -242,9 +249,7 @@ private:
         auto& reg = aopts.registration;
         reg.set_name(node_name());
         reg.set_daemon_version(TDR_VERSION);
-        for (auto& a : tdr::agent::detect_addresses(cfg_.network.listen_port, cfg_.network.tailscale,
-                                                    cfg_.node.advertise_address))
-            *reg.add_addresses() = std::move(a);
+        for (auto& a : advertised_addresses()) *reg.add_addresses() = std::move(a);
         *reg.mutable_physical() = tdr::agent::detect_physical(cfg_.paths.state_dir);
         auto* conf = reg.mutable_configured();
         conf->set_cpu_cores(res_.capacity.cpu_cores);
@@ -257,6 +262,8 @@ private:
         if (has_job_user) reg.add_capabilities("job-user");
         aopts.local_capacity = res_.capacity;
         aopts.policy_cache = cfg_.policy_cache();
+        aopts.peer_refresh = std::chrono::seconds(10);
+        peer_creds_ = {cfg_.tls.ca_file, cfg_.tls.cert_file, cfg_.tls.key_file};
 
         tdr::agent::AgentHooks hooks;
         hooks.apply_capacity = [this](const tdr::jobs::Capacity& cap) {
@@ -267,13 +274,101 @@ private:
                               cap.jobs);
         };
         hooks.fill_stats = [this](tdr::agent::cv1::Heartbeat& hb) { fill_heartbeat(hb); };
+        hooks.on_directory = [this](const tdr::agent::cv1::NodeList& nodes) { on_directory(nodes); };
 
         agent_ = std::make_unique<tdr::agent::NodeAgent>(io_, *control_client_, std::move(aopts), std::move(hooks));
         agent_->start();
         tdr::log_info("control plane {} (node cert '{}')", control_url_, ident->name);
     }
 
+    // ---- peers (phase3.md) ---------------------------------------------------
+    void on_directory(const tdr::agent::cv1::NodeList& nodes) {
+        if (stopping_) return;
+        if (!peers_) {
+            if (agent_->node_id().empty()) return;
+            tdr::peer::TransportOptions topts;
+            topts.listen_address = cfg_.network.listen_address;
+            topts.listen_port = cfg_.network.listen_port;
+            transport_ = std::make_unique<tdr::peer::TlsTransport>(io_, tdr::tls::make_peer_context(peer_creds_), topts);
+
+            tdr::peer::PeerOptions popts;
+            popts.self_node_id = agent_->node_id();
+            popts.self_name = node_name();
+            popts.daemon_version = TDR_VERSION;
+            popts.ping_interval = std::chrono::seconds(std::max(1u, cfg_.network.peer_ping_interval));
+            popts.ping_timeout = std::chrono::seconds(
+                std::max(cfg_.network.peer_ping_interval + 1, cfg_.network.peer_ping_timeout));
+            peers_ = std::make_unique<tdr::peer::PeerManager>(io_, *transport_, popts);
+            peers_->set_directory_refresh([this] { if (agent_) agent_->refresh_peers(); });
+            peers_->set_state_listener([this](const std::string& id, tdr::peer::PeerState st) {
+                tdr::log_info("peer {} {}", peer_label(id), tdr::peer::to_string(st));
+            });
+            peer_self_id_ = agent_->node_id();
+            peers_->start();
+            transport_->start();  // handlers are installed; now accept
+            tdr::log_info("peer listener on {}:{} (node {})", topts.listen_address, transport_->bound_port(),
+                          agent_->node_id());
+        } else if (agent_->node_id() != peer_self_id_) {
+            tdr::log_warn("control plane assigned a new node id {}; peer links keep the old id until restart",
+                          agent_->node_id());
+        }
+        peers_->update_directory(nodes);
+    }
+
+    std::string peer_label(const std::string& id) const {
+        for (const auto& n : agent_->peers().nodes())
+            if (n.node_id() == id) return n.name() + " (" + id + ")";
+        return id;
+    }
+
+    // node.advertise_address: "auto" (detect), one address, or an explicit
+    // list "type=addr[:port], ..." (e.g. "lan=192.168.1.5, tailscale=100.64.0.3:7400").
+    std::vector<tdr::agent::cv1::NodeAddress> advertised_addresses() const {
+        const auto& adv = cfg_.node.advertise_address;
+        if (adv.find('=') == std::string::npos)
+            return tdr::agent::detect_addresses(cfg_.network.listen_port, cfg_.network.tailscale, adv);
+        std::vector<tdr::agent::cv1::NodeAddress> out;
+        std::size_t pos = 0;
+        while (pos <= adv.size()) {
+            auto end = adv.find(',', pos);
+            if (end == std::string::npos) end = adv.size();
+            std::string item = adv.substr(pos, end - pos);
+            pos = end + 1;
+            auto trim = [](std::string v) {
+                auto b = v.find_first_not_of(" \t"), e = v.find_last_not_of(" \t");
+                return b == std::string::npos ? std::string{} : v.substr(b, e - b + 1);
+            };
+            item = trim(item);
+            if (item.empty()) continue;
+            auto eq = item.find('=');
+            if (eq == std::string::npos || eq == 0)
+                throw std::runtime_error("node.advertise_address: expected type=addr[:port], got '" + item + "'");
+            tdr::agent::cv1::NodeAddress a;
+            a.set_type(trim(item.substr(0, eq)));
+            std::string hp = trim(item.substr(eq + 1));
+            std::uint32_t port = cfg_.network.listen_port;
+            std::string host = hp;
+            if (hp.starts_with('[')) {  // [v6]:port
+                auto close = hp.find(']');
+                if (close == std::string::npos) throw std::runtime_error("node.advertise_address: bad IPv6 '" + hp + "'");
+                host = hp.substr(1, close - 1);
+                if (close + 1 < hp.size() && hp[close + 1] == ':') port = static_cast<std::uint32_t>(std::stoul(hp.substr(close + 2)));
+            } else if (auto c = hp.rfind(':'); c != std::string::npos && hp.find(':') == c) {
+                host = hp.substr(0, c);
+                port = static_cast<std::uint32_t>(std::stoul(hp.substr(c + 1)));
+            }
+            if (host.empty() || port == 0 || port > 65535)
+                throw std::runtime_error("node.advertise_address: bad address '" + hp + "'");
+            a.set_address(host);
+            a.set_port(port);
+            out.push_back(std::move(a));
+        }
+        return out;
+    }
+
     void fill_heartbeat(tdr::agent::cv1::Heartbeat& hb) {
+        if (peers_)
+            for (auto& p : peers_->snapshot()) *hb.add_peers() = std::move(p);
         auto u = manager_->usage();
         auto cap = manager_->capacity();
         hb.mutable_capacity()->set_cpu_cores(cap.cpu_cores);
@@ -425,6 +520,10 @@ private:
                 *list.mutable_peers() = agent_->peers().nodes();
                 list.set_refreshed_unix_ms(agent_->peers_refreshed_ms());
             }
+            if (peers_) {
+                for (auto& p : peers_->snapshot()) *list.add_connections() = std::move(p);
+                list.set_listen_port(transport_->bound_port());
+            }
             return reply(c, f, v1::CTL_PEERS_REPLY, list);
         }
         default:
@@ -446,6 +545,10 @@ private:
     std::unique_ptr<tdr::agent::NodeAgent> agent_;
     tdr::agent::CpuSampler cpu_sampler_;
     std::string control_url_;
+    tdr::tls::Credentials peer_creds_;
+    std::unique_ptr<tdr::peer::TlsTransport> transport_;
+    std::unique_ptr<tdr::peer::PeerManager> peers_;
+    std::string peer_self_id_;  // node id the PeerManager was created with
     bool stopping_ = false;
     std::unordered_map<std::uint64_t, std::string> attempt_by_conn_;
     std::unordered_map<std::string, std::weak_ptr<Connection>> conn_by_attempt_;

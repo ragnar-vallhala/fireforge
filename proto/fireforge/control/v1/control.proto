@@ -70,6 +70,20 @@ message Heartbeat {
   uint64 failed_jobs = 11;
   uint64 policy_version = 12;          // version the node has applied
   repeated NodeAddress addresses = 13; // may change (DHCP, Tailscale up/down)
+  repeated PeerReachability peers = 14; // this node's view of its peer links (Phase 3)
+}
+
+// One peer as seen by the reporting node (docs/design/phase3.md §5).
+message PeerReachability {
+  string node_id = 1;
+  string name = 2;
+  string state = 3;                    // "CONNECTING" | "CONNECTED" | "UNAVAILABLE" | "IDLE"
+  string path_type = 4;                // "lan" | "tailscale" | ... ("" when not connected)
+  string address = 5;                  // "ip:port" of the live link
+  double rtt_ms = 6;                   // EWMA; 0 = unknown
+  int64 connected_since_unix_ms = 7;
+  string last_error = 8;
+  bool outbound = 9;                   // link was dialed by the reporting node
 }
 
 message HeartbeatReply {

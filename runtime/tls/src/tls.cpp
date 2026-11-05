@@ -209,6 +209,10 @@ bool is_ip_literal(const std::string& host) {
 
 [[noreturn]] void fail(const std::string& msg) { throw std::runtime_error(msg); }
 
+// server: require a client certificate (verify_fail_if_no_peer_cert) and
+// advertise the CA as acceptable issuer. Peer contexts set server = true and
+// are used for both handshake directions (fail_if_no_peer_cert is ignored on
+// the client side, where verify_peer already fails without a server cert).
 std::shared_ptr<boost::asio::ssl::context> make_context(boost::asio::ssl::context::method method,
                                                         const Credentials& creds, bool server) {
     auto ctx = std::make_shared<boost::asio::ssl::context>(method);
@@ -310,7 +314,9 @@ std::expected<void, std::string> issue(const fs::path& ca_dir, const IssueOption
     std::vector<std::pair<int, std::string>> exts{
         {NID_basic_constraints, "critical,CA:FALSE"},
         {NID_key_usage, "critical,digitalSignature"},
-        {NID_ext_key_usage, opts.role == Role::kServer ? "serverAuth" : "clientAuth"},
+        {NID_ext_key_usage, opts.role == Role::kServer  ? "serverAuth"
+                            : opts.role == Role::kNode  ? "serverAuth,clientAuth"
+                                                        : "clientAuth"},
         {NID_subject_key_identifier, "hash"},
         {NID_authority_key_identifier, "keyid:always"},
     };
@@ -390,6 +396,13 @@ std::shared_ptr<boost::asio::ssl::context> make_server_context(const Credentials
 
 std::shared_ptr<boost::asio::ssl::context> make_client_context(const Credentials& creds) {
     return make_context(boost::asio::ssl::context::tls_client, creds, false);
+}
+
+std::shared_ptr<boost::asio::ssl::context> make_peer_context(const Credentials& creds) {
+    // Generic TLS method: the same context accepts and dials. OpenSSL picks
+    // the verify purpose by role (sslserver when dialing, sslclient when
+    // accepting), so node certs carry both EKUs.
+    return make_context(boost::asio::ssl::context::tls, creds, true);
 }
 
 bool set_verify_host(SSL* ssl, const std::string& host) {

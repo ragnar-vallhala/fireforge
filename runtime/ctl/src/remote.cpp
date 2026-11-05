@@ -263,6 +263,13 @@ void print_node(const cv1::NodeInfo& n) {
               << " gpus=" << lim(p.max_gpus()) << "\n"
               << "load:       " << hb.running_jobs() << " running, " << hb.queued_jobs() << " queued, cpu "
               << static_cast<int>(hb.cpu_utilization() * 100) << "%, applied policy v" << hb.policy_version() << "\n";
+    for (const auto& peer : hb.peers()) {
+        std::cout << "peer:       " << peer.name() << " " << peer.state();
+        if (!peer.path_type().empty()) std::cout << " via " << peer.path_type() << " " << peer.address();
+        if (peer.rtt_ms() > 0) std::cout << std::format(" rtt {:.2f} ms", peer.rtt_ms());
+        if (!peer.last_error().empty() && peer.state() != "CONNECTED") std::cout << " (" << peer.last_error() << ")";
+        std::cout << "\n";
+    }
 }
 
 void print_campaigns(const cv1::CampaignList& l) {

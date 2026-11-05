@@ -93,6 +93,8 @@ struct AgentHooks {
     // available, cpu_utilization, capacity). The agent sets node_id, sent time,
     // version, policy_version and addresses itself.
     std::function<void(cv1::Heartbeat&)> fill_stats;
+    // Called after every successful peer-directory refresh (Phase 3: PeerManager).
+    std::function<void(const cv1::NodeList&)> on_directory;
 };
 
 class NodeAgent {
@@ -108,6 +110,9 @@ public:
     // Best-effort POST /offline (bounded by offline_timeout), cancels timers,
     // then calls `done` (always, exactly once).
     void stop(std::function<void()> done);
+    // Fetch the peer directory now (no-op before registration or while a fetch
+    // is in flight). Used when an unknown peer says hello (phase3.md §2).
+    void refresh_peers();
 
     ControlState state() const;
     const std::string& node_id() const;               // "" until registered

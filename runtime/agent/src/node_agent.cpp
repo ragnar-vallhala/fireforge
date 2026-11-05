@@ -371,6 +371,7 @@ struct NodeAgent::Impl : std::enable_shared_from_this<Impl> {
         if (r) {
             peers = std::move(*r);
             peers_ms = unix_ms();
+            if (hooks.on_directory) hooks.on_directory(peers);
         } else {
             log_debug("control: peer refresh failed: {}", describe(r.error()));
         }
@@ -392,6 +393,9 @@ NodeAgent::~NodeAgent() {
 }
 
 void NodeAgent::start() { impl_->start(); }
+void NodeAgent::refresh_peers() {
+    if (!impl_->stopped && !impl_->node_id.empty()) impl_->refresh_peers_now();
+}
 void NodeAgent::stop(std::function<void()> done) { impl_->stop(std::move(done)); }
 
 ControlState NodeAgent::state() const { return impl_->state; }

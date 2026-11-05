@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <iostream>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,7 +36,7 @@ commands:
   list [--state STATE] [--limit N] [--json]
   cancel JOB_ID
   node [--json]                 includes control-plane state (Phase 2)
-  peers [--json]                peer directory cached from the control plane
+  peers [--json]                peer directory + live peer links (path, RTT)
   wait JOB_ID [--timeout S]     exit 0 iff the job COMPLETED
 
   pki ...                       local CA and certificates   (tdrctl pki --help)
@@ -215,6 +217,7 @@ int cmd_node(Client& cl, const std::vector<std::string>& a) {
 }
 
 int cmd_peers(Client& cl, const std::vector<std::string>& a) {
+    namespace cv1 = ::fireforge::control::v1;
     v1::PeerList pl;
     cl.call(v1::CTL_PEERS, v1::PeersRequest{}, v1::CTL_PEERS_REPLY).parse(pl);
     if (!a.empty() && a[0] == "--json") { std::cout << to_json(pl); return 0; }
@@ -222,11 +225,19 @@ int cmd_peers(Client& cl, const std::vector<std::string>& a) {
         std::cout << "no peer directory yet (standalone, or not connected to the control plane)\n";
         return 0;
     }
+    std::map<std::string, const cv1::PeerReachability*> links;
+    for (const auto& c : pl.connections()) links[c.node_id()] = &c;
+    if (pl.listen_port()) std::cout << "peer listener on port " << pl.listen_port() << "\n";
+    std::cout << std::format("{:<20} {:<26} {:<8} {:<12} {:<10} {:<22} {:>8}  {}\n", "NAME", "NODE_ID", "HEALTH",
+                             "LINK", "PATH", "ADDRESS", "RTT_MS", "LAST_ERROR");
     for (const auto& n : pl.peers()) {
-        std::cout << n.name() << "  " << n.node_id() << "  "
-                  << ::fireforge::control::v1::NodeHealth_Name(n.health());
-        for (const auto& ad : n.addresses()) std::cout << "  " << ad.type() << "=" << ad.address() << ":" << ad.port();
-        std::cout << "\n";
+        auto it = links.find(n.node_id());
+        const cv1::PeerReachability* l = it == links.end() ? nullptr : it->second;
+        std::string rtt = l && l->rtt_ms() > 0 ? std::format("{:.2f}", l->rtt_ms()) : "-";
+        std::cout << std::format("{:<20} {:<26} {:<8} {:<12} {:<10} {:<22} {:>8}  {}\n", n.name(), n.node_id(),
+                                 cv1::NodeHealth_Name(n.health()), l ? l->state() : "self/-",
+                                 l && !l->path_type().empty() ? l->path_type() : "-",
+                                 l && !l->address().empty() ? l->address() : "-", rtt, l ? l->last_error() : "");
     }
     return 0;
 }

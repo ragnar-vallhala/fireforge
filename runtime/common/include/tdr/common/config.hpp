@@ -37,6 +37,8 @@ struct Config {
         std::string listen_address = "0.0.0.0";
         std::uint16_t listen_port = 7400;
         std::string tailscale = "auto";
+        std::uint32_t peer_ping_interval = 5;   // seconds (phase3.md §4)
+        std::uint32_t peer_ping_timeout = 15;   // seconds without any frame -> link closed
     } network;
 
     struct Resources {

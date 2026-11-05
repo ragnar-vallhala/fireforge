@@ -10,6 +10,7 @@
 #include <string>
 
 #include <openssl/pem.h>
+#include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
@@ -104,9 +105,10 @@ BOOST_AUTO_TEST_CASE(tls_issue_all_roles_and_identity) {
         Role role;
         const char* name;
         int purpose;
-    } cases[] = {{Role::kNode, "node-1", X509_PURPOSE_SSL_CLIENT},
-                 {Role::kAdmin, "alice", X509_PURPOSE_SSL_CLIENT},
-                 {Role::kServer, "cp.example", X509_PURPOSE_SSL_SERVER}};
+        bool both;  // node certs are valid for both purposes (phase3.md §2)
+    } cases[] = {{Role::kNode, "node-1", X509_PURPOSE_SSL_CLIENT, true},
+                 {Role::kAdmin, "alice", X509_PURPOSE_SSL_CLIENT, false},
+                 {Role::kServer, "cp.example", X509_PURPOSE_SSL_SERVER, false}};
     for (const auto& c : cases) {
         IssueOptions o;
         o.role = c.role;
@@ -118,9 +120,12 @@ BOOST_AUTO_TEST_CASE(tls_issue_all_roles_and_identity) {
         BOOST_TEST(mode_of(key) == 0600u);
         auto cert = load(crt);
         BOOST_TEST(verify(ca.get(), cert.get(), c.purpose) == X509_V_OK);
-        // Wrong purpose fails (EKU restricts).
+        // Other purpose: fails for admin/server (EKU restricts), passes for node.
         int other = c.purpose == X509_PURPOSE_SSL_CLIENT ? X509_PURPOSE_SSL_SERVER : X509_PURPOSE_SSL_CLIENT;
-        BOOST_TEST(verify(ca.get(), cert.get(), other) != X509_V_OK);
+        if (c.both)
+            BOOST_TEST(verify(ca.get(), cert.get(), other) == X509_V_OK);
+        else
+            BOOST_TEST(verify(ca.get(), cert.get(), other) != X509_V_OK);
         BOOST_TEST(X509_check_ca(cert.get()) == 0);
 
         auto id = read_identity(crt);
@@ -278,4 +283,24 @@ BOOST_AUTO_TEST_CASE(tls_contexts_load_and_reject_bad_files) {
     }
     BOOST_CHECK_THROW(make_client_context({t.path / "ca.crt", t.path / "nope.crt", t.path / "n.key"}),
                       std::runtime_error);
+
+    // Peer context: node cert both ways; bad files name the file.
+    std::shared_ptr<boost::asio::ssl::context> peer;
+    BOOST_CHECK_NO_THROW(peer = make_peer_context({t.path / "ca.crt", t.path / "n.crt", t.path / "n.key"}));
+    if (peer) {
+        BOOST_TEST(SSL_CTX_get_min_proto_version(peer->native_handle()) == TLS1_3_VERSION);
+        BOOST_TEST((SSL_CTX_get_verify_mode(peer->native_handle()) & SSL_VERIFY_FAIL_IF_NO_PEER_CERT) != 0);
+    }
+    try {
+        make_peer_context({t.path / "ca.crt", t.path / "n.crt", t.path / "srv.key"});
+        BOOST_FAIL("expected throw");
+    } catch (const std::runtime_error& e) {
+        BOOST_TEST(std::string(e.what()).find("srv.key") != std::string::npos);
+    }
+    try {
+        make_peer_context({t.path / "missing-ca.crt", t.path / "n.crt", t.path / "n.key"});
+        BOOST_FAIL("expected throw");
+    } catch (const std::runtime_error& e) {
+        BOOST_TEST(std::string(e.what()).find("missing-ca.crt") != std::string::npos);
+    }
 }

@@ -2,7 +2,8 @@
 
 FireForge: distributed materials-discovery platform. Vision: `Description.md`.
 Phase 1 (TDR local job execution, `docs/design/phase1.md`) is done.
-Current work: Phase 2 (control plane: nodes + campaigns), design in `docs/design/phase2.md`.
+Phase 2 (control plane, `docs/design/phase2.md`) is done.
+Current work: Phase 3 (peer networking), design in `docs/design/phase3.md`.
 
 ## Memory cap — mandatory
 
@@ -32,6 +33,7 @@ proto/fireforge/tdr/v1/   protobuf contracts (envelope, job, local IPC)
 proto/fireforge/control/  control-plane API payloads (sent as proto3 JSON)
 runtime/<module>/         C++ TDR runtime: include/tdr/<module>/, src/, tests/
 runtime/tls, http, agent  mTLS/PKI, HTTPS server+client, tdrd control-plane agent
+runtime/peer              peer links: TLS transport + PeerManager (Phase 3)
 runtime/daemon, ctl       tdrd and tdrctl executables
 control/db, api, server   tdrcp: Postgres repository, API handlers, executable
 sdk/python/fireforge/     Python worker SDK (tests in sdk/python/tests)

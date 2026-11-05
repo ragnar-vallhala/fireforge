@@ -52,7 +52,8 @@ struct IssueOptions {
 };
 
 // Generates a key pair and a certificate signed by <ca_dir>/ca.{key,crt}.
-// EKU: clientAuth for node/admin, serverAuth for server. Random 128-bit serial.
+// EKU: serverAuth+clientAuth for node (peer links, phase3.md §2), clientAuth
+// for admin, serverAuth for server. Random 128-bit serial.
 // Writes out_key (0600) and out_cert; refuses to overwrite either.
 std::expected<void, std::string> issue(const fs::path& ca_dir, const IssueOptions& opts,
                                        const fs::path& out_key, const fs::path& out_cert);
@@ -75,6 +76,12 @@ struct Credentials {
 // Throws std::runtime_error with a readable message on bad files.
 std::shared_ptr<boost::asio::ssl::context> make_server_context(const Credentials& creds);
 std::shared_ptr<boost::asio::ssl::context> make_client_context(const Credentials& creds);
+
+// Peer links (phase3.md §2): one context for both accepting and dialing.
+// TLS 1.3 only, node cert + key, trusts only ca_file, verify_peer |
+// verify_fail_if_no_peer_cert. No hostname check: callers compare the peer
+// identity name themselves. Requires a node cert with serverAuth+clientAuth.
+std::shared_ptr<boost::asio::ssl::context> make_peer_context(const Credentials& creds);
 
 // Configure an SSL* (client side) for SNI and RFC 2818 host/IP verification
 // against the server cert's SANs. Returns false on failure.

@@ -10,12 +10,17 @@ scheme = https
 [node]
 # Default: hostname
 name =
+# auto = detect (LAN + Tailscale), one address, or an explicit list
+# "type=addr[:port], ...", e.g. "lan=192.168.1.5, tailscale=100.64.0.3:7400".
 advertise_address = auto
 
 [network]
 listen_address = 0.0.0.0
 listen_port = 7400
 tailscale = auto
+# Peer links (Phase 3): ping every N seconds; close a link silent for M seconds.
+peer_ping_interval = 5
+peer_ping_timeout = 15
 
 [resources]
 # 0 = all online CPUs

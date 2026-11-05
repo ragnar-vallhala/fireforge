@@ -1,0 +1,26 @@
+// Peer link payloads (docs/design/phase3.md §3). Carried in the 48-byte
+// envelope inside a mutually authenticated TLS 1.3 stream.
+
+syntax = "proto3";
+
+package fireforge.tdr.v1;
+
+// NODE_HELLO, both directions (the reply sets correlation_id).
+message PeerHello {
+  string node_id = 1;            // control-plane id, e.g. "ff-node-0123456789abcdef"
+  string name = 2;               // must equal the TLS certificate CN
+  string daemon_version = 3;
+  uint32 protocol_version = 4;   // 1
+  int64 sent_unix_ms = 5;
+}
+
+// NODE_HEARTBEAT ping; the peer echoes the same message back as a reply.
+message PeerPing {
+  uint64 seq = 1;
+  int64 sent_unix_ms = 2;        // sender's clock; RTT uses the sender's steady clock
+}
+
+// PEER_ADVERTISE with this payload: graceful close notice.
+message PeerGoodbye {
+  string reason = 1;             // "shutdown" | "duplicate" | "removed" | ...
+}

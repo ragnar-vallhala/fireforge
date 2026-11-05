@@ -1,7 +1,7 @@
 // Message type registry for the TDR binary envelope.
 //
 // Every frame on the wire (peer TCP or local Unix socket) is:
-//   48-byte header (big-endian, see docs/design/protocol.md) + protobuf payload.
+//   48-byte header (big-endian, see docs/design/phase1.md §2) + protobuf payload.
 // The header's `message_type` field holds one of these values and fully
 // determines which protobuf message the payload contains.
 //
@@ -15,11 +15,11 @@ package fireforge.tdr.v1;
 enum MessageType {
   MESSAGE_TYPE_UNSPECIFIED = 0;
 
-  // ---- Peer: node (Phase 2-3) ---------------------------------------------
-  NODE_HELLO = 0x0101;
-  NODE_HEARTBEAT = 0x0102;
-  NODE_STATUS = 0x0103;
-  PEER_ADVERTISE = 0x0104;
+  // ---- Peer: node (Phase 3, payloads in peer.proto) -----------------------
+  NODE_HELLO = 0x0101;       // PeerHello (both directions; reply has correlation_id)
+  NODE_HEARTBEAT = 0x0102;   // PeerPing (echoed back as reply)
+  NODE_STATUS = 0x0103;      // reserved
+  PEER_ADVERTISE = 0x0104;   // PeerGoodbye (graceful close)
 
   // ---- Peer: jobs (Phase 4) -----------------------------------------------
   JOB_SUBMIT = 0x0201;
