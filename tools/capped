@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run a command inside the shared fireforge-build systemd slice.
+# Every process started through this wrapper shares ONE 8 GiB memory cap
+# (swap disabled), so parallel builds and tests together never exceed 8 GiB.
+#
+#   tools/capped cmake --build build/dev -j2
+#   FF_MEM_CAP=4G tools/capped pytest      # optional lower cap
+set -euo pipefail
+
+SLICE=fireforge-build.slice
+CAP="${FF_MEM_CAP:-8G}"
+
+if [[ $# -eq 0 ]]; then
+    echo "usage: tools/capped <command> [args...]" >&2
+    exit 2
+fi
+
+# Idempotent: (re)apply the cap to the shared slice. --runtime = cleared on reboot.
+systemctl --user set-property --runtime "$SLICE" MemoryMax="$CAP" MemorySwapMax=0 >/dev/null
+
+# Keep compiler parallelism modest; several agents build at once.
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+
+exec systemd-run --user --scope --quiet --slice="$SLICE" \
+    --setenv=CMAKE_BUILD_PARALLEL_LEVEL="$CMAKE_BUILD_PARALLEL_LEVEL" -- "$@"

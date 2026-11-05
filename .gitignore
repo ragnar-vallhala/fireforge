@@ -1,0 +1,6 @@
+build/
+.venv/
+__pycache__/
+*.pyc
+/var/
+sdk/python/fireforge/tdr/v1/*_pb2.py

@@ -1,0 +1,132 @@
+// Local IPC payloads: daemon <-> worker child, and tdrctl <-> daemon.
+// Both use the same 48-byte envelope over Unix domain sockets.
+
+syntax = "proto3";
+
+package fireforge.tdr.v1;
+
+import "fireforge/tdr/v1/job.proto";
+
+// ---------------------------------------------------------------------------
+// Worker protocol
+//
+// The daemon launches each attempt with these environment variables:
+//   FIREFORGE_IPC_SOCKET       path of the daemon's worker socket
+//   FIREFORGE_JOB_ID
+//   FIREFORGE_ATTEMPT_ID
+//   FIREFORGE_ATTEMPT_TOKEN    secret; proves the connection belongs to the attempt
+//   FIREFORGE_WORKDIR          attempt working directory (also the cwd)
+//   FIREFORGE_INPUT_DIR        materialized input artifacts
+//   FIREFORGE_OUTPUT_DIR       files written here can be published as outputs
+//   FIREFORGE_CHECKPOINT_DIR
+//
+// Flow: HELLO -> TASK, then any number of PROGRESS, then RESULT -> ACK.
+// The daemon may send CANCEL at any time; the worker should stop promptly.
+// SDK use is optional: a plain command that never connects is judged by its
+// exit code, and everything under FIREFORGE_OUTPUT_DIR becomes its outputs.
+// ---------------------------------------------------------------------------
+
+message WorkerHello {
+  string attempt_id = 1;
+  string token = 2;
+  uint32 pid = 3;
+  string sdk_version = 4;
+}
+
+message InputFile {
+  string artifact_id = 1;
+  string path = 2;   // absolute path inside FIREFORGE_INPUT_DIR
+}
+
+message WorkerTask {
+  string job_id = 1;
+  string attempt_id = 2;
+  uint32 attempt_number = 3;    // 1-based
+  string operation = 4;
+  string parameters_json = 5;
+  repeated InputFile inputs = 6;
+  string output_dir = 7;
+  string checkpoint_dir = 8;
+  string campaign_id = 9;
+  string material_id = 10;
+}
+
+message WorkerProgress {
+  string attempt_id = 1;
+  double fraction = 2;   // 0..1
+  string message = 3;
+}
+
+message OutputFile {
+  string path = 1;        // relative to output_dir
+  string media_type = 2;  // e.g. "application/json", "chemical/x-cif"
+  string name = 3;        // logical name, e.g. "band_structure"
+}
+
+message WorkerResult {
+  string attempt_id = 1;
+  bool success = 2;
+  string error = 3;
+  bool retryable = 4;     // failure may succeed on another attempt
+  repeated OutputFile outputs = 5;
+}
+
+message WorkerCancel {
+  string attempt_id = 1;
+  string reason = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Control protocol (tdrctl)
+// ---------------------------------------------------------------------------
+
+message SubmitJobRequest { JobSpec spec = 1; }
+message SubmitJobReply { string job_id = 1; }
+
+message GetJobRequest { string job_id = 1; }
+
+message ListJobsRequest {
+  JobState state = 1;   // JOB_STATE_UNSPECIFIED = all
+  uint32 limit = 2;     // 0 = 100
+}
+message JobList { repeated JobStatus jobs = 1; }
+
+message CancelJobRequest { string job_id = 1; }
+
+message NodeStatusRequest {}
+
+message ResourceAmounts {
+  uint32 cpu_cores = 1;
+  uint64 memory_bytes = 2;
+  uint32 jobs = 3;
+  uint64 disk_bytes = 4;
+}
+
+message NodeStatus {
+  string node_name = 1;
+  string daemon_version = 2;
+  ResourceAmounts capacity = 3;    // configured caps
+  ResourceAmounts allocated = 4;   // reserved by ASSIGNED/RUNNING jobs
+  uint32 running_jobs = 5;
+  uint32 queued_jobs = 6;
+  uint64 failed_jobs = 7;
+  bool cgroups_enabled = 8;
+  int64 started_unix_ms = 9;
+}
+
+message Ack {}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  BAD_REQUEST = 1;
+  NOT_FOUND = 2;
+  CONFLICT = 3;        // e.g. cancel of a terminal job
+  UNAUTHORIZED = 4;    // bad attempt token
+  INTERNAL = 5;
+  UNSUPPORTED = 6;     // unknown message type
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+}

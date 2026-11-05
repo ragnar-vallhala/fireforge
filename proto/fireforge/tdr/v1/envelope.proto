@@ -1,0 +1,67 @@
+// Message type registry for the TDR binary envelope.
+//
+// Every frame on the wire (peer TCP or local Unix socket) is:
+//   48-byte header (big-endian, see docs/design/protocol.md) + protobuf payload.
+// The header's `message_type` field holds one of these values and fully
+// determines which protobuf message the payload contains.
+//
+// Requests carry a fresh message_id. Replies set correlation_id to the
+// request's message_id.
+
+syntax = "proto3";
+
+package fireforge.tdr.v1;
+
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+
+  // ---- Peer: node (Phase 2-3) ---------------------------------------------
+  NODE_HELLO = 0x0101;
+  NODE_HEARTBEAT = 0x0102;
+  NODE_STATUS = 0x0103;
+  PEER_ADVERTISE = 0x0104;
+
+  // ---- Peer: jobs (Phase 4) -----------------------------------------------
+  JOB_SUBMIT = 0x0201;
+  JOB_REQUEST = 0x0202;
+  JOB_ASSIGN = 0x0203;
+  JOB_ACCEPT = 0x0204;
+  JOB_START = 0x0205;
+  JOB_PROGRESS = 0x0206;
+  JOB_COMPLETE = 0x0207;
+  JOB_FAIL = 0x0208;
+  JOB_CANCEL = 0x0209;
+
+  // ---- Peer: artifacts (Phase 5) ------------------------------------------
+  ARTIFACT_QUERY = 0x0301;
+  ARTIFACT_OFFER = 0x0302;
+  ARTIFACT_REQUEST = 0x0303;
+  ARTIFACT_TRANSFER = 0x0304;
+
+  // ---- Peer: checkpoints --------------------------------------------------
+  CHECKPOINT_CREATE = 0x0401;
+  CHECKPOINT_RESTORE = 0x0402;
+
+  // ---- Local: daemon <-> worker child process (Phase 1) -------------------
+  WORKER_HELLO = 0x1001;     // worker -> daemon   WorkerHello
+  WORKER_TASK = 0x1002;      // daemon -> worker   WorkerTask   (reply to HELLO)
+  WORKER_PROGRESS = 0x1003;  // worker -> daemon   WorkerProgress (no reply)
+  WORKER_RESULT = 0x1004;    // worker -> daemon   WorkerResult
+  WORKER_CANCEL = 0x1005;    // daemon -> worker   WorkerCancel (unsolicited)
+  WORKER_ACK = 0x1006;       // daemon -> worker   Ack          (reply to RESULT)
+
+  // ---- Local: tdrctl <-> daemon (Phase 1) ---------------------------------
+  CTL_SUBMIT = 0x1101;             // SubmitJobRequest  -> SubmitJobReply
+  CTL_SUBMIT_REPLY = 0x1102;
+  CTL_GET_JOB = 0x1103;            // GetJobRequest     -> JobStatus
+  CTL_JOB_INFO = 0x1104;
+  CTL_LIST_JOBS = 0x1105;          // ListJobsRequest   -> JobList
+  CTL_JOB_LIST = 0x1106;
+  CTL_CANCEL = 0x1107;             // CancelJobRequest  -> Ack
+  CTL_ACK = 0x1108;
+  CTL_NODE_STATUS = 0x1109;        // NodeStatusRequest -> NodeStatus
+  CTL_NODE_STATUS_REPLY = 0x110A;
+
+  // Any request may be answered with ERROR (payload: Error).
+  ERROR = 0x7FFF;
+}

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fireforge"
+version = "0.1.0"
+description = "FireForge worker SDK: run Python tasks under the TDR daemon (tdrd)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["protobuf>=4.21,<5"]
+
+[project.optional-dependencies]
+structures = ["pymatgen"]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["fireforge", "fireforge.tdr", "fireforge.tdr.v1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

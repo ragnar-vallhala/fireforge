@@ -1,0 +1,77 @@
+// Job model shared by the runtime, tdrctl, the control plane and the SDK.
+
+syntax = "proto3";
+
+package fireforge.tdr.v1;
+
+// Lifecycle (Description.md section 10.1).
+// Phase 1 local path: CREATED -> QUEUED -> ASSIGNED -> RUNNING -> COMMITTING -> COMPLETED
+// LEASED is used once the control plane hands out leases (Phase 4).
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  CREATED = 1;
+  QUEUED = 2;
+  LEASED = 3;
+  ASSIGNED = 4;        // resources reserved on this node
+  RUNNING = 5;         // child process alive
+  COMMITTING = 6;      // child finished OK, outputs being published
+  COMPLETED = 7;       // terminal
+  FAILED = 8;          // terminal: attempts exhausted or non-retryable
+  RETRY_PENDING = 9;   // attempt failed, another attempt allowed
+  CANCELLED = 10;      // terminal
+  EXPIRED = 11;        // terminal: lease/timeout expired with no retries left
+  VALIDATION_FAILED = 12;  // terminal: outputs rejected
+}
+
+message ResourceRequest {
+  uint32 cpu_cores = 1;     // 0 is treated as 1
+  uint64 memory_bytes = 2;  // 0 = node default (see daemon config)
+  uint64 disk_bytes = 3;
+  uint32 gpu_count = 4;
+}
+
+message ExecutionPolicy {
+  uint32 max_attempts = 1;      // 0 is treated as 1
+  uint64 timeout_seconds = 2;   // 0 = no timeout
+  bool checkpoint = 3;
+}
+
+// How the daemon launches the child process.
+message Command {
+  repeated string argv = 1;          // argv[0] resolved via PATH
+  map<string, string> env = 2;       // added to the minimal child environment
+}
+
+message JobSpec {
+  string job_id = 1;          // empty on submit = daemon assigns one
+  string campaign_id = 2;
+  string material_id = 3;
+
+  string operation = 4;       // e.g. "transport.calculate" (SDK task name)
+  string solver = 5;
+  string solver_version = 6;
+
+  ResourceRequest resources = 7;
+  ExecutionPolicy policy = 8;
+
+  repeated string input_artifacts = 9;  // "artifact://sha256/<64 hex>"
+  repeated string depends_on = 10;      // job ids (Phase 6; ignored in Phase 1)
+
+  Command command = 11;
+  string parameters_json = 12;          // opaque to the runtime, passed to the task
+  repeated string required_capabilities = 13;
+}
+
+message JobStatus {
+  string job_id = 1;
+  JobState state = 2;
+  JobSpec spec = 3;
+  uint32 attempts_used = 4;
+  string current_attempt_id = 5;
+  string last_error = 6;
+  repeated string output_artifacts = 7;
+  int64 created_unix_ms = 8;
+  int64 updated_unix_ms = 9;
+  double progress_fraction = 10;   // last WORKER_PROGRESS, 0..1
+  string progress_message = 11;
+}

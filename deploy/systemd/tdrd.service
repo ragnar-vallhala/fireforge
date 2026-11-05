@@ -1,0 +1,25 @@
+[Unit]
+Description=FireForge TDR daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tdrd --config /etc/fireforge/tdr.conf
+Restart=on-failure
+RestartSec=2
+# Lets tdrd create per-job cgroups under its own cgroup.
+Delegate=yes
+User=fireforge
+Group=fireforge
+StateDirectory=fireforge
+LogsDirectory=fireforge
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/fireforge /var/log/fireforge
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

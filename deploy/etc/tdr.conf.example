@@ -1,0 +1,41 @@
+# /etc/fireforge/tdr.conf
+# Every key is optional. Values shown are the defaults.
+
+[control]
+# Empty = standalone node (Phase 1). Set in Phase 2.
+address =
+port = 8080
+scheme = https
+
+[node]
+# Default: hostname
+name =
+advertise_address = auto
+
+[network]
+listen_address = 0.0.0.0
+listen_port = 7400
+tailscale = auto
+
+[resources]
+# 0 = all online CPUs
+max_cpu_cores = 0
+# 0 = 80% of physical RAM
+max_memory_mb = 0
+# 0 = same as max_cpu_cores
+max_jobs = 0
+# 0 = unlimited
+max_disk_mb = 0
+# Memory reserved for a job that requests 0
+default_job_memory_mb = 1024
+# auto | required | off
+cgroups = auto
+
+[paths]
+state_dir = /var/lib/fireforge
+# Empty = stderr only (captured by journald)
+log_file =
+
+[log]
+# debug | info | warn | error
+level = info
