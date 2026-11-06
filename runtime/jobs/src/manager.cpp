@@ -36,6 +36,7 @@ using supervisor::ExitKind;
 constexpr std::string_view kArtifactPrefix = "artifact://sha256/";
 constexpr std::string_view kDefaultMediaType = "application/octet-stream";
 constexpr std::size_t kMaxJobIdLength = 128;
+constexpr std::string_view kDefaultCheckpointName = "checkpoint";
 
 // "artifact://sha256/<64 lowercase hex>" -> hex. Local re-implementation so
 // this module does not depend on the artifacts library's free functions.
@@ -57,6 +58,9 @@ bool valid_job_id(const std::string& id) {
                c == '_' || c == '.';
     });
 }
+
+// Checkpoint names become file names (checkpoints/resume/<name>).
+bool valid_checkpoint_name(const std::string& name) { return valid_job_id(name); }
 
 bool constant_time_equal(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) return false;
@@ -123,8 +127,9 @@ struct QueueKey {
 };
 
 struct OutputToIngest {
-    fs::path path;
+    fs::path path;       // canonical
     std::string media_type;
+    std::string name;    // phase6.md §2
 };
 
 }  // namespace
@@ -141,6 +146,7 @@ struct JobManager::Impl {
         v1::JobSpec spec;
         Capacity reserved;
         std::vector<v1::InputFile> inputs;
+        fs::path resume_path;  // checkpoints/resume/<name>, "" = no resume
         Phase phase = Phase::kStarting;
         bool cancel_requested = false;
         std::string cancel_reason;
@@ -175,6 +181,7 @@ struct JobManager::Impl {
 
     std::function<void(const std::string&, const std::string&)> cancel_notifier;
     std::function<void(const std::string&, v1::JobState)> state_listener;
+    std::function<void(const std::string&, const v1::NamedArtifact&)> checkpoint_listener;
 
     // ---- helpers -----------------------------------------------------------
 
@@ -320,7 +327,8 @@ struct JobManager::Impl {
             fs::create_directories(a.dir / "outputs");
             fs::create_directories(a.dir / "checkpoints");
             std::set<std::string> seen;
-            for (const auto& id : rec->spec.input_artifacts()) {
+            for (int i = 0; i < rec->spec.input_artifacts_size(); ++i) {
+                const std::string& id = rec->spec.input_artifacts(i);
                 auto hex = artifact_hex(id);
                 if (!hex) {
                     setup_error = "invalid input artifact id: " + id;
@@ -336,7 +344,27 @@ struct JobManager::Impl {
                 v1::InputFile f;
                 f.set_artifact_id(id);
                 f.set_path(dest.string());
+                if (i < rec->spec.input_names_size()) f.set_name(rec->spec.input_names(i));
                 a.inputs.push_back(std::move(f));
+            }
+            // Resume (phase6.md §6): this job's latest local checkpoint wins
+            // over the spec's (control-plane) resume checkpoint.
+            if (setup_error.empty()) {
+                std::string resume_id = rec->checkpoint.artifact_id();
+                std::string resume_name = rec->checkpoint.name();
+                if (resume_id.empty()) {
+                    resume_id = rec->spec.resume_checkpoint();
+                    resume_name.clear();
+                }
+                if (!valid_checkpoint_name(resume_name)) resume_name = kDefaultCheckpointName;
+                if (!resume_id.empty()) {
+                    const fs::path dest = a.dir / "checkpoints" / "resume" / resume_name;
+                    if (auto r = store.materialize(resume_id, dest); !r) {
+                        setup_error = "materialize resume checkpoint " + resume_id + ": " + r.error();
+                    } else {
+                        a.resume_path = dest;
+                    }
+                }
             }
             // Restricted job user: ownership and modes are applied after the
             // inputs are materialized, so inputs/ ends up 02750 (the job can
@@ -344,11 +372,13 @@ struct JobManager::Impl {
             // from an earlier attempt; re-applying is harmless.
             if (opts.run_as && setup_error.empty()) {
                 const gid_t gid = opts.run_as->gid;
-                const std::pair<fs::path, mode_t> dirs[] = {
+                std::vector<std::pair<fs::path, mode_t>> dirs = {
                     {a.dir.parent_path(), 02750},  {a.dir, 02770},
                     {a.dir / "outputs", 02770},    {a.dir / "checkpoints", 02770},
                     {a.dir / "inputs", 02750},
                 };
+                // Like inputs/: readable, but the job cannot add or remove files.
+                if (!a.resume_path.empty()) dirs.emplace_back(a.resume_path.parent_path(), 02750);
                 for (const auto& [path, mode] : dirs) {
                     setup_error = restrict_dir(path, gid, mode);
                     if (!setup_error.empty()) {
@@ -529,11 +559,14 @@ struct JobManager::Impl {
             }
             if (ec) return std::unexpected("scan outputs: " + ec.message());
             std::ranges::sort(files);
-            for (auto& f : files) out.push_back({std::move(f), std::string(kDefaultMediaType)});
+            for (auto& f : files) {
+                std::string name = f.lexically_relative(base).generic_string();
+                out.push_back({std::move(f), std::string(kDefaultMediaType), std::move(name)});
+            }
             return out;
         }
 
-        std::set<fs::path> seen;
+        std::set<std::pair<fs::path, std::string>> seen;
         for (const auto& o : a.result->outputs()) {
             const fs::path rel(o.path());
             if (o.path().empty() || rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) {
@@ -554,8 +587,10 @@ struct JobManager::Impl {
             if (!fs::is_regular_file(real, ec)) {
                 return std::unexpected("declared output is not a regular file: " + o.path());
             }
-            if (!seen.insert(real).second) continue;  // same file declared twice
-            out.push_back({real, o.media_type().empty() ? std::string(kDefaultMediaType) : o.media_type()});
+            std::string name = o.name().empty() ? rel.lexically_normal().generic_string() : o.name();
+            if (!seen.insert({real, name}).second) continue;  // same output declared twice
+            out.push_back({real, o.media_type().empty() ? std::string(kDefaultMediaType) : o.media_type(),
+                           std::move(name)});
         }
         return out;
     }
@@ -571,37 +606,57 @@ struct JobManager::Impl {
             return;
         }
 
-        std::vector<std::string> ids;
-        for (const auto& f : *files) {
-            // With a restricted job user the output file is owned by the job
-            // user, so it is copied: the store file must be a new daemon-owned file.
-            auto meta = store.ingest(f.path, f.media_type, job_id, /*move_source=*/!opts.run_as.has_value());
-            if (!meta) {
-                std::string err = "ingest " + f.path.filename().string() + ": " + meta.error();
+        // Names are unique per job (phase6.md §2); checked before anything is ingested.
+        {
+            std::set<std::string> names;
+            for (const auto& f : *files) {
+                if (names.insert(f.name).second) continue;
+                const std::string err = "duplicate output name: " + f.name;
                 journal.finish_attempt(a.id, AttemptState::kFailed, 0, 0, err);
-                fail_or_retry(job_id, v1::COMMITTING, err, /*retryable=*/true);
+                fail_or_retry(job_id, v1::COMMITTING, err, /*retryable=*/false);
                 return;
             }
-            journal::ArtifactRow row;
-            row.id = meta->id;
-            row.sha256_hex = meta->sha256_hex;
-            row.size = meta->size;
-            row.media_type = meta->media_type;
-            row.producer_job = meta->producer_job;
-            row.local_path = meta->local_path.string();
-            row.created_unix_ms = meta->created_unix_ms;
-            journal.record_artifact(row);
-            if (std::ranges::find(ids, meta->id) == ids.end()) ids.push_back(meta->id);
         }
 
-        if (!journal.commit_outputs(job_id, a.id, ids)) {
+        std::vector<v1::NamedArtifact> named;
+        std::map<fs::path, artifacts::ArtifactMeta> ingested;  // a file declared under two names: ingest once
+        std::size_t distinct = 0;
+        for (const auto& f : *files) {
+            auto it = ingested.find(f.path);
+            if (it == ingested.end()) {
+                // With a restricted job user the output file is owned by the job
+                // user, so it is copied: the store file must be a new daemon-owned file.
+                auto meta = store.ingest(f.path, f.media_type, job_id, /*move_source=*/!opts.run_as.has_value());
+                if (!meta) {
+                    std::string err = "ingest " + f.path.filename().string() + ": " + meta.error();
+                    journal.finish_attempt(a.id, AttemptState::kFailed, 0, 0, err);
+                    fail_or_retry(job_id, v1::COMMITTING, err, /*retryable=*/true);
+                    return;
+                }
+                record(*meta);
+                it = ingested.emplace(f.path, std::move(*meta)).first;
+            }
+            const auto& meta = it->second;
+            if (std::ranges::none_of(named, [&](const auto& n) { return n.artifact_id() == meta.id; })) ++distinct;
+            v1::NamedArtifact n;
+            n.set_artifact_id(meta.id);
+            n.set_name(f.name);
+            n.set_size(meta.size);
+            n.set_media_type(meta.media_type);
+            named.push_back(std::move(n));
+        }
+        std::vector<v1::StepSpec> spawn;
+        if (a.result && a.result->success()) spawn.assign(a.result->spawn().begin(), a.result->spawn().end());
+
+        if (!journal.commit_outputs(job_id, a.id, named, spawn)) {
             // Fencing: the attempt is no longer current. Outputs stay in the
             // store unreferenced; the job is not touched.
             log_warn("job {}: commit by stale attempt {} rejected", job_id, a.id);
             journal.finish_attempt(a.id, AttemptState::kAbandoned, 0, 0, "commit fenced: attempt no longer current");
             return;
         }
-        log_info("job {}: COMMITTING -> COMPLETED ({} outputs)", job_id, ids.size());
+        log_info("job {}: COMMITTING -> COMPLETED ({} outputs, {} artifacts{})", job_id, named.size(), distinct,
+                 spawn.empty() ? std::string() : std::format(", {} spawned steps", spawn.size()));
         notify(job_id, v1::COMPLETED);
 
         if (!opts.keep_work_dirs) {
@@ -612,6 +667,18 @@ struct JobManager::Impl {
             if (ec) log_warn("job {}: cleanup of {} failed: {}", job_id, a.dir.string(), ec.message());
             fs::remove(a.dir.parent_path(), ec);  // job dir, only if now empty
         }
+    }
+
+    void record(const artifacts::ArtifactMeta& meta) {
+        journal::ArtifactRow row;
+        row.id = meta.id;
+        row.sha256_hex = meta.sha256_hex;
+        row.size = meta.size;
+        row.media_type = meta.media_type;
+        row.producer_job = meta.producer_job;
+        row.local_path = meta.local_path.string();
+        row.created_unix_ms = meta.created_unix_ms;
+        journal.record_artifact(row);
     }
 
     // ---- recovery ------------------------------------------------------------
@@ -673,6 +740,14 @@ struct JobManager::Impl {
         for (const auto& id : spec.input_artifacts()) {
             if (!artifact_hex(id)) return std::unexpected("invalid input artifact id: " + id);
             if (!store.contains(id)) return std::unexpected("input artifact not found locally: " + id);
+        }
+        if (spec.input_names_size() > spec.input_artifacts_size()) {
+            return std::unexpected(std::format("input_names has {} entries but there are only {} input artifacts",
+                                               spec.input_names_size(), spec.input_artifacts_size()));
+        }
+        if (const auto& ck = spec.resume_checkpoint(); !ck.empty()) {
+            if (!artifact_hex(ck)) return std::unexpected("invalid resume checkpoint id: " + ck);
+            if (!store.contains(ck)) return std::unexpected("resume checkpoint not found locally: " + ck);
         }
         if (spec.job_id().empty()) {
             spec.set_job_id(new_id("job"));
@@ -784,6 +859,10 @@ struct JobManager::Impl {
         t.set_checkpoint_dir((a.dir / "checkpoints").string());
         t.set_campaign_id(a.spec.campaign_id());
         t.set_material_id(a.spec.material_id());
+        if (!a.resume_path.empty()) t.set_resume_checkpoint(a.resume_path.string());
+        t.set_workflow_id(a.spec.workflow_id());
+        t.set_step(a.spec.step());
+        t.set_checkpoint_enabled(a.spec.policy().checkpoint());
         log_debug("job {}: worker hello (attempt {}, pid {}, sdk {})", a.job_id, a.id, hello.pid(),
                   hello.sdk_version());
         return t;
@@ -803,8 +882,61 @@ struct JobManager::Impl {
         if (!a) return std::unexpected("unknown or finished attempt: " + r.attempt_id());
         if (a->result) return std::unexpected("result already received for attempt " + r.attempt_id());
         a->result = r;
-        log_debug("job {}: worker result success={} outputs={}", a->job_id, r.success(), r.outputs_size());
+        log_debug("job {}: worker result success={} outputs={} spawn={}", a->job_id, r.success(), r.outputs_size(),
+                  r.spawn_size());
         return {};
+    }
+
+    // phase6.md §6. Same path care as declared outputs.
+    std::expected<v1::NamedArtifact, std::string> on_worker_checkpoint(const v1::WorkerCheckpoint& c) {
+        Attempt* a = running_attempt(c.attempt_id());
+        if (!a) return std::unexpected("unknown or finished attempt: " + c.attempt_id());
+        if (!a->spec.policy().checkpoint()) return std::unexpected("checkpointing not enabled for this job");
+        if (a->cancel_requested) return std::unexpected("attempt is being cancelled");
+        auto rec = journal.get_job(a->job_id);
+        if (!rec || rec->state != v1::RUNNING || rec->current_attempt_id != a->id) {
+            return std::unexpected("attempt is not running");
+        }
+        const std::string name = c.name().empty() ? std::string(kDefaultCheckpointName) : c.name();
+        if (!valid_checkpoint_name(name)) {
+            return std::unexpected("invalid checkpoint name (allowed: [A-Za-z0-9._-], max 128 chars)");
+        }
+        if (c.path().empty()) return std::unexpected("checkpoint path is empty");
+
+        std::error_code ec;
+        const fs::path base = fs::canonical(a->dir / "checkpoints", ec);
+        if (ec) return std::unexpected("checkpoint dir missing");
+        const fs::path given(c.path());
+        if (!given.is_absolute()) {
+            for (const auto& part : given) {
+                if (part == "..") return std::unexpected("checkpoint path escapes checkpoint dir: " + c.path());
+            }
+        }
+        const fs::path full = given.is_absolute() ? given : base / given;
+        const fs::path real = fs::canonical(full, ec);
+        if (ec) return std::unexpected("checkpoint not found: " + c.path());
+        if (!is_within(base, real) || real == base) {
+            return std::unexpected("checkpoint path escapes checkpoint dir: " + c.path());
+        }
+        if (!fs::is_regular_file(real, ec)) return std::unexpected("checkpoint is not a regular file: " + c.path());
+
+        // Always a copy: the worker may keep writing to the file (and under a
+        // restricted job user it owns it).
+        const std::string media = c.media_type().empty() ? std::string(kDefaultMediaType) : c.media_type();
+        auto meta = store.ingest(real, media, a->job_id, /*move_source=*/false);
+        if (!meta) return std::unexpected("ingest checkpoint: " + meta.error());
+        record(*meta);
+
+        v1::NamedArtifact n;
+        n.set_artifact_id(meta->id);
+        n.set_name(name);
+        n.set_size(meta->size);
+        n.set_media_type(meta->media_type);
+        const std::string job_id = a->job_id;  // the listener may re-enter
+        journal.set_checkpoint(job_id, n);
+        log_info("job {}: checkpoint '{}' {} ({} bytes)", job_id, name, n.artifact_id(), n.size());
+        if (checkpoint_listener) checkpoint_listener(job_id, n);
+        return n;
     }
 };
 
@@ -857,6 +989,14 @@ void JobManager::on_worker_progress(const v1::WorkerProgress& progress) { impl_-
 
 std::expected<void, std::string> JobManager::on_worker_result(const v1::WorkerResult& result) {
     return impl_->on_worker_result(result);
+}
+
+std::expected<v1::NamedArtifact, std::string> JobManager::on_worker_checkpoint(const v1::WorkerCheckpoint& c) {
+    return impl_->on_worker_checkpoint(c);
+}
+
+void JobManager::set_checkpoint_listener(std::function<void(const std::string&, const v1::NamedArtifact&)> fn) {
+    impl_->checkpoint_listener = std::move(fn);
 }
 
 void JobManager::set_cancel_notifier(std::function<void(const std::string&, const std::string&)> fn) {

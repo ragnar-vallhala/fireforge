@@ -186,6 +186,7 @@ message ArtifactRef {
   string media_type = 3;
   string producer_job = 4;
   int64 created_unix_ms = 5;
+  string name = 6;                 // Phase 6: output name within producer_job ("" in announcements)
 }
 
 message JobAttempt {
@@ -216,7 +217,47 @@ message Job {
   double progress_fraction = 13;
   string progress_message = 14;
   repeated JobAttempt attempts = 15;  // filled by GET /jobs/{id} only, oldest first
+  // ---- Phase 6 ----
+  string workflow_id = 16;
+  string step = 17;
+  ArtifactRef checkpoint = 18;     // latest checkpoint (name set)
+  string reserved_node = 19;       // ranked placement reservation (phase6.md §7)
+  int64 reserved_until_unix_ms = 20;
 }
+
+// ---- workflows (phase6.md §3, §8) ----
+message CreateWorkflowRequest {
+  string name = 1;
+  string campaign_id = 2;
+  repeated fireforge.tdr.v1.StepSpec steps = 3;
+}
+
+message WorkflowStep {
+  string name = 1;                 // full name ("<parent>/<short>" for spawned)
+  string state = 2;                // "WAITING" | "SKIPPED" | "CANCELLED" | a JobState name
+  string job_id = 3;               // "" until the step's job exists
+  string parent_step = 4;          // spawning step ("" = static)
+  fireforge.tdr.v1.StepSpec spec = 5;
+  string node_id = 6;
+  string error = 7;
+  int64 updated_unix_ms = 8;
+}
+
+message Workflow {
+  string workflow_id = 1;          // "wf-<16 hex>"
+  string name = 2;
+  string campaign_id = 3;
+  string state = 4;                // "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED"
+  string submitted_by = 5;
+  int64 created_unix_ms = 6;
+  int64 updated_unix_ms = 7;
+  int64 finished_unix_ms = 8;
+  map<string, uint32> step_counts = 9;  // step state -> count
+  repeated WorkflowStep steps = 10;     // GET /workflows/{id} only, creation order
+  string error = 11;                    // why FAILED (first failing step)
+}
+
+message WorkflowList { repeated Workflow workflows = 1; }
 
 message CreateJobRequest { fireforge.tdr.v1.JobSpec spec = 1; }
 message JobList { repeated Job jobs = 1; }
@@ -233,6 +274,9 @@ message JobUpdate {
   repeated ArtifactRef outputs = 6;   // COMPLETED only
   double progress_fraction = 7;    // RUNNING only (optional)
   string progress_message = 8;
+  // ---- Phase 6 ----
+  repeated fireforge.tdr.v1.StepSpec spawn = 9;  // COMPLETED only: fan-out (phase6.md §5)
+  ArtifactRef checkpoint = 10;     // RUNNING only: new latest checkpoint (name set)
 }
 
 message LeaseRequest {

@@ -60,6 +60,43 @@ message JobSpec {
   Command command = 11;
   string parameters_json = 12;          // opaque to the runtime, passed to the task
   repeated string required_capabilities = 13;
+
+  // ---- Phase 6 (docs/design/phase6.md) ----
+  repeated string input_names = 14;     // parallel to input_artifacts ("" = unnamed); may be shorter
+  string resume_checkpoint = 15;        // artifact id of the checkpoint to resume from ("" = none)
+  string workflow_id = 16;              // set by the control plane for workflow steps
+  string step = 17;                     // full step name within the workflow
+}
+
+// An output (or checkpoint) with its logical name (phase6.md §2).
+message NamedArtifact {
+  string artifact_id = 1;
+  string name = 2;
+  uint64 size = 3;
+  string media_type = 4;
+}
+
+// ---- workflows (phase6.md §3) ----
+enum RunIf {
+  ALL_SUCCEEDED = 0;   // default: every dependency (and its spawned subtree) COMPLETED
+  ANY_FAILED = 1;      // at least one FAILED/EXPIRED/VALIDATION_FAILED/CANCELLED
+  ALWAYS = 2;
+}
+
+message StepInput {
+  string step = 1;      // full step name; in a spawn, a sibling's short name, or "." = the spawning step
+  string output = 2;    // output name; "" or "*" = all outputs
+  bool spawned = 3;     // also the same selection from every COMPLETED step in its spawned subtree
+  string input_name = 4; // input name for the child ("" = the output name)
+}
+
+message StepSpec {
+  string name = 1;                  // [A-Za-z0-9_.-]{1,64}; spawned: short name (stored as "<parent>/<name>")
+  JobSpec job = 2;                  // template: no job_id/campaign_id/workflow fields
+  repeated string depends_on = 3;   // step names (StepInput.step entries are implicit dependencies)
+  repeated StepInput inputs = 4;
+  RunIf run_if = 5;
+  bool allow_failure = 6;           // a failure of this step doesn't fail the workflow
 }
 
 message JobStatus {
@@ -76,4 +113,8 @@ message JobStatus {
   string progress_message = 11;
   string node_id = 12;             // central jobs: executing node (Phase 4)
   string remote_job_id = 13;       // local copy of a leased job: the central job id
+  // ---- Phase 6 ----
+  repeated NamedArtifact outputs = 14;  // same artifacts as output_artifacts, with names (same order)
+  NamedArtifact checkpoint = 15;        // latest checkpoint (empty artifact_id = none)
+  repeated StepSpec spawn = 16;         // steps the successful attempt spawned (WorkerResult.spawn)
 }

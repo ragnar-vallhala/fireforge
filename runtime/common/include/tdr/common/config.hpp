@@ -51,6 +51,7 @@ struct Config {
         std::uint32_t gc_low = 80;         // % to evict down to
         std::uint32_t gc_interval = 60;    // seconds between GC passes
         std::uint32_t gc_min_age = 600;    // seconds: younger artifacts are never evicted
+        std::uint32_t checkpoint_replicas = 1;  // Phase 6: peers asked to copy each new checkpoint
     } artifacts;
 
     struct Resources {

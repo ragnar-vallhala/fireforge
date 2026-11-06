@@ -1,8 +1,10 @@
 // SQLite implementation of IJournal. See journal.hpp.
+#include <google/protobuf/util/json_util.h>
 #include <sqlite3.h>
 
 #include <format>
 #include <map>
+#include <set>
 #include <string_view>
 #include <utility>
 
@@ -13,7 +15,7 @@ namespace tdr::journal {
 
 namespace {
 
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 constexpr int kBusyTimeoutMs = 5000;
 
 constexpr const char* kSchemaV1 = R"sql(
@@ -69,9 +71,63 @@ CREATE TABLE artifacts (
 );
 )sql";
 
+// Phase 6: output names, spawn list, latest checkpoint.
+constexpr const char* kSchemaV2 = R"sql(
+ALTER TABLE job_outputs ADD COLUMN name TEXT NOT NULL DEFAULT '';
+ALTER TABLE job_outputs ADD COLUMN size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE job_outputs ADD COLUMN media_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN spawn_json TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN checkpoint_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN checkpoint_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN checkpoint_size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN checkpoint_media_type TEXT NOT NULL DEFAULT '';
+)sql";
+
 constexpr const char* kJobColumns =
     "job_id, spec, state, attempts_used, current_attempt_id, last_error, created_ms, updated_ms, "
-    "progress_fraction, progress_message";
+    "progress_fraction, progress_message, spawn_json, checkpoint_id, checkpoint_name, checkpoint_size, "
+    "checkpoint_media_type";
+
+// spawn_json holds the JSON array of StepSpec (proto3 JSON, proto field names);
+// "" = none. Encoded through the JobStatus.spawn field, the only repeated
+// StepSpec field around.
+constexpr std::string_view kSpawnPrefix = "{\"spawn\":";
+
+std::string spawn_to_json(const std::vector<v1::StepSpec>& spawn) {
+    if (spawn.empty()) return {};
+    v1::JobStatus holder;
+    for (const auto& s : spawn) *holder.add_spawn() = s;
+    google::protobuf::util::JsonPrintOptions po;
+    po.preserve_proto_field_names = true;
+    std::string out;
+    if (!google::protobuf::util::MessageToJsonString(holder, &out, po).ok() || !out.starts_with(kSpawnPrefix) ||
+        !out.ends_with('}')) {
+        throw JournalError("journal: cannot encode spawn list");
+    }
+    return out.substr(kSpawnPrefix.size(), out.size() - kSpawnPrefix.size() - 1);
+}
+
+std::vector<v1::StepSpec> spawn_from_json(const std::string& job_id, const std::string& json) {
+    if (json.empty()) return {};
+    v1::JobStatus holder;
+    google::protobuf::util::JsonParseOptions po;
+    po.ignore_unknown_fields = true;
+    const std::string doc = std::string(kSpawnPrefix) + json + "}";
+    if (!google::protobuf::util::JsonStringToMessage(doc, &holder, po).ok()) {
+        throw JournalError("journal: corrupt spawn list for job " + job_id);
+    }
+    return {holder.spawn().begin(), holder.spawn().end()};
+}
+
+std::vector<v1::NamedArtifact> unnamed(const std::vector<std::string>& ids) {
+    std::vector<v1::NamedArtifact> out;
+    for (const auto& id : ids) {
+        v1::NamedArtifact a;
+        a.set_artifact_id(id);
+        out.push_back(std::move(a));
+    }
+    return out;
+}
 constexpr const char* kAttemptColumns =
     "attempt_id, job_id, number, token, state, pid, pid_start_ticks, cgroup_path, work_dir, exit_code, "
     "exit_signal, error, started_ms, ended_ms";
@@ -250,16 +306,19 @@ public:
         if (!job.spec.SerializeToString(&spec)) throw JournalError("journal: cannot serialize JobSpec");
         Tx tx(db_);
         {
-            auto s = stmt(
-                "INSERT INTO jobs (job_id, spec, state, attempts_used, current_attempt_id, last_error, created_ms, "
-                "updated_ms, progress_fraction, progress_message) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)");
+            auto s = stmt(std::format("INSERT INTO jobs ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, "
+                                      "?11, ?12, ?13, ?14, ?15)",
+                                      kJobColumns));
             s->bind(1, job.job_id).bind_blob(2, spec).bind(3, static_cast<int>(job.state));
             s->bind(4, job.attempts_used).bind(5, job.current_attempt_id).bind(6, job.last_error);
             s->bind(7, job.created_unix_ms).bind(8, job.updated_unix_ms);
             s->bind(9, job.progress_fraction).bind(10, job.progress_message);
+            s->bind(11, spawn_to_json(job.spawn));
+            s->bind(12, job.checkpoint.artifact_id()).bind(13, job.checkpoint.name());
+            s->bind(14, job.checkpoint.size()).bind(15, job.checkpoint.media_type());
             s->exec();
         }
-        write_outputs(job.job_id, job.output_artifacts);
+        write_outputs(job.job_id, job.outputs.empty() ? unnamed(job.output_artifacts) : job.outputs);
         tx.commit();
     }
 
@@ -417,19 +476,21 @@ public:
     // ---- commit (fencing) ----------------------------------------------------
 
     bool commit_outputs(const std::string& job_id, const std::string& attempt_id,
-                        const std::vector<std::string>& artifact_ids) override {
+                        const std::vector<v1::NamedArtifact>& outputs,
+                        const std::vector<v1::StepSpec>& spawn) override {
+        const std::string spawn_json = spawn_to_json(spawn);
         Tx tx(db_);
         const std::int64_t now = unix_ms();
         {
             auto s = stmt(
-                "UPDATE jobs SET state = ?4, updated_ms = ?5 "
+                "UPDATE jobs SET state = ?4, updated_ms = ?5, spawn_json = ?6 "
                 "WHERE job_id = ?1 AND state = ?2 AND current_attempt_id = ?3 AND ?3 <> ''");
             s->bind(1, job_id).bind(2, static_cast<int>(v1::COMMITTING)).bind(3, attempt_id);
-            s->bind(4, static_cast<int>(v1::COMPLETED)).bind(5, now);
+            s->bind(4, static_cast<int>(v1::COMPLETED)).bind(5, now).bind(6, spawn_json);
             s->exec();
         }
         if (sqlite3_changes(db_) != 1) return false;  // Tx dtor rolls back (nothing changed anyway)
-        write_outputs(job_id, artifact_ids);
+        write_outputs(job_id, outputs);
         {
             auto s = stmt(
                 "UPDATE attempts SET state = ?2, ended_ms = CASE WHEN ended_ms = 0 THEN ?3 ELSE ended_ms END "
@@ -439,6 +500,21 @@ public:
         }
         tx.commit();
         return true;
+    }
+
+    // ---- checkpoints -----------------------------------------------------------
+
+    void set_checkpoint(const std::string& job_id, const v1::NamedArtifact& c) override {
+        Tx tx(db_);
+        {
+            auto s = stmt(
+                "UPDATE jobs SET checkpoint_id = ?2, checkpoint_name = ?3, checkpoint_size = ?4, "
+                "checkpoint_media_type = ?5, updated_ms = ?6 WHERE job_id = ?1");
+            s->bind(1, job_id).bind(2, c.artifact_id()).bind(3, c.name()).bind(4, c.size());
+            s->bind(5, c.media_type()).bind(6, unix_ms());
+            s->exec();
+        }
+        tx.commit();  // unknown job: no-op
     }
 
     // ---- artifacts -----------------------------------------------------------
@@ -505,28 +581,44 @@ private:
                                            kSchemaVersion));
         }
         Tx tx(db_);
-        exec_sql(db_, kSchemaV1);
+        if (version < 1) exec_sql(db_, kSchemaV1);
+        if (version < 2) exec_sql(db_, kSchemaV2);
         exec_sql(db_, std::format("PRAGMA user_version = {}", kSchemaVersion).c_str());
         tx.commit();
     }
 
-    void write_outputs(const std::string& job_id, const std::vector<std::string>& ids) {
+    void write_outputs(const std::string& job_id, const std::vector<v1::NamedArtifact>& outs) {
         {
             auto d = stmt("DELETE FROM job_outputs WHERE job_id = ?1");
             d->bind(1, job_id);
             d->exec();
         }
-        for (std::size_t i = 0; i < ids.size(); ++i) {
-            auto s = stmt("INSERT INTO job_outputs (job_id, idx, artifact_id) VALUES (?1, ?2, ?3)");
-            s->bind(1, job_id).bind(2, static_cast<std::int64_t>(i)).bind(3, ids[i]);
+        for (std::size_t i = 0; i < outs.size(); ++i) {
+            auto s = stmt(
+                "INSERT INTO job_outputs (job_id, idx, artifact_id, name, size, media_type) "
+                "VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
+            s->bind(1, job_id).bind(2, static_cast<std::int64_t>(i)).bind(3, outs[i].artifact_id());
+            s->bind(4, outs[i].name()).bind(5, outs[i].size()).bind(6, outs[i].media_type());
             s->exec();
         }
     }
 
+    // outputs = every row in order; output_artifacts = their distinct ids.
     void load_outputs(JobRecord& j) const {
-        auto s = stmt("SELECT artifact_id FROM job_outputs WHERE job_id = ?1 ORDER BY idx");
+        j.output_artifacts.clear();
+        j.outputs.clear();
+        std::set<std::string> seen;
+        auto s = stmt("SELECT artifact_id, name, size, media_type FROM job_outputs WHERE job_id = ?1 ORDER BY idx");
         s->bind(1, j.job_id);
-        while (s->step()) j.output_artifacts.push_back(s->text(0));
+        while (s->step()) {
+            v1::NamedArtifact a;
+            a.set_artifact_id(s->text(0));
+            a.set_name(s->text(1));
+            a.set_size(static_cast<std::uint64_t>(s->i64(2)));
+            a.set_media_type(s->text(3));
+            if (seen.insert(a.artifact_id()).second) j.output_artifacts.push_back(a.artifact_id());
+            j.outputs.push_back(std::move(a));
+        }
     }
 
     static JobRecord read_job(const Stmt& s) {
@@ -542,6 +634,11 @@ private:
         j.updated_unix_ms = s.i64(7);
         j.progress_fraction = s.dbl(8);
         j.progress_message = s.text(9);
+        j.spawn = spawn_from_json(j.job_id, s.text(10));
+        j.checkpoint.set_artifact_id(s.text(11));
+        j.checkpoint.set_name(s.text(12));
+        j.checkpoint.set_size(static_cast<std::uint64_t>(s.i64(13)));
+        j.checkpoint.set_media_type(s.text(14));
         return j;
     }
 

@@ -15,7 +15,7 @@ structures = ["pymatgen"]
 test = ["pytest"]
 
 [tool.setuptools]
-packages = ["fireforge", "fireforge.tdr", "fireforge.tdr.v1"]
+packages = ["fireforge", "fireforge.tdr", "fireforge.tdr.v1", "fireforge.control", "fireforge.control.v1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

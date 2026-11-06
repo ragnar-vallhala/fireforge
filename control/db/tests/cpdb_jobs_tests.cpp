@@ -147,11 +147,12 @@ BOOST_AUTO_TEST_CASE(migrates_v1_database_to_latest) {
     auto n = db.node("alpha");
     // Roll this database back to a v1 schema that holds data.
     psql(db.conninfo,
-         "DROP TABLE artifact_pins, artifact_syncs, artifact_locations, job_attempts, jobs;"
+         "DROP TABLE workflow_step_deps, workflow_steps, artifact_pins, artifact_syncs, artifact_locations, job_attempts,"
+         " jobs, workflows;"
          " DELETE FROM schema_migrations WHERE version >= 2");
     BOOST_TEST(schema_version(db.conninfo) == 1);
     auto repo = open_pg_repository(db.conninfo);
-    BOOST_TEST(schema_version(db.conninfo) == 3);
+    BOOST_TEST(schema_version(db.conninfo) == 4);
     BOOST_TEST(repo->get_node(n)->name() == "alpha");
     auto j = repo->create_job(spec(), "admin:a", T0);
     BOOST_REQUIRE(j);
@@ -384,7 +385,10 @@ BOOST_AUTO_TEST_CASE(lease_fit_and_greedy_skip) {
     BOOST_TEST(ls[0].job_id() == "zero-cpu");  // oldest first
     BOOST_TEST(ls[1].job_id() == "fits-a");
 
-    // max_jobs caps grants; gpu fits once gpus are free.
+    // max_jobs caps grants; gpu fits once gpus are free. A GPU job is strict
+    // (phase6.md §7): leasable only once place_jobs released it (no node
+    // has a heartbeat here, so none is eligible and it is released at once).
+    BOOST_TEST(db.repo->place_jobs(PlacementOptions{}, T0 + 11).empty());
     auto l2 = db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 1, 2), TTL, WAIT, T0 + 11);
     BOOST_TEST((ids(l2) == std::set<std::string>{"big", "mem-hog"}));
     auto l3 = db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 1, 10), TTL, WAIT, T0 + 12);

@@ -64,5 +64,57 @@ def fail(context):
     return JobResult(success=False, error="bad input", retryable=True)
 
 
+@worker.task("demo.wf_info")
+def wf_info(context):
+    try:
+        context.input("missing")
+    except KeyError as exc:
+        missing = str(exc)
+    return {"workflow_id": context.workflow_id, "step": context.step,
+            "named": sorted(context.named_inputs),
+            "structure": context.input("structure").read_text(),
+            "names": [i.name for i in context.inputs],
+            "resume": context.load_checkpoint_json(), "missing": missing}
+
+
+@worker.task("demo.checkpoint")
+def checkpoint(context):
+    for i in range(3):
+        context.checkpoint({"i": i}, name="state")
+    ext = context.workdir / "external.dat"
+    ext.write_bytes(b"ext")
+    context.checkpoint(ext, name="ext")
+    return {"ok": True}
+
+
+@worker.task("demo.checkpoint_error")
+def checkpoint_error(context):
+    from fireforge import CheckpointError
+    try:
+        context.checkpoint(b"x")
+    except CheckpointError as exc:
+        return {"error": str(exc), "retryable": exc.retryable}
+    return {"error": None}
+
+
+@worker.task("demo.spawn")
+def spawn(context):
+    from fireforge import StepInput
+    for i in range(2):
+        context.spawn(f"child{i}", operation="demo.child", params={"i": i},
+                      inputs=[".:result"], resources={"cpu_cores": 2})
+    context.spawn("join", argv=["/bin/true"], operation="demo.join",
+                  inputs=[StepInput("child0", spawned=True, as_name="c0"), "child1"],
+                  run_if="always", allow_failure=True, checkpoint=True, max_attempts=3,
+                  timeout=60, env={"X": "1"})
+    return {"spawned": True}
+
+
+@worker.task("demo.spawn_fail")
+def spawn_fail(context):
+    context.spawn("child", operation="demo.child")
+    return JobResult(success=False, error="nope")
+
+
 if __name__ == "__main__":
     worker.run()

@@ -44,7 +44,15 @@ M parse(const http::Response& r) {
 struct Fixture {
     FakeRepository repo;
     std::int64_t now = 1'000'000;
-    ControlApi api{repo, ApiOptions{10, 30, 90}, [this] { return now; }};
+    ControlApi api{repo,
+                   [] {
+                       ApiOptions o;
+                       o.heartbeat_interval_seconds = 10;
+                       o.stale_after_seconds = 30;
+                       o.offline_after_seconds = 90;
+                       return o;
+                   }(),
+                   [this] { return now; }};
 
     http::Response call(const std::string& method, const std::string& path, std::optional<tls::Identity> peer,
                         std::string body = {}, std::map<std::string, std::string> query = {}) {

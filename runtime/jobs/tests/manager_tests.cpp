@@ -857,4 +857,360 @@ BOOST_FIXTURE_TEST_CASE(run_as_foreign_group_is_setup_error, Fixture) {
     BOOST_TEST(mgr->usage().allocated.jobs == 0u);
 }
 
+// ---- Phase 6: named outputs/inputs, checkpoints, resume, spawn ----------------
+
+namespace {
+v1::WorkerHello hello_for(const tdr::supervisor::LaunchSpec& l) {
+    v1::WorkerHello h;
+    h.set_attempt_id(l.attempt_id);
+    h.set_token(l.env.at("FIREFORGE_ATTEMPT_TOKEN"));
+    return h;
+}
+v1::WorkerCheckpoint ckpt(const std::string& att, const std::string& path, const std::string& name = "",
+                          const std::string& media = "") {
+    v1::WorkerCheckpoint c;
+    c.set_attempt_id(att);
+    c.set_path(path);
+    c.set_name(name);
+    c.set_media_type(media);
+    return c;
+}
+v1::JobSpec ckpt_spec(std::uint32_t attempts = 1) {
+    auto s = Fixture::spec(attempts);
+    s.mutable_policy()->set_checkpoint(true);
+    return s;
+}
+fs::path ckdir(const tdr::supervisor::LaunchSpec& l) { return l.working_dir / "checkpoints"; }
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(named_outputs_declared, Fixture) {
+    auto id = submit(spec());
+    const auto att = launch(0).attempt_id;
+    write_file(outdir(0) / "result.json", "{}");
+    write_file(outdir(0) / "sub" / "b.txt", "beta");
+    v1::WorkerResult r = ok_result(att);
+    auto* o = r.add_outputs();
+    o->set_path("result.json");
+    o->set_name("result");
+    o->set_media_type("application/json");
+    r.add_outputs()->set_path("./sub/b.txt");  // unnamed: normalized relative path
+    o = r.add_outputs();                       // same file under a second name
+    o->set_path("result.json");
+    o->set_name("copy");
+    o = r.add_outputs();                       // exact repeat: ignored
+    o->set_path("result.json");
+    o->set_name("result");
+    BOOST_REQUIRE(mgr->on_worker_result(r).has_value());
+    sup.exit_code(0, 0);
+    pump();
+    auto st = mgr->status(id);
+    BOOST_REQUIRE(st.has_value());
+    BOOST_TEST(st->state() == v1::COMPLETED);
+    BOOST_REQUIRE_EQUAL(st->outputs_size(), 3);
+    BOOST_TEST(st->outputs(0).name() == "result");
+    BOOST_TEST(st->outputs(0).artifact_id() == "artifact://sha256/" + fake_digest("{}"));
+    BOOST_TEST(st->outputs(0).size() == 2u);
+    BOOST_TEST(st->outputs(0).media_type() == "application/json");
+    BOOST_TEST(st->outputs(1).name() == "sub/b.txt");
+    BOOST_TEST(st->outputs(1).size() == 4u);
+    BOOST_TEST(st->outputs(1).media_type() == "application/octet-stream");
+    BOOST_TEST(st->outputs(2).name() == "copy");
+    BOOST_TEST(st->outputs(2).artifact_id() == st->outputs(0).artifact_id());
+    // output_artifacts: distinct ids, same order.
+    BOOST_REQUIRE_EQUAL(st->output_artifacts_size(), 2);
+    BOOST_TEST(st->output_artifacts(0) == st->outputs(0).artifact_id());
+    BOOST_TEST(st->output_artifacts(1) == st->outputs(1).artifact_id());
+    BOOST_TEST(store.ingests.size() == 2u);  // the shared file is ingested once
+}
+
+BOOST_FIXTURE_TEST_CASE(named_outputs_scanned, Fixture) {
+    auto id = submit(spec());
+    write_file(outdir(0) / "z.txt", "zeta");
+    write_file(outdir(0) / "sub" / "b.txt", "beta");
+    sup.exit_code(0, 0);
+    pump();
+    auto st = mgr->status(id);
+    BOOST_TEST(st->state() == v1::COMPLETED);
+    BOOST_REQUIRE_EQUAL(st->outputs_size(), 2);
+    BOOST_TEST(st->outputs(0).name() == "sub/b.txt");
+    BOOST_TEST(st->outputs(1).name() == "z.txt");
+    BOOST_TEST(st->output_artifacts(0) == st->outputs(0).artifact_id());
+    BOOST_TEST(st->output_artifacts(1) == st->outputs(1).artifact_id());
+}
+
+BOOST_FIXTURE_TEST_CASE(duplicate_output_name_fails_not_retryable, Fixture) {
+    auto id = submit(spec(3));
+    write_file(outdir(0) / "a.txt", "alpha");
+    write_file(outdir(0) / "b.txt", "beta");
+    v1::WorkerResult r = ok_result(launch(0).attempt_id);
+    auto* o = r.add_outputs();
+    o->set_path("a.txt");
+    o->set_name("x");
+    o = r.add_outputs();
+    o->set_path("b.txt");
+    o->set_name("x");
+    BOOST_REQUIRE(mgr->on_worker_result(r).has_value());
+    sup.exit_code(0, 0);
+    pump();
+    BOOST_TEST(state(id) == v1::FAILED);
+    BOOST_TEST(journal.jobs.at(id).last_error == "duplicate output name: x");
+    BOOST_TEST(sup.launches.size() == 1u);  // not retried
+    BOOST_TEST(store.ingests.empty());
+    BOOST_TEST(journal.attempts.at(launch(0).attempt_id).state == AttemptState::kFailed);
+
+    // A declared name equal to another output's path also collides.
+    auto id2 = submit(spec());
+    write_file(outdir(1) / "a.txt", "alpha");
+    write_file(outdir(1) / "b.txt", "beta");
+    v1::WorkerResult r2 = ok_result(launch(1).attempt_id);
+    r2.add_outputs()->set_path("a.txt");
+    o = r2.add_outputs();
+    o->set_path("b.txt");
+    o->set_name("a.txt");
+    BOOST_REQUIRE(mgr->on_worker_result(r2).has_value());
+    sup.exit_code(1, 0);
+    pump();
+    BOOST_TEST(state(id2) == v1::FAILED);
+    BOOST_TEST(journal.jobs.at(id2).last_error == "duplicate output name: a.txt");
+}
+
+BOOST_FIXTURE_TEST_CASE(input_names_and_workflow_fields_in_task, Fixture) {
+    const auto in1 = store.add("structure-data");
+    const auto in2 = store.add("other");
+    auto s = spec();
+    s.add_input_artifacts(in1);
+    s.add_input_artifacts(in2);
+    s.add_input_names("structure");  // shorter than input_artifacts: the rest is unnamed
+    s.set_workflow_id("wf-0123456789abcdef");
+    s.set_step("relax/child-1");
+
+    auto too_many = s;
+    too_many.add_input_names("b");
+    too_many.add_input_names("c");
+    BOOST_TEST(!mgr->submit(too_many).has_value());
+    BOOST_TEST(journal.jobs.empty());
+
+    submit(s);
+    auto task = mgr->on_worker_hello(hello_for(launch(0)));
+    BOOST_REQUIRE(task.has_value());
+    BOOST_REQUIRE_EQUAL(task->inputs_size(), 2);
+    BOOST_TEST(task->inputs(0).name() == "structure");
+    BOOST_TEST(task->inputs(0).artifact_id() == in1);
+    BOOST_TEST(read_file(task->inputs(0).path()) == "structure-data");
+    BOOST_TEST(task->inputs(1).name().empty());
+    BOOST_TEST(task->workflow_id() == "wf-0123456789abcdef");
+    BOOST_TEST(task->step() == "relax/child-1");
+    BOOST_TEST(!task->checkpoint_enabled());
+    BOOST_TEST(task->resume_checkpoint().empty());
+
+    submit(ckpt_spec());
+    auto t2 = mgr->on_worker_hello(hello_for(launch(1)));
+    BOOST_REQUIRE(t2.has_value());
+    BOOST_TEST(t2->checkpoint_enabled());
+}
+
+BOOST_FIXTURE_TEST_CASE(checkpoint_accepted_and_listener_fired, Fixture) {
+    std::vector<std::pair<std::string, v1::NamedArtifact>> seen;
+    mgr->set_checkpoint_listener(
+        [&](const std::string& job, const v1::NamedArtifact& a) { seen.emplace_back(job, a); });
+    auto id = submit(ckpt_spec());
+    const auto att = launch(0).attempt_id;
+    write_file(ckdir(launch(0)) / "step-10.bin", "state-10");
+
+    auto r = mgr->on_worker_checkpoint(ckpt(att, "step-10.bin", "", "application/x-state"));
+    BOOST_REQUIRE_MESSAGE(r.has_value(), (r ? "" : r.error()));
+    BOOST_TEST(r->name() == "checkpoint");
+    BOOST_TEST(r->artifact_id() == "artifact://sha256/" + fake_digest("state-10"));
+    BOOST_TEST(r->size() == 8u);
+    BOOST_TEST(r->media_type() == "application/x-state");
+    BOOST_REQUIRE_EQUAL(store.ingests.size(), 1u);
+    BOOST_TEST(!store.ingests[0].move_source);  // copied: the worker may keep writing
+    BOOST_TEST(store.ingests[0].producer_job == id);
+    BOOST_TEST(fs::exists(ckdir(launch(0)) / "step-10.bin"));
+    BOOST_TEST(journal.artifacts.at(r->artifact_id()).producer_job == id);
+    BOOST_REQUIRE_EQUAL(seen.size(), 1u);
+    BOOST_TEST(seen[0].first == id);
+    BOOST_TEST(seen[0].second.artifact_id() == r->artifact_id());
+    BOOST_TEST(mgr->status(id)->checkpoint().artifact_id() == r->artifact_id());
+
+    // Absolute path inside the dir, custom name; the last one wins.
+    write_file(ckdir(launch(0)) / "sub" / "step-20.bin", "state-20");
+    auto r2 = mgr->on_worker_checkpoint(ckpt(att, (ckdir(launch(0)) / "sub" / "step-20.bin").string(), "state"));
+    BOOST_REQUIRE_MESSAGE(r2.has_value(), (r2 ? "" : r2.error()));
+    BOOST_TEST(r2->media_type() == "application/octet-stream");
+    auto st = mgr->status(id);
+    BOOST_TEST(st->checkpoint().name() == "state");
+    BOOST_TEST(st->checkpoint().artifact_id() == "artifact://sha256/" + fake_digest("state-20"));
+    BOOST_TEST(seen.size() == 2u);
+    // A job without a checkpoint reports none.
+    auto other = submit(spec());
+    BOOST_TEST(!mgr->status(other)->has_checkpoint());
+}
+
+BOOST_FIXTURE_TEST_CASE(checkpoint_rejections, Fixture) {
+    make({4, 4 * kGiB, 4});
+    std::size_t fired = 0;
+    mgr->set_checkpoint_listener([&](const std::string&, const v1::NamedArtifact&) { ++fired; });
+    // Not enabled.
+    submit(spec());
+    write_file(ckdir(launch(0)) / "c.bin", "x");
+    auto r = mgr->on_worker_checkpoint(ckpt(launch(0).attempt_id, "c.bin"));
+    BOOST_REQUIRE(!r.has_value());
+    BOOST_TEST(r.error() == "checkpointing not enabled for this job");
+
+    auto id = submit(ckpt_spec());
+    const auto& l = launch(1);
+    const auto att = l.attempt_id;
+    write_file(tmp.path / "secret", "outside");
+    write_file(l.working_dir / "outputs" / "o.bin", "out");
+    write_file(ckdir(l) / "ok.bin", "fine");
+    fs::create_symlink(tmp.path / "secret", ckdir(l) / "link");
+    fs::create_directories(ckdir(l) / "dir");
+    for (const std::string& path : {(tmp.path / "secret").string(), std::string("../outputs/o.bin"),
+                                    (ckdir(l) / ".." / "outputs" / "o.bin").string(), std::string("link"),
+                                    std::string("dir"), std::string("missing.bin"), std::string(""),
+                                    std::string("."), ckdir(l).string()}) {
+        BOOST_TEST(!mgr->on_worker_checkpoint(ckpt(att, path)).has_value(), "path '" << path << "' accepted");
+    }
+    // Bad names (they become file names on resume).
+    for (const std::string& name : {std::string("a/b"), std::string(".."), std::string(200, 'n')}) {
+        BOOST_TEST(!mgr->on_worker_checkpoint(ckpt(att, "ok.bin", name)).has_value(), "name '" << name << "'");
+    }
+    // Unknown attempt (the daemon authenticates the connection by hello token;
+    // here only the attempt id is checked).
+    BOOST_TEST(!mgr->on_worker_checkpoint(ckpt("att-unknown", "ok.bin")).has_value());
+    BOOST_TEST(fired == 0u);
+    BOOST_TEST(store.ingests.empty());
+    BOOST_TEST(mgr->on_worker_checkpoint(ckpt(att, "ok.bin")).has_value());
+    BOOST_TEST(fired == 1u);
+
+    // Not running any more.
+    sup.exit_code(1, 0);
+    pump();
+    BOOST_TEST(state(id) == v1::COMPLETED);
+    BOOST_TEST(!mgr->on_worker_checkpoint(ckpt(att, "ok.bin")).has_value());
+    // Being cancelled.
+    submit(ckpt_spec());
+    const auto& l3 = launch(2);
+    write_file(ckdir(l3) / "c.bin", "x");
+    BOOST_REQUIRE(mgr->cancel(journal.jobs.at(l3.env.at("FIREFORGE_JOB_ID")).job_id).has_value());
+    BOOST_TEST(!mgr->on_worker_checkpoint(ckpt(l3.attempt_id, "c.bin")).has_value());
+    BOOST_TEST(fired == 1u);
+}
+
+BOOST_FIXTURE_TEST_CASE(local_retry_resumes_from_latest_checkpoint, Fixture) {
+    const auto spec_ck = store.add("control-plane-ck");
+    auto s = ckpt_spec(3);
+    s.set_resume_checkpoint(spec_ck);
+    auto id = submit(s);
+    // Attempt 1 resumes from the spec's checkpoint.
+    auto t1 = mgr->on_worker_hello(hello_for(launch(0)));
+    BOOST_REQUIRE(t1.has_value());
+    BOOST_TEST(t1->resume_checkpoint() == (ckdir(launch(0)) / "resume" / "checkpoint").string());
+    BOOST_TEST(read_file(t1->resume_checkpoint()) == "control-plane-ck");
+
+    write_file(ckdir(launch(0)) / "a.bin", "first");
+    BOOST_REQUIRE(mgr->on_worker_checkpoint(ckpt(launch(0).attempt_id, "a.bin", "state")).has_value());
+    write_file(ckdir(launch(0)) / "a.bin", "second");  // the worker keeps writing
+    BOOST_REQUIRE(mgr->on_worker_checkpoint(ckpt(launch(0).attempt_id, "a.bin", "state")).has_value());
+    sup.exit_kind(0, ExitKind::kSignaled);
+    pump();
+    BOOST_TEST(state(id) == v1::RUNNING);
+    BOOST_REQUIRE_EQUAL(sup.launches.size(), 2u);
+
+    // Attempt 2: the latest local checkpoint wins over spec.resume_checkpoint.
+    auto t2 = mgr->on_worker_hello(hello_for(launch(1)));
+    BOOST_REQUIRE(t2.has_value());
+    BOOST_TEST(t2->attempt_number() == 2u);
+    const fs::path resume = ckdir(launch(1)) / "resume" / "state";
+    BOOST_TEST(t2->resume_checkpoint() == resume.string());
+    BOOST_TEST(read_file(resume) == "second");
+    BOOST_TEST(mgr->status(id)->checkpoint().name() == "state");
+
+    // The resume file itself may be re-submitted as a checkpoint.
+    auto again = mgr->on_worker_checkpoint(ckpt(launch(1).attempt_id, "resume/state", "state"));
+    BOOST_TEST(again.has_value());
+    sup.exit_code(1, 0);
+    pump();
+    BOOST_TEST(state(id) == v1::COMPLETED);
+    BOOST_TEST(mgr->status(id)->checkpoint().name() == "state");  // kept after completion
+}
+
+BOOST_FIXTURE_TEST_CASE(spec_resume_checkpoint_validated_and_used, Fixture) {
+    auto missing = ckpt_spec();
+    missing.set_resume_checkpoint("artifact://sha256/" + std::string(64, 'e'));
+    auto r = mgr->submit(missing);
+    BOOST_REQUIRE(!r.has_value());
+    BOOST_TEST(r.error().find("not found locally") != std::string::npos);
+    auto bad = ckpt_spec();
+    bad.set_resume_checkpoint("nope");
+    BOOST_TEST(!mgr->submit(bad).has_value());
+
+    // Works without policy.checkpoint too (resume only needs the file).
+    const auto ck = store.add("resume-me");
+    auto s = spec();
+    s.set_resume_checkpoint(ck);
+    submit(s);
+    auto t = mgr->on_worker_hello(hello_for(launch(0)));
+    BOOST_REQUIRE(t.has_value());
+    BOOST_TEST(read_file(t->resume_checkpoint()) == "resume-me");
+    BOOST_TEST(!t->checkpoint_enabled());
+}
+
+BOOST_FIXTURE_TEST_CASE(run_as_resume_dir_is_read_only_for_job, Fixture) {
+    run_as = self_run_as();
+    make({4, 4 * kGiB, 2});
+    const auto ck = store.add("resume-me");
+    auto s = ckpt_spec();
+    s.set_resume_checkpoint(ck);
+    submit(s);
+    const fs::path resume_dir = ckdir(launch(0)) / "resume";
+    BOOST_TEST(dir_info(resume_dir).mode == 02750u);
+    BOOST_TEST(dir_info(ckdir(launch(0))).mode == 02770u);
+    BOOST_TEST(read_file(resume_dir / "checkpoint") == "resume-me");
+    write_file(ckdir(launch(0)) / "c.bin", "x");
+    BOOST_TEST(mgr->on_worker_checkpoint(ckpt(launch(0).attempt_id, "c.bin")).has_value());
+    BOOST_TEST(!store.ingests.back().move_source);
+}
+
+BOOST_FIXTURE_TEST_CASE(spawn_persisted_and_survives_restart, Fixture) {
+    auto id = submit(spec());
+    v1::WorkerResult r = ok_result(launch(0).attempt_id);
+    auto* sp = r.add_spawn();
+    sp->set_name("cand-1");
+    sp->mutable_job()->set_operation("relax");
+    sp->add_depends_on("prep");
+    r.add_spawn()->set_name("cand-2");
+    BOOST_REQUIRE(mgr->on_worker_result(r).has_value());
+    sup.exit_code(0, 0);
+    pump();
+    auto st = mgr->status(id);
+    BOOST_TEST(st->state() == v1::COMPLETED);
+    BOOST_REQUIRE_EQUAL(st->spawn_size(), 2);
+    BOOST_TEST(st->spawn(0).name() == "cand-1");
+    BOOST_TEST(st->spawn(0).job().operation() == "relax");
+    BOOST_TEST(st->spawn(1).name() == "cand-2");
+
+    // Failed attempt: spawn ignored.
+    auto failed = submit(spec());
+    v1::WorkerResult fr;
+    fr.set_attempt_id(launch(1).attempt_id);
+    fr.set_success(false);
+    fr.add_spawn()->set_name("ignored");
+    BOOST_REQUIRE(mgr->on_worker_result(fr).has_value());
+    sup.exit_code(1, 0);
+    pump();
+    BOOST_TEST(state(failed) == v1::FAILED);
+    BOOST_TEST(mgr->status(failed)->spawn_size() == 0);
+
+    // A new manager over the same journal still reports it.
+    make({4, 4 * kGiB, 2});
+    mgr->recover();
+    pump();
+    st = mgr->status(id);
+    BOOST_REQUIRE_EQUAL(st->spawn_size(), 2);
+    BOOST_TEST(st->spawn(1).name() == "cand-2");
+    BOOST_TEST(mgr->list(v1::COMPLETED, 10).at(0).spawn_size() == 2);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

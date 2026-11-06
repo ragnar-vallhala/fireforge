@@ -12,7 +12,7 @@ namespace {
 // Arbitrary constant: pg_advisory_xact_lock key for "fireforge schema".
 constexpr std::int64_t kMigrationLock = 0x4646'5343'4845'4d41;  // "FFSCHEMA"
 
-constexpr std::array<std::string_view, 3> kMigrations = {
+constexpr std::array<std::string_view, 4> kMigrations = {
     // 1: initial control-plane schema
     R"sql(
 CREATE TABLE nodes (
@@ -161,6 +161,66 @@ CREATE TABLE artifact_pins (
     pinned_by   text NOT NULL DEFAULT '',
     pinned_at   timestamptz NOT NULL
 );
+)sql",
+    // 4: Phase 6 workflows, checkpoints, ranked placement (docs/design/phase6.md §3-§7)
+    R"sql(
+CREATE TABLE workflows (
+    seq          bigserial NOT NULL UNIQUE,
+    workflow_id  text PRIMARY KEY,
+    name         text NOT NULL DEFAULT '',
+    campaign_id  text REFERENCES campaigns (campaign_id),
+    state        text NOT NULL CHECK (state IN ('RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')),
+    submitted_by text NOT NULL DEFAULT '',
+    error        text NOT NULL DEFAULT '',          -- first failing step (FAILED)
+    step_count   int NOT NULL DEFAULT 0,            -- static + spawned
+    open_steps   int NOT NULL DEFAULT 0,            -- steps not yet terminal
+    created_at   timestamptz NOT NULL,
+    updated_at   timestamptz NOT NULL,
+    finished_at  timestamptz
+);
+CREATE INDEX workflows_created_idx ON workflows (created_at DESC, seq DESC);
+CREATE INDEX workflows_running_idx ON workflows (created_at, seq) WHERE state = 'RUNNING';
+
+-- Names are byte-ordered (COLLATE "C") so the spawned subtree of X is the
+-- range ['X/', 'X0') of the primary key.
+CREATE TABLE workflow_steps (
+    workflow_id text NOT NULL REFERENCES workflows (workflow_id) ON DELETE CASCADE,
+    name        text COLLATE "C" NOT NULL,
+    seq         int NOT NULL,                       -- creation order within the workflow
+    parent_step text COLLATE "C",                   -- spawning step (NULL = static)
+    depth       int NOT NULL DEFAULT 0,
+    spec        jsonb NOT NULL,                     -- fireforge.tdr.v1.StepSpec (proto3 JSON, full names)
+    state       text NOT NULL CHECK (state IN ('WAITING', 'ACTIVE', 'SKIPPED', 'CANCELLED', 'COMPLETED', 'FAILED',
+                                               'EXPIRED', 'VALIDATION_FAILED')),
+    job_id      text,
+    error       text NOT NULL DEFAULT '',
+    open_desc   int NOT NULL DEFAULT 0,             -- spawned descendants not yet terminal
+    updated_at  timestamptz NOT NULL,
+    PRIMARY KEY (workflow_id, name),
+    UNIQUE (workflow_id, seq)
+);
+CREATE INDEX workflow_steps_state_idx ON workflow_steps (workflow_id, state);
+
+CREATE TABLE workflow_step_deps (
+    workflow_id text NOT NULL,
+    step        text COLLATE "C" NOT NULL,
+    dep         text COLLATE "C" NOT NULL,
+    PRIMARY KEY (workflow_id, step, dep),
+    FOREIGN KEY (workflow_id, step) REFERENCES workflow_steps (workflow_id, name) ON DELETE CASCADE
+);
+CREATE INDEX workflow_step_deps_dep_idx ON workflow_step_deps (workflow_id, dep);
+
+ALTER TABLE jobs
+    ADD COLUMN workflow_id    text REFERENCES workflows (workflow_id),
+    ADD COLUMN step           text,
+    ADD COLUMN checkpoint     jsonb,                           -- latest checkpoint (ArtifactRef)
+    ADD COLUMN strict         boolean NOT NULL DEFAULT false,  -- needs ranked placement (§7)
+    ADD COLUMN reserved_node  text,
+    ADD COLUMN reserved_until timestamptz,
+    ADD COLUMN reserve_tried  text[] NOT NULL DEFAULT '{}',
+    ADD COLUMN reserve_done   boolean NOT NULL DEFAULT false;  -- released to every node
+CREATE INDEX jobs_workflow_idx ON jobs (workflow_id) WHERE workflow_id IS NOT NULL;
+CREATE INDEX jobs_placement_idx ON jobs (created_at, seq) WHERE state = 'QUEUED' AND strict AND NOT reserve_done;
 )sql",
 };
 

@@ -133,12 +133,15 @@ BOOST_AUTO_TEST_CASE(migrates_v2_database_to_v3) {
     db.job(spec("r"), T0 - 400);
     // Roll back to v2 (with a non-QUEUED job) and migrate again.
     psql(db.conninfo,
-         "DROP TABLE artifact_pins; ALTER TABLE jobs DROP COLUMN queued_at;"
+         "ALTER TABLE jobs DROP COLUMN workflow_id, DROP COLUMN step, DROP COLUMN checkpoint, DROP COLUMN strict,"
+         " DROP COLUMN reserved_node, DROP COLUMN reserved_until, DROP COLUMN reserve_tried, DROP COLUMN reserve_done;"
+         " DROP TABLE workflow_step_deps, workflow_steps, workflows;"
+         " DROP TABLE artifact_pins; ALTER TABLE jobs DROP COLUMN queued_at;"
          " UPDATE jobs SET state = 'CANCELLED' WHERE job_id = 'r';"
-         " DELETE FROM schema_migrations WHERE version = 3");
+         " DELETE FROM schema_migrations WHERE version >= 3");
     BOOST_TEST(schema_version(db.conninfo) == 2);
     auto repo = open_pg_repository(db.conninfo);
-    BOOST_TEST(schema_version(db.conninfo) == 3);
+    BOOST_TEST(schema_version(db.conninfo) == 4);
     BOOST_TEST(db.queued_at("q") == std::to_string(T0 - 500));  // backfilled from created_at
     BOOST_TEST(db.queued_at("r") == "");                        // not queued
     BOOST_TEST(psql(db.conninfo, "SELECT count(*) FROM artifact_pins") == "0");

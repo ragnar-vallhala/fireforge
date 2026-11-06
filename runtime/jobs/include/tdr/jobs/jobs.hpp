@@ -94,7 +94,8 @@ public:
     void recover();
 
     // Validates (non-empty argv; request fits node capacity at all; input
-    // artifacts exist locally), assigns job_id if empty, persists
+    // artifacts and spec.resume_checkpoint exist locally; input_names no longer
+    // than input_artifacts), assigns job_id if empty, persists
     // CREATED -> QUEUED, then tries to start work. Returns the job id.
     std::expected<std::string, std::string> submit(v1::JobSpec spec);
 
@@ -120,7 +121,21 @@ public:
     std::expected<v1::WorkerTask, std::string> on_worker_hello(const v1::WorkerHello& hello);
     void on_worker_progress(const v1::WorkerProgress& progress);
     // Stores the result; the outcome is applied when the process exits.
+    // Phase 6: result.spawn is kept with the job (JobStatus.spawn) when it
+    // completes; output names (JobStatus.outputs) come from OutputFile.name, else
+    // the relative path; a duplicate name fails the job (non-retryable).
     std::expected<void, std::string> on_worker_result(const v1::WorkerResult& result);
+
+    // Phase 6 (phase6.md §6): the attempt must be RUNNING and its job have
+    // policy.checkpoint; path must be a regular file inside the attempt's
+    // checkpoint dir. Ingests it (producer_job = job id), journals it as the
+    // job's latest checkpoint (JobStatus.checkpoint) and fires the checkpoint
+    // listener. A later attempt of the same job (local retry) resumes from it:
+    // it is materialized into the new attempt's checkpoint dir as
+    // resume/<name> and passed as WorkerTask.resume_checkpoint; so is
+    // spec.resume_checkpoint for the first attempt.
+    std::expected<v1::NamedArtifact, std::string> on_worker_checkpoint(const v1::WorkerCheckpoint& checkpoint);
+    void set_checkpoint_listener(std::function<void(const std::string& job_id, const v1::NamedArtifact&)> fn);
 
     // The daemon registers this to push WORKER_CANCEL to a connected worker.
     void set_cancel_notifier(std::function<void(const std::string& attempt_id, const std::string& reason)> fn);

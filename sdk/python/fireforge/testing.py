@@ -2,7 +2,8 @@
 
 ``FakeDaemon`` binds a Unix socket in a temp dir, plays the daemon side of
 the worker protocol (HELLO -> TASK, PROGRESS*, RESULT -> ACK) in a thread,
-records what the worker sent, and can push WORKER_CANCEL::
+records what the worker sent (incl. WORKER_CHECKPOINT, replied ACK or a
+configurable ERROR), and can push WORKER_CANCEL::
 
     with FakeDaemon(operation="demo.add", params={"a": 1}) as d:
         d.add_input(b"data_x\\n_cell_length_a 5.0\\n")
@@ -41,6 +42,17 @@ class FakeDaemon:
         ERROR(UNAUTHORIZED). ``env()`` hands out ``worker_token`` (default: token).
       cancel_after_progress: send WORKER_CANCEL after this many PROGRESS frames.
       send_ack: reply ACK to RESULT (False = never answer).
+      workflow_id, step, checkpoint_enabled, resume_checkpoint: Phase 6 task
+        fields. ``resume_checkpoint`` may be bytes/str content (materialized
+        as ``checkpoints/resume/<resume_name>`` like tdrd does) or a path.
+      checkpoint_error: reply ERROR(checkpoint_error_code, this message) to
+        WORKER_CHECKPOINT instead of ACK. Without it, checkpoints are refused
+        with BAD_REQUEST "checkpointing not enabled for this job" when
+        ``checkpoint_enabled`` is False (like tdrd), else ACKed.
+
+    Recorded: ``checkpoints`` (WorkerCheckpoint messages, in order),
+    ``checkpoint_files`` (file content at receive time, same order),
+    ``spawned`` (StepSpecs from the result).
     """
 
     def __init__(self, operation: str = "test.op", params: dict | str | None = None, *,
@@ -48,7 +60,12 @@ class FakeDaemon:
                  token: str = "s3cret", worker_token: str | None = None,
                  campaign_id: str = "", material_id: str = "",
                  cancel_after_progress: int | None = None, cancel_reason: str = "test cancel",
-                 send_ack: bool = True, root: str | os.PathLike | None = None) -> None:
+                 send_ack: bool = True, root: str | os.PathLike | None = None,
+                 workflow_id: str = "", step: str = "", checkpoint_enabled: bool = False,
+                 resume_checkpoint: bytes | str | os.PathLike | None = None,
+                 resume_name: str = "checkpoint.json",
+                 checkpoint_error: str | None = None,
+                 checkpoint_error_code: int = local_pb2.BAD_REQUEST) -> None:
         self.operation = operation
         if params is None:
             self.parameters_json = ""
@@ -75,12 +92,26 @@ class FakeDaemon:
         for d in (self.input_dir, self.output_dir, self.checkpoint_dir):
             d.mkdir(parents=True, exist_ok=True)
         self.inputs: list[local_pb2.InputFile] = []
+        self.workflow_id, self.step = workflow_id, step
+        self.checkpoint_enabled = checkpoint_enabled
+        self.checkpoint_error, self.checkpoint_error_code = checkpoint_error, checkpoint_error_code
+        self.resume_checkpoint = ""
+        if isinstance(resume_checkpoint, os.PathLike):
+            self.resume_checkpoint = str(resume_checkpoint)
+        elif resume_checkpoint is not None:
+            rp = self.checkpoint_dir / "resume" / resume_name
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            rp.write_bytes(resume_checkpoint.encode() if isinstance(resume_checkpoint, str)
+                           else bytes(resume_checkpoint))
+            self.resume_checkpoint = str(rp)
 
         # Recorded traffic.
         self.received: list[tuple[int, Any]] = []   # (message_type, decoded message)
         self.hello: local_pb2.WorkerHello | None = None
         self.progress: list[local_pb2.WorkerProgress] = []
         self.result: local_pb2.WorkerResult | None = None
+        self.checkpoints: list[local_pb2.WorkerCheckpoint] = []
+        self.checkpoint_files: list[bytes | None] = []
         self.cancel_sent = False
         self.errors: list[str] = []
 
@@ -95,13 +126,15 @@ class FakeDaemon:
 
     # -- setup --------------------------------------------------------------
 
-    def add_input(self, data: bytes | str, artifact_id: str | None = None) -> local_pb2.InputFile:
-        """Materialize an input like tdrd does: inputs/<sha256 hex>."""
+    def add_input(self, data: bytes | str, artifact_id: str | None = None,
+                  name: str = "") -> local_pb2.InputFile:
+        """Materialize an input like tdrd does: inputs/<sha256 hex> (``name``: input name)."""
         raw = data.encode() if isinstance(data, str) else bytes(data)
         digest = hashlib.sha256(raw).hexdigest()
         path = self.input_dir / digest
         path.write_bytes(raw)
-        f = local_pb2.InputFile(artifact_id=artifact_id or f"artifact://sha256/{digest}", path=str(path))
+        f = local_pb2.InputFile(artifact_id=artifact_id or f"artifact://sha256/{digest}", path=str(path),
+                                name=name)
         self.inputs.append(f)
         return f
 
@@ -128,7 +161,18 @@ class FakeDaemon:
             job_id=self.job_id, attempt_id=self.attempt_id, attempt_number=self.attempt_number,
             operation=self.operation, parameters_json=self.parameters_json, inputs=self.inputs,
             output_dir=str(self.output_dir), checkpoint_dir=str(self.checkpoint_dir),
-            campaign_id=self.campaign_id, material_id=self.material_id)
+            campaign_id=self.campaign_id, material_id=self.material_id,
+            resume_checkpoint=self.resume_checkpoint, workflow_id=self.workflow_id, step=self.step,
+            checkpoint_enabled=self.checkpoint_enabled)
+
+    @property
+    def spawned(self) -> list:
+        """StepSpecs the worker spawned (``WorkerResult.spawn``; [] without a result)."""
+        return list(self.result.spawn) if self.result is not None else []
+
+    def checkpoint_path(self, msg: local_pb2.WorkerCheckpoint) -> Path:
+        p = Path(msg.path)
+        return p if p.is_absolute() else self.checkpoint_dir / p
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -243,6 +287,27 @@ class FakeDaemon:
                 if (self.cancel_after_progress is not None and not self.cancel_sent
                         and len(self.progress) >= self.cancel_after_progress):
                     self.send_cancel(self.cancel_reason)
+            elif header.message_type == _pb.WORKER_CHECKPOINT:
+                msg = local_pb2.WorkerCheckpoint.FromString(payload)
+                self._record(header.message_type, msg)
+                try:
+                    content = self.checkpoint_path(msg).read_bytes()
+                except OSError:
+                    content = None
+                with self._lock:
+                    self.checkpoints.append(msg)
+                    self.checkpoint_files.append(content)
+                if self.checkpoint_error is not None:
+                    err = local_pb2.Error(code=self.checkpoint_error_code, message=self.checkpoint_error)
+                elif not self.checkpoint_enabled:
+                    err = local_pb2.Error(code=local_pb2.BAD_REQUEST,
+                                          message="checkpointing not enabled for this job")
+                else:
+                    err = None
+                if err is not None:
+                    writer.send(_pb.ERROR, err, header.message_id)
+                else:
+                    writer.send(_pb.WORKER_ACK, local_pb2.Ack(), header.message_id)
             elif header.message_type == _pb.WORKER_RESULT:
                 msg = local_pb2.WorkerResult.FromString(payload)
                 self._record(header.message_type, msg)

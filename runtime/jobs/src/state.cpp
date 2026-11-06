@@ -88,6 +88,9 @@ v1::JobStatus to_status(const journal::JobRecord& rec) {
     st.set_updated_unix_ms(rec.updated_unix_ms);
     st.set_progress_fraction(rec.progress_fraction);
     st.set_progress_message(rec.progress_message);
+    for (const auto& o : rec.outputs) *st.add_outputs() = o;
+    if (!rec.checkpoint.artifact_id().empty()) *st.mutable_checkpoint() = rec.checkpoint;
+    for (const auto& s : rec.spawn) *st.add_spawn() = s;
     return st;
 }
 

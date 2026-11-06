@@ -1,7 +1,8 @@
 // tdrcp — FireForge control plane (docs/design/phase2.md §8).
 //
 // Wiring only: config -> Postgres repository (runs migrations) -> ControlApi
-// -> mTLS HttpsServer, plus a health-sweep timer. One io_context thread.
+// -> mTLS HttpsServer, plus health/lease, workflow and placement timers. One
+// io_context thread. ControlApi applies [workflows] limits to the repository.
 
 #include <charconv>
 #include <chrono>
@@ -41,6 +42,12 @@ struct CpConfig {
     std::string conninfo = "postgresql:///fireforge";
     tdr::cpapi::ApiOptions api;
     std::string log_level = "info";
+    // Phase 6 timers (seconds) and placement settings in config units.
+    std::uint32_t workflow_sweep_seconds = 5;
+    std::uint32_t placement_interval_seconds = 1;
+    std::uint32_t reserve_window_seconds = 5;
+    std::uint32_t max_reserve_seconds = 30;
+    std::uint64_t strict_input_mb = 64;
 };
 
 template <class T>
@@ -49,6 +56,14 @@ std::expected<T, std::string> parse_num(const std::string& v) {
     auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), out);
     if (ec != std::errc{} || p != v.data() + v.size()) return std::unexpected("not a number: '" + v + "'");
     return out;
+}
+
+// Config units (seconds, MiB) -> PlacementOptions.
+void apply_placement(CpConfig& c) {
+    auto& p = c.api.placement;
+    p.reserve_window_ms = std::int64_t{c.reserve_window_seconds} * 1000;
+    p.max_reserve_ms = std::int64_t{c.max_reserve_seconds} * 1000;
+    p.strict_input_bytes = c.strict_input_mb << 20;
 }
 
 std::expected<CpConfig, std::string> load(const fs::path& path) {
@@ -79,6 +94,19 @@ std::expected<CpConfig, std::string> load(const fs::path& path) {
                     {"offline_after", num(c.api.offline_after_seconds)}}},
         {"jobs", {{"lease_ttl", num(c.api.lease_ttl_seconds)}, {"max_attempts_default", num(c.api.max_attempts_default)},
                   {"locality_wait", num(c.api.locality_wait_seconds)}}},
+        {"workflows", {{"sweep_interval", num(c.workflow_sweep_seconds)},
+                       {"max_steps", num(c.api.workflow_limits.max_steps)},
+                       {"max_spawn", num(c.api.workflow_limits.max_spawn)},
+                       {"max_depth", num(c.api.workflow_limits.max_depth)}}},
+        {"placement", {{"interval", num(c.placement_interval_seconds)},
+                       {"reserve_window", num(c.reserve_window_seconds)},
+                       {"max_reserve", num(c.max_reserve_seconds)},
+                       {"strict_input_mb", num(c.strict_input_mb)},
+                       {"w_compute", num(c.api.placement.w_compute)},
+                       {"w_transfer", num(c.api.placement.w_transfer)},
+                       {"w_queue", num(c.api.placement.w_queue)},
+                       {"w_memory", num(c.api.placement.w_memory)},
+                       {"w_contention", num(c.api.placement.w_contention)}}},
         {"log", {{"level", str(c.log_level)}}},
     };
     for (const auto& [sec, keys] : ini->sections) {
@@ -91,6 +119,7 @@ std::expected<CpConfig, std::string> load(const fs::path& path) {
             if (auto r = f->second(v); !r) return std::unexpected("[" + sec + "] " + k + ": " + r.error());
         }
     }
+    apply_placement(c);
     return c;
 }
 
@@ -104,6 +133,16 @@ std::expected<void, std::string> validate(const CpConfig& c) {
     if (a.lease_ttl_seconds <= a.heartbeat_interval_seconds)
         return std::unexpected("jobs.lease_ttl must exceed health.heartbeat_interval");
     if (a.max_attempts_default == 0) return std::unexpected("jobs.max_attempts_default must be >= 1");
+    if (c.workflow_sweep_seconds == 0) return std::unexpected("workflows.sweep_interval must be > 0");
+    if (a.workflow_limits.max_steps == 0 || a.workflow_limits.max_spawn == 0)
+        return std::unexpected("workflows.max_steps and max_spawn must be >= 1");
+    // Strict jobs become leasable only through the placement sweep (phase6.md §7).
+    if (c.placement_interval_seconds == 0) return std::unexpected("placement.interval must be > 0");
+    if (c.reserve_window_seconds == 0) return std::unexpected("placement.reserve_window must be > 0");
+    if (c.strict_input_mb > (std::uint64_t{1} << 40)) return std::unexpected("placement.strict_input_mb is too large");
+    const auto& p = a.placement;
+    for (double w : {p.w_compute, p.w_transfer, p.w_queue, p.w_memory, p.w_contention})
+        if (!(w >= 0)) return std::unexpected("placement weights must be >= 0");
     return {};
 }
 
@@ -153,11 +192,42 @@ int run(const CpConfig& cfg, const std::string& port_file) {
     };
     arm();
 
+    // Phase 6: workflow safety-net sweep and ranked placement. Errors only log.
+    asio::steady_timer workflow_timer(io), placement_timer(io);
+    std::function<void()> arm_workflows = [&] {
+        workflow_timer.expires_after(std::chrono::seconds(cfg.workflow_sweep_seconds));
+        workflow_timer.async_wait([&](boost::system::error_code ec) {
+            if (ec) return;
+            try {
+                api.sweep_workflows();
+            } catch (const std::exception& e) {
+                tdr::log_warn("workflow sweep failed: {}", e.what());
+            }
+            arm_workflows();
+        });
+    };
+    std::function<void()> arm_placement = [&] {
+        placement_timer.expires_after(std::chrono::seconds(cfg.placement_interval_seconds));
+        placement_timer.async_wait([&](boost::system::error_code ec) {
+            if (ec) return;
+            try {
+                api.place_jobs();
+            } catch (const std::exception& e) {
+                tdr::log_warn("placement sweep failed: {}", e.what());
+            }
+            arm_placement();
+        });
+    };
+    arm_workflows();
+    arm_placement();
+
     asio::signal_set signals(io, SIGINT, SIGTERM);
     signals.async_wait([&](boost::system::error_code ec, int sig) {
         if (ec) return;
         tdr::log_info("signal {}: shutting down", sig);
         sweep_timer.cancel();
+        workflow_timer.cancel();
+        placement_timer.cancel();
         server.stop();
         io.stop();
     });

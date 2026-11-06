@@ -31,3 +31,10 @@ message ArtifactChunk {
 message ArtifactChunkAck {
   uint64 next_offset = 1;
 }
+
+// Phase 6 (phase6.md §6): on a PEER link, "please fetch this artifact from me"
+// (ARTIFACT_REPLICATE). Used to keep a second copy of each checkpoint so a
+// retry elsewhere can resume after the checkpointing node dies. No reply.
+message ArtifactReplicate {
+  string artifact_id = 1;
+}

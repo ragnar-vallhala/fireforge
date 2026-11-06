@@ -130,17 +130,26 @@ public:
         return out;
     }
     bool commit_outputs(const std::string& job_id, const std::string& attempt_id,
-                        const std::vector<std::string>& ids) override {
+                        const std::vector<v1::NamedArtifact>& outs, const std::vector<v1::StepSpec>& spawn) override {
         auto it = jobs.find(job_id);
         if (it == jobs.end() || it->second.state != v1::COMMITTING || it->second.current_attempt_id != attempt_id) {
             return false;
         }
-        it->second.output_artifacts = ids;
+        it->second.outputs = outs;
+        it->second.output_artifacts.clear();
+        for (const auto& o : outs) {
+            if (std::ranges::find(it->second.output_artifacts, o.artifact_id()) == it->second.output_artifacts.end())
+                it->second.output_artifacts.push_back(o.artifact_id());
+        }
+        it->second.spawn = spawn;
         it->second.state = v1::COMPLETED;
         it->second.updated_unix_ms = unix_ms();
         attempts.at(attempt_id).state = AttemptState::kSucceeded;
         transitions.emplace_back(job_id, v1::COMMITTING, v1::COMPLETED);
         return true;
+    }
+    void set_checkpoint(const std::string& job_id, const v1::NamedArtifact& c) override {
+        if (auto it = jobs.find(job_id); it != jobs.end()) it->second.checkpoint = c;
     }
     void record_artifact(const journal::ArtifactRow& row) override { artifacts[row.id] = row; }
     std::optional<journal::ArtifactRow> get_artifact(const std::string& id) const override {

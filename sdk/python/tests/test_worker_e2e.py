@@ -119,7 +119,7 @@ def test_none_return_declares_output_dir_files():
     with FakeDaemon("demo.none") as d:
         proc = run(d)
         assert proc.returncode == 0, proc.stderr
-        assert [(o.path, o.name) for o in d.result.outputs] == [("plain.dat", "plain")]
+        assert [(o.path, o.name) for o in d.result.outputs] == [("plain.dat", "plain.dat")]
 
 
 def test_bad_parameters_json():

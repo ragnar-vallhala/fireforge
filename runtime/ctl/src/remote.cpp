@@ -4,6 +4,10 @@
 #include "remote.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <thread>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -187,6 +191,11 @@ constexpr const char* kCpUsage = R"(usage: tdrctl cp [--url URL] [--ca F] [--cer
   job-submit [--cpus N] [--memory-mb N] [--timeout S] [--attempts N] [--operation OP]
              [--params JSON] [--input ARTIFACT]... [--env KEY=VALUE]... [--campaign ID]
              [--material ID] [--capability C]... -- argv...
+  workflow-submit FILE                             CreateWorkflowRequest JSON ("-" = stdin) (Phase 6)
+  workflows [--state S] [--campaign ID] [--limit N]
+  workflow ID                                      steps: state, job, node, dependencies
+  workflow-cancel ID [--reason TEXT]
+  workflow-wait ID [--timeout S]                   exit 0 iff the workflow SUCCEEDED
   artifact ID                                      which nodes hold an artifact (+ pinned)
   artifact-pin ID | artifact-unpin ID              pinned artifacts are never evicted (Phase 5)
 
@@ -315,6 +324,31 @@ void print_jobs(const cv1::JobList& l) {
                                  short_spec(j.spec()));
 }
 
+void print_workflow(const cv1::Workflow& w) {
+    std::cout << "workflow:   " << w.workflow_id() << " (" << w.name() << ")\n"
+              << "state:      " << w.state() << "\n"
+              << "submitted:  " << fmt_time(w.created_unix_ms()) << " by " << w.submitted_by() << "\n";
+    if (!w.campaign_id().empty()) std::cout << "campaign:   " << w.campaign_id() << "\n";
+    if (w.finished_unix_ms() > 0) std::cout << "finished:   " << fmt_time(w.finished_unix_ms()) << "\n";
+    if (!w.error().empty()) std::cout << "error:      " << w.error() << "\n";
+    std::map<std::string, std::uint32_t> counts(w.step_counts().begin(), w.step_counts().end());
+    std::cout << "steps:     ";
+    for (const auto& [st, n] : counts) std::cout << " " << st << "=" << n;
+    std::cout << "\n";
+    if (w.steps_size() == 0) return;
+    std::cout << std::format("\n{:<32} {:<18} {:<22} {:<26} {}\n", "STEP", "STATE", "JOB", "NODE", "DEPENDS ON / ERROR");
+    for (const auto& st : w.steps()) {
+        std::string deps;
+        for (const auto& d : st.spec().depends_on()) deps += (deps.empty() ? "" : ",") + d;
+        for (const auto& in : st.spec().inputs())
+            if (deps.find(in.step()) == std::string::npos) deps += (deps.empty() ? "" : ",") + in.step();
+        if (!st.parent_step().empty()) deps = "spawned by " + st.parent_step() + (deps.empty() ? "" : "; " + deps);
+        if (!st.error().empty()) deps += (deps.empty() ? "" : " — ") + st.error();
+        std::cout << std::format("{:<32} {:<18} {:<22} {:<26} {}\n", st.name(), st.state(),
+                                 st.job_id().empty() ? "-" : st.job_id(), st.node_id().empty() ? "-" : st.node_id(), deps);
+    }
+}
+
 void print_job(const cv1::Job& j) {
     std::cout << "job:        " << j.job_id() << "\n"
               << "state:      " << ::fireforge::tdr::v1::JobState_Name(j.state())
@@ -328,8 +362,16 @@ void print_job(const cv1::Job& j) {
     if (!j.node_id().empty()) std::cout << "node:       " << j.node_id() << "\n";
     if (j.progress_fraction() > 0 || !j.progress_message().empty())
         std::cout << "progress:   " << static_cast<int>(j.progress_fraction() * 100) << "% " << j.progress_message() << "\n";
+    if (!j.workflow_id().empty()) std::cout << "workflow:   " << j.workflow_id() << " step " << j.step() << "\n";
+    if (!j.reserved_node().empty())
+        std::cout << "reserved:   for " << j.reserved_node() << " until " << fmt_time(j.reserved_until_unix_ms()) << "\n";
     if (!j.last_error().empty()) std::cout << "error:      " << j.last_error() << "\n";
-    for (const auto& o : j.outputs()) std::cout << "output:     " << o.artifact_id() << " (" << o.size() << " bytes)\n";
+    if (!j.checkpoint().artifact_id().empty())
+        std::cout << "checkpoint: " << j.checkpoint().artifact_id() << " (" << j.checkpoint().name() << ", "
+                  << j.checkpoint().size() << " bytes)\n";
+    for (const auto& o : j.outputs())
+        std::cout << "output:     " << o.artifact_id() << " (" << (o.name().empty() ? "" : o.name() + ", ") << o.size()
+                  << " bytes)\n";
     for (const auto& at : j.attempts())
         std::cout << std::format("attempt {}:  {} on {} {}{}\n", at.number(), at.state(), at.node_id(),
                                  fmt_time(at.leased_unix_ms()), at.error().empty() ? "" : " — " + at.error());
@@ -494,6 +536,70 @@ int cp(const std::vector<std::string>& all_args) {
         if (json) std::cout << to_json(j) << "\n";
         else std::cout << j.job_id() << "\n";
         return 0;
+    }
+    if (cmd == "workflow-submit") {
+        auto file = need_arg("FILE");
+        std::stringstream body;
+        if (file == "-") body << std::cin.rdbuf();
+        else {
+            std::ifstream f(file);
+            if (!f) throw std::runtime_error("cannot read " + file);
+            body << f.rdbuf();
+        }
+        cv1::CreateWorkflowRequest req;
+        google::protobuf::util::JsonParseOptions po;
+        if (auto st = google::protobuf::util::JsonStringToMessage(body.str(), &req, po); !st.ok())
+            throw UsageError(file + ": not a CreateWorkflowRequest: " + std::string(st.message()));
+        auto w = c.get<cv1::Workflow>("POST", "/api/v1/workflows", to_json(req, false));
+        if (json) std::cout << to_json(w) << "\n";
+        else std::cout << w.workflow_id() << "\n";
+        return 0;
+    }
+    if (cmd == "workflows") {
+        std::string t = "/api/v1/workflows";
+        std::string sep = "?";
+        if (auto s = a.get("--state")) { t += sep + "state=" + *s; sep = "&"; }
+        if (auto s = a.get("--campaign")) { t += sep + "campaign=" + *s; sep = "&"; }
+        if (auto l = a.get("--limit")) t += sep + "limit=" + std::to_string(to_u64("--limit", *l));
+        auto l = c.get<cv1::WorkflowList>("GET", t);
+        return out(l, [&] {
+            std::cout << std::format("{:<22} {:<24} {:<10} {:<8} {}\n", "WORKFLOW", "NAME", "STATE", "STEPS", "UPDATED");
+            for (const auto& w : l.workflows()) {
+                std::uint32_t n = 0;
+                for (const auto& [_, k] : w.step_counts()) n += k;
+                std::cout << std::format("{:<22} {:<24} {:<10} {:<8} {}\n", w.workflow_id(), w.name(), w.state(), n,
+                                         fmt_time(w.updated_unix_ms()));
+            }
+        });
+    }
+    if (cmd == "workflow") {
+        auto w = c.get<cv1::Workflow>("GET", "/api/v1/workflows/" + need_arg("ID"));
+        return out(w, [&] { print_workflow(w); });
+    }
+    if (cmd == "workflow-cancel") {
+        cv1::CancelRequest req;
+        req.set_reason(a.get("--reason").value_or(""));
+        auto w = c.get<cv1::Workflow>("POST", "/api/v1/workflows/" + need_arg("ID") + "/cancel", to_json(req, false));
+        return out(w, [&] { print_workflow(w); });
+    }
+    if (cmd == "workflow-wait") {
+        auto id = need_arg("ID");
+        std::uint64_t timeout = 0;
+        if (auto t = a.get("--timeout")) timeout = to_u64("--timeout", *t);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+        for (;;) {
+            auto w = c.get<cv1::Workflow>("GET", "/api/v1/workflows/" + id);
+            if (w.state() != "RUNNING") {
+                if (json) std::cout << to_json(w) << "\n";
+                else print_workflow(w);
+                return w.state() == "SUCCEEDED" ? 0 : 1;
+            }
+            if (timeout && std::chrono::steady_clock::now() >= deadline) {
+                std::cerr << "tdrctl: timed out waiting; workflow " << id << " still RUNNING\n";
+                return 3;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
     }
     if (cmd == "artifact" || cmd == "artifact-pin" || cmd == "artifact-unpin") {
         auto id = need_arg("ID");

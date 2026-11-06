@@ -37,6 +37,7 @@ message WorkerHello {
 message InputFile {
   string artifact_id = 1;
   string path = 2;   // absolute path inside FIREFORGE_INPUT_DIR
+  string name = 3;   // Phase 6: JobSpec.input_names entry ("" = unnamed)
 }
 
 message WorkerTask {
@@ -50,6 +51,11 @@ message WorkerTask {
   string checkpoint_dir = 8;
   string campaign_id = 9;
   string material_id = 10;
+  // ---- Phase 6 ----
+  string resume_checkpoint = 11;   // absolute path of the checkpoint to resume from ("" = none)
+  string workflow_id = 12;
+  string step = 13;
+  bool checkpoint_enabled = 14;    // ExecutionPolicy.checkpoint
 }
 
 message WorkerProgress {
@@ -70,6 +76,15 @@ message WorkerResult {
   string error = 3;
   bool retryable = 4;     // failure may succeed on another attempt
   repeated OutputFile outputs = 5;
+  repeated StepSpec spawn = 6;     // Phase 6: steps to add to the workflow (success only)
+}
+
+// worker -> daemon (WORKER_CHECKPOINT), reply Ack or ERROR. Phase 6.
+message WorkerCheckpoint {
+  string attempt_id = 1;
+  string path = 2;        // file inside checkpoint_dir (relative or absolute)
+  string media_type = 3;
+  string name = 4;        // logical name ("" = "checkpoint")
 }
 
 message WorkerCancel {

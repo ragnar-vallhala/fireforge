@@ -20,12 +20,19 @@
 // unavailable"). Leases not yet submitted hold their slot/cpu/memory in the
 // pull loop and their inputs are protected_inputs().
 //
+// Phase 6 (phase6.md §5, §6): COMPLETED updates carry named outputs
+// (ArtifactRef.name from JobStatus.outputs) and JobStatus.spawn. A checkpoint
+// of a leased job queues a fenced RUNNING update with `checkpoint`; an unsent
+// one for the same lease is replaced instead (coalesced). A lease's
+// spec.resume_checkpoint is fetched like an input and protected while waiting.
+//
 // State file (RemoteOptions::state_file, replaced atomically: tmp + fsync +
-// rename), version 2 (version 1 files, which lack "submitted"/"spec", are
-// read as all submitted):
+// rename), version 3 (version 1 files, which lack "submitted"/"spec", are
+// read as all submitted; version 2 files are read as is: v3 only adds the
+// Phase 6 JobUpdate fields, spawn/checkpoint/output names, inside "update"):
 //
 //   {
-//     "version": 2,
+//     "version": 3,
 //     "leases": [                      // mapping, keyed by local job id
 //       {"local_job_id": "job-x.a2", "job_id": "job-x", "attempt_id": "att-...",
 //        "fencing_token": 2, "attempt_number": 2,
@@ -153,7 +160,10 @@ bool bool_field(const json::object& o, std::string_view key, bool dflt = false) 
     return v->as_bool();
 }
 
-constexpr std::string_view kInputMissing = "input artifact not found locally";
+// JobManager::submit: "input artifact not found locally: ..." or
+// "resume checkpoint not found locally: ...".
+constexpr std::string_view kInputMissing = "not found locally";
+constexpr std::uint64_t kStateVersion = 3;
 
 }  // namespace
 
@@ -266,7 +276,7 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
                                       {"terminal", p.terminal},
                                       {"update", json::parse(u)}});
         }
-        json::object root{{"version", 2}, {"leases", std::move(ls)}, {"outbox", std::move(ob)}};
+        json::object root{{"version", kStateVersion}, {"leases", std::move(ls)}, {"outbox", std::move(ob)}};
         write_atomic(opts.state_file, json::serialize(root) + "\n");
     }
 
@@ -283,7 +293,7 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
             const json::value doc = json::parse(ss.str());
             const json::object& root = doc.as_object();
             const auto version = uint_field(root, "version");
-            if (version != 1 && version != 2) throw std::runtime_error("unsupported version");
+            if (version < 1 || version > kStateVersion) throw std::runtime_error("unsupported version");
             pbu::JsonParseOptions po;
             po.ignore_unknown_fields = true;
             for (const auto& v : root.at("leases").as_array()) {
@@ -501,8 +511,10 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
 
     // ---- inputs -> submit ---------------------------------------------------------
 
+    // Everything a lease needs locally before submit: inputs + resume checkpoint.
     static std::vector<std::string> inputs_of(const tv1::JobSpec& spec) {
         std::set<std::string> ids(spec.input_artifacts().begin(), spec.input_artifacts().end());
+        if (!spec.resume_checkpoint().empty()) ids.insert(spec.resume_checkpoint());
         return {ids.begin(), ids.end()};
     }
 
@@ -592,7 +604,7 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         std::vector<std::string> todo;
         for (const auto& [local, l] : leases) {
             if (!l.waiting() || l.fetching) continue;
-            if (!fetcher && !l.spec.input_artifacts().empty()) continue;  // wait for set_fetcher()
+            if (!fetcher && !inputs_of(l.spec).empty()) continue;  // wait for set_fetcher()
             todo.push_back(local);
         }
         bool freed = false;
@@ -619,15 +631,15 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         std::set<std::string> ids;
         for (const auto& [_, l] : leases) {
             if (!l.waiting()) continue;
-            ids.insert(l.spec.input_artifacts().begin(), l.spec.input_artifacts().end());
+            for (auto& id : inputs_of(l.spec)) ids.insert(std::move(id));
         }
         return {ids.begin(), ids.end()};
     }
 
     // ---- job state -> outbox ------------------------------------------------------
 
-    void queue_outcome(const std::string& local, Lease& l, tv1::JobState state, const std::string& error,
-                       bool retryable, std::vector<cv1::ArtifactRef> outputs) {
+    Pending& queue_outcome(const std::string& local, Lease& l, tv1::JobState state, const std::string& error,
+                           bool retryable, std::vector<cv1::ArtifactRef> outputs) {
         Pending p;
         p.job_id = l.job_id;
         p.local_id = local;
@@ -640,25 +652,49 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         for (auto& o : outputs) *p.update.add_outputs() = std::move(o);
         if (p.terminal) l.terminal = true;
         outbox.push_back(std::move(p));
+        return outbox.back();
     }
 
+    // Store metadata of a local artifact (hook), else what the caller knows.
+    cv1::ArtifactRef ref_of(const std::string& id, std::uint64_t size = 0, const std::string& media_type = {}) const {
+        std::optional<cv1::ArtifactRef> meta;
+        if (hooks.artifact_meta) meta = hooks.artifact_meta(id);
+        if (!meta) {
+            meta.emplace();
+            meta->set_artifact_id(id);
+            meta->set_size(size);
+            meta->set_media_type(media_type);
+        }
+        return std::move(*meta);
+    }
+
+    // Distinct output artifacts, unnamed (announcements).
     std::vector<cv1::ArtifactRef> outputs_of(const tv1::JobStatus& st) const {
         std::vector<cv1::ArtifactRef> out;
-        for (const auto& id : st.output_artifacts()) {
-            std::optional<cv1::ArtifactRef> meta;
-            if (hooks.artifact_meta) meta = hooks.artifact_meta(id);
-            if (!meta) {
-                meta.emplace();
-                meta->set_artifact_id(id);
-            }
-            out.push_back(std::move(*meta));
+        for (const auto& id : st.output_artifacts()) out.push_back(ref_of(id));
+        return out;
+    }
+
+    // Every named output in order (COMPLETED update); jobs journaled before
+    // Phase 6 have no names: then the distinct artifacts, unnamed.
+    std::vector<cv1::ArtifactRef> named_outputs_of(const tv1::JobStatus& st) const {
+        if (st.outputs().empty()) return outputs_of(st);
+        std::vector<cv1::ArtifactRef> out;
+        for (const auto& o : st.outputs()) {
+            auto r = ref_of(o.artifact_id(), o.size(), o.media_type());
+            r.set_name(o.name());
+            out.push_back(std::move(r));
         }
         return out;
     }
 
     void queue_terminal_from_status(const std::string& local, Lease& l, const tv1::JobStatus& st) {
         switch (st.state()) {
-            case tv1::COMPLETED: queue_outcome(local, l, tv1::COMPLETED, {}, false, outputs_of(st)); break;
+            case tv1::COMPLETED: {
+                Pending& p = queue_outcome(local, l, tv1::COMPLETED, {}, false, named_outputs_of(st));
+                for (const auto& sp : st.spawn()) *p.update.add_spawn() = sp;
+                break;
+            }
             case tv1::FAILED: queue_outcome(local, l, tv1::FAILED, st.last_error(), true, {}); break;
             case tv1::CANCELLED: queue_outcome(local, l, tv1::CANCELLED, st.last_error(), false, {}); break;
             case tv1::EXPIRED: queue_outcome(local, l, tv1::EXPIRED, st.last_error(), false, {}); break;
@@ -697,6 +733,37 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
             }
         }
         if (terminal && started) request_poll();  // capacity freed
+    }
+
+    // A leased job checkpointed: fenced RUNNING update (coalesced) + announce.
+    void on_checkpoint(const std::string& local, const tv1::NamedArtifact& ck) {
+        if (stopped || ck.artifact_id().empty()) return;
+        cv1::ArtifactRef ref = ref_of(ck.artifact_id(), ck.size(), ck.media_type());
+        to_announce.push_back(ref);  // announcements carry no name
+        send_announce();
+        auto it = leases.find(local);
+        if (!started || it == leases.end() || it->second.terminal || !it->second.submitted) return;
+        Lease& l = it->second;
+        ref.set_name(ck.name());
+        ref.set_size(ck.size());
+        if (!ck.media_type().empty()) ref.set_media_type(ck.media_type());
+        // Replace a queued, unsent checkpoint update of this lease (the one in
+        // flight, at the front, is left alone).
+        for (std::size_t i = outbox.size(); i-- > 0;) {
+            Pending& p = outbox[i];
+            if (i == 0 && update_in_flight) break;
+            if (p.local_id != local || p.update.state() != tv1::RUNNING || !p.update.has_checkpoint()) continue;
+            if (p.update.attempt_id() != l.attempt_id || p.update.fencing_token() != l.token) continue;
+            *p.update.mutable_checkpoint() = std::move(ref);
+            save();
+            log_debug("remote: lease {}: checkpoint {} replaces a queued one", l.job_id, ck.artifact_id());
+            return;
+        }
+        Pending& p = queue_outcome(local, l, tv1::RUNNING, {}, false, {});
+        *p.update.mutable_checkpoint() = std::move(ref);
+        save();
+        log_debug("remote: lease {}: checkpoint {} queued", l.job_id, ck.artifact_id());
+        send_next_update();
     }
 
     // ---- outbox sender ---------------------------------------------------------------
@@ -911,6 +978,9 @@ std::vector<cv1::LeaseRef> RemoteExecutor::active_leases() const { return impl_-
 void RemoteExecutor::set_fetcher(transfer::IArtifactFetcher* fetcher) { impl_->set_fetcher(fetcher); }
 void RemoteExecutor::announce(const std::vector<cv1::ArtifactRef>& refs) { impl_->announce(refs); }
 std::vector<std::string> RemoteExecutor::protected_inputs() const { return impl_->protected_inputs(); }
+void RemoteExecutor::on_checkpoint(const std::string& local_job_id, const tv1::NamedArtifact& checkpoint) {
+    impl_->on_checkpoint(local_job_id, checkpoint);
+}
 
 std::optional<std::string> RemoteExecutor::central_job_id(const std::string& local_job_id) const {
     auto it = impl_->leases.find(local_job_id);

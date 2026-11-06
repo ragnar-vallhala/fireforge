@@ -49,6 +49,28 @@ struct ExpiredLease {
     tv1::JobState new_state = tv1::JOB_STATE_UNSPECIFIED;  // QUEUED (retry) | FAILED | CANCELLED
 };
 
+// Phase 6 limits (tdrcp [workflows]).
+struct WorkflowLimits {
+    std::size_t max_steps = 10000;   // per workflow, static + spawned
+    std::size_t max_spawn = 1000;    // per expansion
+    std::size_t max_depth = 8;       // spawn nesting
+};
+
+// Phase 6 ranked placement (tdrcp [placement], phase6.md §7).
+struct PlacementOptions {
+    std::int64_t reserve_window_ms = 5000;
+    std::int64_t max_reserve_ms = 30000;        // since queued_at; then anyone may lease
+    std::uint64_t strict_input_bytes = 64ull << 20;
+    double w_compute = 0.1, w_transfer = 0.5, w_queue = 0.2, w_memory = 0.1, w_contention = 0.1;
+};
+
+struct Reservation {
+    std::string job_id;
+    std::string node_id;
+    double cost = 0;
+    std::int64_t until_ms = 0;
+};
+
 struct HealthChange {
     std::string node_id;
     cv1::NodeHealth from = cv1::NODE_HEALTH_UNSPECIFIED;
@@ -179,6 +201,39 @@ public:
                                                   std::int64_t now_ms) = 0;
 
     // ---- audit ---------------------------------------------------------------
+    // ---- workflows (docs/design/phase6.md §3-§5) ---------------------------------
+    // Validates (names, unique, deps exist, acyclic, step limit, campaign exists if
+    // set) and stores the workflow; creates jobs for steps with no dependencies
+    // (others WAITING). Error string = 400 message.
+    virtual std::expected<cv1::Workflow, std::string> create_workflow(const cv1::CreateWorkflowRequest& req,
+                                                                      const std::string& submitted_by,
+                                                                      std::int64_t now_ms) = 0;
+    // with_steps: fill Workflow.steps (creation order). Always fills step_counts.
+    virtual std::optional<cv1::Workflow> get_workflow(const std::string& workflow_id, bool with_steps) = 0;
+    // Newest first; state "" = all.
+    virtual std::vector<cv1::Workflow> list_workflows(const std::string& state, const std::string& campaign_id,
+                                                      std::size_t limit) = 0;
+    // RUNNING -> CANCELLED: WAITING steps CANCELLED, their jobs cancelled as
+    // cancel_job does. nullopt = not found; a finished workflow is returned unchanged.
+    virtual std::optional<cv1::Workflow> cancel_workflow(const std::string& workflow_id, const std::string& reason,
+                                                         std::int64_t now_ms) = 0;
+    // Safety net (§4): re-evaluate RUNNING workflows; returns how many steps changed.
+    virtual std::size_t sweep_workflows(std::int64_t now_ms) = 0;
+    // The engine also runs inside update_job / expire_leases / cancel_job whenever a
+    // workflow step's job becomes terminal (same transaction). update_job applies
+    // JobUpdate.spawn (validated against the limits from set_workflow_limits;
+    // invalid -> kInvalid, job FAILED non-retryable "invalid spawn: ...", outputs
+    // kept) and JobUpdate.checkpoint (RUNNING updates; fenced; stored as
+    // Job.checkpoint). lease_jobs sets Lease.spec.resume_checkpoint from it, skips
+    // jobs reserved for another node until reserved_until, and orders jobs
+    // reserved for the caller first.
+    virtual void set_workflow_limits(const WorkflowLimits& limits) = 0;
+
+    // ---- ranked placement (phase6.md §7) ----------------------------------------
+    // Reserve QUEUED strict jobs for their best-ranked untried eligible node;
+    // release reservations past max_reserve. Returns the reservations made.
+    virtual std::vector<Reservation> place_jobs(const PlacementOptions& options, std::int64_t now_ms) = 0;
+
     virtual void audit(const std::string& actor, const std::string& action, const std::string& target,
                        const std::string& details_json, std::int64_t now_ms) = 0;
     virtual std::vector<cv1::AuditEntry> list_audit(std::size_t limit) = 0;  // newest first

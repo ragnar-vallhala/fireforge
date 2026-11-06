@@ -275,8 +275,8 @@ def test_many_small_jobs_complete_exactly_once(cluster):
         jobs = {j["job_id"]: j for j in cp.jobs() if j["job_id"] in ids}
         return len(jobs) == len(ids) and all(j["state"] in TERMINAL for j in jobs.values()) and jobs
     jobs = wait_for(all_done, timeout=180, interval=1, what="200 jobs terminal")
-    assert all(j["state"] == "COMPLETED" for j in jobs.values())
-    assert all(j["attempts_used"] == 1 for j in jobs.values())
+    bad = [j for j in jobs.values() if j["state"] != "COMPLETED" or j["attempts_used"] != 1]
+    assert not bad, json.dumps(bad[:3], indent=1)
     # Each ran exactly once across the cluster.
     ran = []
     for n in nodes:

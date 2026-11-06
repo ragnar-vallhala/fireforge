@@ -312,6 +312,7 @@ public:
     cpdb::UpdateOutcome update_job(const std::string& id, const std::string& node_id, const cv1::JobUpdate& u,
                                    std::int64_t now) override {
         maybe_fail();
+        last_update = u;
         cpdb::UpdateOutcome out;
         auto it = jobs.find(id);
         if (it == jobs.end()) return out;
@@ -337,12 +338,21 @@ public:
                 cur->set_state("RUNNING");
                 j.set_progress_fraction(u.progress_fraction());
                 j.set_progress_message(u.progress_message());
+                if (u.has_checkpoint()) *j.mutable_checkpoint() = u.checkpoint();
                 break;
             case tv1::COMPLETED:
                 j.set_state(tv1::COMPLETED);
                 cur->set_state("SUCCEEDED");
                 *j.mutable_outputs() = u.outputs();
                 for (const auto& o : u.outputs()) locations[{o.artifact_id(), node_id}] = o;
+                if (!u.spawn().empty() && j.workflow_id().empty()) {  // mirrors the Postgres rule
+                    j.set_state(tv1::FAILED);
+                    j.set_last_error("invalid spawn: only workflow steps may spawn");
+                    out.result = cpdb::UpdateResult::kInvalid;
+                    out.message = j.last_error();
+                    out.job = j;
+                    return out;
+                }
                 break;
             case tv1::FAILED: {
                 cur->set_state("FAILED");
@@ -458,6 +468,103 @@ public:
         cv1::ArtifactInfo info;
         info.mutable_artifact()->set_artifact_id(id);
         return info;
+    }
+
+    // ---- workflows (minimal: storage only, no engine) ---------------------------------
+    std::map<std::string, cv1::Workflow> workflows;
+    std::vector<std::string> workflow_order;
+    cv1::CreateWorkflowRequest last_workflow_request;
+    cpdb::WorkflowLimits workflow_limits;
+    int limits_set = 0;
+    std::size_t sweep_result = 0;
+    int workflow_sweeps = 0;
+    std::vector<cpdb::Reservation> reservations;  // returned by place_jobs
+    cpdb::PlacementOptions last_placement;
+    int place_calls = 0;
+    cv1::JobUpdate last_update;
+
+    std::expected<cv1::Workflow, std::string> create_workflow(const cv1::CreateWorkflowRequest& req,
+                                                              const std::string& by, std::int64_t now) override {
+        maybe_fail();
+        last_workflow_request = req;
+        if (req.steps().empty()) return std::unexpected("workflow has no steps");
+        if (!req.campaign_id().empty() && !campaigns.contains(req.campaign_id()))
+            return std::unexpected("unknown campaign " + req.campaign_id());
+        cv1::Workflow w;
+        w.set_workflow_id(std::format("wf-{:016x}", ++counter_));
+        w.set_name(req.name());
+        w.set_campaign_id(req.campaign_id());
+        w.set_state("RUNNING");
+        w.set_submitted_by(by);
+        w.set_created_unix_ms(now);
+        w.set_updated_unix_ms(now);
+        for (const auto& s : req.steps()) {
+            auto* x = w.add_steps();
+            x->set_name(s.name());
+            x->set_state("WAITING");
+            *x->mutable_spec() = s;
+        }
+        (*w.mutable_step_counts())["WAITING"] = static_cast<std::uint32_t>(req.steps_size());
+        workflows[w.workflow_id()] = w;
+        workflow_order.push_back(w.workflow_id());
+        return w;
+    }
+
+    std::optional<cv1::Workflow> get_workflow(const std::string& id, bool with_steps) override {
+        maybe_fail();
+        auto it = workflows.find(id);
+        if (it == workflows.end()) return std::nullopt;
+        cv1::Workflow w = it->second;
+        if (!with_steps) w.clear_steps();
+        return w;
+    }
+
+    std::vector<cv1::Workflow> list_workflows(const std::string& state, const std::string& campaign,
+                                              std::size_t limit) override {
+        maybe_fail();
+        std::vector<cv1::Workflow> out;
+        for (auto it = workflow_order.rbegin(); it != workflow_order.rend() && out.size() < limit; ++it) {
+            auto w = workflows.at(*it);
+            if (!state.empty() && w.state() != state) continue;
+            if (!campaign.empty() && w.campaign_id() != campaign) continue;
+            w.clear_steps();
+            out.push_back(w);
+        }
+        return out;
+    }
+
+    std::optional<cv1::Workflow> cancel_workflow(const std::string& id, const std::string& reason,
+                                                 std::int64_t now) override {
+        maybe_fail();
+        auto it = workflows.find(id);
+        if (it == workflows.end()) return std::nullopt;
+        auto& w = it->second;
+        if (w.state() == "RUNNING") {
+            w.set_state("CANCELLED");
+            w.set_error(reason);
+            w.set_finished_unix_ms(now);
+            for (auto& s : *w.mutable_steps())
+                if (s.state() == "WAITING") s.set_state("CANCELLED");
+        }
+        return w;
+    }
+
+    std::size_t sweep_workflows(std::int64_t) override {
+        maybe_fail();
+        ++workflow_sweeps;
+        return sweep_result;
+    }
+
+    void set_workflow_limits(const cpdb::WorkflowLimits& l) override {
+        workflow_limits = l;
+        ++limits_set;
+    }
+
+    std::vector<cpdb::Reservation> place_jobs(const cpdb::PlacementOptions& o, std::int64_t) override {
+        maybe_fail();
+        last_placement = o;
+        ++place_calls;
+        return reservations;
     }
 
     std::map<std::string, std::string> pins;  // artifact_id -> pinned_by

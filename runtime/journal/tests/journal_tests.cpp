@@ -2,6 +2,8 @@
 
 #include <filesystem>
 
+#include <sqlite3.h>
+
 #include "tdr/common/common.hpp"
 #include "tdr/journal/journal.hpp"
 
@@ -202,17 +204,21 @@ BOOST_AUTO_TEST_CASE(commit_outputs_fencing) {
     j->begin_attempt(make_attempt("att-1", "job-1", 1));
     j->finish_attempt("att-1", AttemptState::kFailed, 1, 0, "");
     j->begin_attempt(make_attempt("att-2", "job-1", 2));
-    const std::vector<std::string> outs = {"artifact://sha256/" + std::string(64, 'd')};
+    const std::vector<std::string> ids_out = {"artifact://sha256/" + std::string(64, 'd')};
+    std::vector<v1::NamedArtifact> outs(1);
+    outs[0].set_artifact_id(ids_out[0]);
+    outs[0].set_name("out.txt");
+    const std::vector<v1::StepSpec> none;
 
     // Not COMMITTING yet: refused.
-    BOOST_TEST(!j->commit_outputs("job-1", "att-2", outs));
+    BOOST_TEST(!j->commit_outputs("job-1", "att-2", outs, none));
     BOOST_TEST(j->get_job("job-1")->state == v1::QUEUED);
 
     BOOST_TEST(j->transition("job-1", v1::QUEUED, v1::COMMITTING));
     const auto before = j->get_job("job-1");
 
     // Stale attempt: refused, nothing changed.
-    BOOST_TEST(!j->commit_outputs("job-1", "att-1", outs));
+    BOOST_TEST(!j->commit_outputs("job-1", "att-1", outs, none));
     auto r = j->get_job("job-1");
     BOOST_TEST(r->state == v1::COMMITTING);
     BOOST_TEST(r->output_artifacts.empty());
@@ -220,21 +226,21 @@ BOOST_AUTO_TEST_CASE(commit_outputs_fencing) {
     BOOST_TEST((j->get_attempt("att-1")->state == AttemptState::kFailed));
     BOOST_TEST((j->get_attempt("att-2")->state == AttemptState::kStarting));
 
-    BOOST_TEST(!j->commit_outputs("job-1", "", outs));
-    BOOST_TEST(!j->commit_outputs("job-missing", "att-2", outs));
+    BOOST_TEST(!j->commit_outputs("job-1", "", outs, none));
+    BOOST_TEST(!j->commit_outputs("job-missing", "att-2", outs, none));
 
     // Current attempt: accepted.
-    BOOST_TEST(j->commit_outputs("job-1", "att-2", outs));
+    BOOST_TEST(j->commit_outputs("job-1", "att-2", outs, none));
     r = j->get_job("job-1");
     BOOST_TEST(r->state == v1::COMPLETED);
-    BOOST_TEST(r->output_artifacts == outs);
+    BOOST_TEST(r->output_artifacts == ids_out);
     auto a = j->get_attempt("att-2");
     BOOST_TEST((a->state == AttemptState::kSucceeded));
     BOOST_TEST(a->ended_unix_ms > 0);
 
     // Second commit: job no longer COMMITTING.
-    BOOST_TEST(!j->commit_outputs("job-1", "att-2", {}));
-    BOOST_TEST(j->get_job("job-1")->output_artifacts == outs);
+    BOOST_TEST(!j->commit_outputs("job-1", "att-2", {}, none));
+    BOOST_TEST(j->get_job("job-1")->output_artifacts == ids_out);
 }
 
 BOOST_AUTO_TEST_CASE(list_ordering_and_filters) {
@@ -341,6 +347,181 @@ BOOST_AUTO_TEST_CASE(attempt_state_names) {
 
 BOOST_AUTO_TEST_CASE(open_bad_path_throws) {
     BOOST_CHECK_THROW(open_sqlite_journal("/proc/no-such/journal.db"), JournalError);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ---- Phase 6: named outputs, spawn, checkpoints, v1 -> v2 migration ----------
+
+BOOST_AUTO_TEST_SUITE(journal_phase6)
+
+namespace {
+v1::NamedArtifact named(char hexc, const std::string& name, std::uint64_t size, const std::string& media = "") {
+    v1::NamedArtifact a;
+    a.set_artifact_id("artifact://sha256/" + std::string(64, hexc));
+    a.set_name(name);
+    a.set_size(size);
+    a.set_media_type(media);
+    return a;
+}
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(named_outputs_and_spawn_committed, Fixture) {
+    j->insert_job(make_job("job-n", 1, v1::COMMITTING));
+    j->begin_attempt(make_attempt("att-1", "job-n", 1));
+    // Order kept; two names may share one artifact (identical content).
+    const std::vector<v1::NamedArtifact> outs = {named('c', "z.txt", 3, "text/plain"), named('a', "a.bin", 10),
+                                                 named('c', "copy.txt", 3, "text/plain")};
+    std::vector<v1::StepSpec> spawn(2);
+    spawn[0].set_name("child-1");
+    spawn[0].mutable_job()->set_operation("relax");
+    spawn[0].add_depends_on("prep");
+    spawn[0].set_run_if(v1::ANY_FAILED);
+    auto* in = spawn[0].add_inputs();
+    in->set_step(".");
+    in->set_output("structure");
+    in->set_input_name("s");
+    spawn[1].set_name("child-2");
+    spawn[1].set_allow_failure(true);
+    BOOST_TEST(j->commit_outputs("job-n", "att-1", outs, spawn));
+
+    auto r = j->get_job("job-n");
+    BOOST_REQUIRE(r.has_value());
+    BOOST_TEST(r->state == v1::COMPLETED);
+    BOOST_REQUIRE_EQUAL(r->outputs.size(), 3u);
+    for (std::size_t i = 0; i < outs.size(); ++i) BOOST_TEST(r->outputs[i].SerializeAsString() == outs[i].SerializeAsString());
+    BOOST_TEST(r->output_artifacts ==
+                   (std::vector<std::string>{outs[0].artifact_id(), outs[1].artifact_id()}),
+               boost::test_tools::per_element());
+    BOOST_REQUIRE_EQUAL(r->spawn.size(), 2u);
+    BOOST_TEST(r->spawn[0].SerializeAsString() == spawn[0].SerializeAsString());
+    BOOST_TEST(r->spawn[1].SerializeAsString() == spawn[1].SerializeAsString());
+    // Also through the list paths.
+    BOOST_TEST(j->list_jobs(v1::COMPLETED, 10).at(0).spawn.size() == 2u);
+    BOOST_TEST(j->jobs_in_states({v1::COMPLETED}).at(0).outputs.size() == 3u);
+
+    // Survives reopen.
+    j.reset();
+    j = open_sqlite_journal(db_path);
+    r = j->get_job("job-n");
+    BOOST_TEST(r->outputs.at(2).name() == "copy.txt");
+    BOOST_TEST(r->spawn.at(0).inputs(0).input_name() == "s");
+}
+
+BOOST_FIXTURE_TEST_CASE(insert_with_unnamed_output_artifacts, Fixture) {
+    auto rec = make_job("job-u", 1, v1::COMPLETED);
+    rec.output_artifacts = {"artifact://sha256/" + std::string(64, '1'), "artifact://sha256/" + std::string(64, '2')};
+    j->insert_job(rec);
+    auto r = j->get_job("job-u");
+    BOOST_TEST(r->output_artifacts == rec.output_artifacts, boost::test_tools::per_element());
+    BOOST_REQUIRE_EQUAL(r->outputs.size(), 2u);
+    BOOST_TEST(r->outputs[0].name().empty());
+    BOOST_TEST(r->spawn.empty());
+    BOOST_TEST(r->checkpoint.artifact_id().empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(latest_checkpoint_per_job, Fixture) {
+    j->insert_job(make_job("job-c", 1, v1::RUNNING));
+    j->insert_job(make_job("job-d", 2, v1::RUNNING));
+    j->set_checkpoint("job-c", named('e', "checkpoint", 5, "application/octet-stream"));
+    j->set_checkpoint("job-c", named('f', "state", 7));  // last one wins
+    j->set_checkpoint("job-missing", named('f', "state", 7));  // no-op
+    auto c = j->get_job("job-c");
+    BOOST_TEST(c->checkpoint.artifact_id() == "artifact://sha256/" + std::string(64, 'f'));
+    BOOST_TEST(c->checkpoint.name() == "state");
+    BOOST_TEST(c->checkpoint.size() == 7u);
+    BOOST_TEST(j->get_job("job-d")->checkpoint.artifact_id().empty());
+    // Kept through later state changes and a reopen.
+    BOOST_TEST(j->transition("job-c", v1::RUNNING, v1::FAILED, "boom"));
+    j.reset();
+    j = open_sqlite_journal(db_path);
+    BOOST_TEST(j->get_job("job-c")->checkpoint.name() == "state");
+}
+
+BOOST_FIXTURE_TEST_CASE(insert_keeps_checkpoint_and_spawn, Fixture) {
+    auto rec = make_job("job-i", 1, v1::COMPLETED);
+    rec.checkpoint = named('9', "ck", 1);
+    rec.spawn.resize(1);
+    rec.spawn[0].set_name("s");
+    j->insert_job(rec);
+    auto r = j->get_job("job-i");
+    BOOST_TEST(r->checkpoint.name() == "ck");
+    BOOST_REQUIRE_EQUAL(r->spawn.size(), 1u);
+    BOOST_TEST(r->spawn[0].name() == "s");
+}
+
+BOOST_AUTO_TEST_CASE(migrates_v1_database) {
+    const fs::path dir = fs::path("/tmp/claude-1000") / tdr::new_id("journal-mig");
+    const fs::path db = dir / "journal.db";
+    fs::create_directories(dir);
+    {
+        // Phase 1-5 schema (user_version 1) with one completed job.
+        sqlite3* raw = nullptr;
+        BOOST_REQUIRE(sqlite3_open(db.c_str(), &raw) == SQLITE_OK);
+        v1::JobSpec spec;
+        spec.set_job_id("old-job");
+        spec.mutable_command()->add_argv("/bin/true");
+        const std::string blob = spec.SerializeAsString();
+        const char* ddl = R"sql(
+CREATE TABLE jobs (job_id TEXT PRIMARY KEY NOT NULL, spec BLOB NOT NULL, state INTEGER NOT NULL,
+    attempts_used INTEGER NOT NULL DEFAULT 0, current_attempt_id TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+    progress_fraction REAL NOT NULL DEFAULT 0, progress_message TEXT NOT NULL DEFAULT '');
+CREATE INDEX jobs_state_created ON jobs(state, created_ms);
+CREATE INDEX jobs_created ON jobs(created_ms);
+CREATE TABLE job_outputs (job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    idx INTEGER NOT NULL, artifact_id TEXT NOT NULL, PRIMARY KEY (job_id, idx)) WITHOUT ROWID;
+CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    number INTEGER NOT NULL, token TEXT NOT NULL, state INTEGER NOT NULL, pid INTEGER NOT NULL DEFAULT 0,
+    pid_start_ticks INTEGER NOT NULL DEFAULT 0, cgroup_path TEXT NOT NULL DEFAULT '', work_dir TEXT NOT NULL DEFAULT '',
+    exit_code INTEGER NOT NULL DEFAULT 0, exit_signal INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+    started_ms INTEGER NOT NULL DEFAULT 0, ended_ms INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX attempts_state ON attempts(state);
+CREATE INDEX attempts_job ON attempts(job_id);
+CREATE TABLE artifacts (id TEXT PRIMARY KEY NOT NULL, sha256_hex TEXT NOT NULL, size INTEGER NOT NULL,
+    media_type TEXT NOT NULL DEFAULT '', producer_job TEXT NOT NULL DEFAULT '', local_path TEXT NOT NULL DEFAULT '',
+    created_ms INTEGER NOT NULL DEFAULT 0);
+PRAGMA user_version = 1;
+)sql";
+        BOOST_REQUIRE(sqlite3_exec(raw, ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_stmt* st = nullptr;
+        BOOST_REQUIRE(sqlite3_prepare_v2(raw, "INSERT INTO jobs (job_id, spec, state, created_ms, updated_ms) "
+                                              "VALUES ('old-job', ?1, ?2, 5, 6)", -1, &st, nullptr) == SQLITE_OK);
+        sqlite3_bind_blob(st, 1, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, static_cast<int>(v1::COMPLETED));
+        BOOST_REQUIRE(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+        const std::string out = "INSERT INTO job_outputs VALUES ('old-job', 0, 'artifact://sha256/" +
+                                std::string(64, 'b') + "')";
+        BOOST_REQUIRE(sqlite3_exec(raw, out.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    {
+        auto jr = open_sqlite_journal(db);
+        auto r = jr->get_job("old-job");
+        BOOST_REQUIRE(r.has_value());
+        BOOST_TEST(r->state == v1::COMPLETED);
+        BOOST_TEST(r->output_artifacts == (std::vector<std::string>{"artifact://sha256/" + std::string(64, 'b')}),
+                   boost::test_tools::per_element());
+        BOOST_REQUIRE_EQUAL(r->outputs.size(), 1u);
+        BOOST_TEST(r->outputs[0].name().empty());
+        BOOST_TEST(r->spawn.empty());
+        BOOST_TEST(r->checkpoint.artifact_id().empty());
+        jr->set_checkpoint("old-job", named('7', "checkpoint", 2));
+        BOOST_TEST(jr->get_job("old-job")->checkpoint.size() == 2u);
+    }
+    {
+        sqlite3* raw = nullptr;
+        BOOST_REQUIRE(sqlite3_open(db.c_str(), &raw) == SQLITE_OK);
+        sqlite3_stmt* st = nullptr;
+        BOOST_REQUIRE(sqlite3_prepare_v2(raw, "PRAGMA user_version", -1, &st, nullptr) == SQLITE_OK);
+        BOOST_REQUIRE(sqlite3_step(st) == SQLITE_ROW);
+        BOOST_TEST(sqlite3_column_int(st, 0) == 2);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

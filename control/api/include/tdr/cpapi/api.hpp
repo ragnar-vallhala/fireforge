@@ -26,6 +26,8 @@ struct ApiOptions {
     std::uint32_t lease_ttl_seconds = 60;      // phase4.md §3
     std::uint32_t max_attempts_default = 3;    // when a submitted spec leaves it 0
     std::uint32_t locality_wait_seconds = 15;  // phase5.md §4 (0 = any node at once)
+    cpdb::WorkflowLimits workflow_limits;      // phase6.md §9 [workflows]
+    cpdb::PlacementOptions placement;          // phase6.md §7 [placement]
 };
 
 // §8.3 presets. nullopt for an unknown profile name.
@@ -53,6 +55,10 @@ public:
     // Runs repo.expire_leases unless still within lease_ttl of construction
     // (startup grace, phase4.md §3). Logs each expiry. tdrcp calls it with sweep().
     std::vector<cpdb::ExpiredLease> sweep_leases();
+    // Phase 6: repo.sweep_workflows (tdrcp: [workflows] sweep_interval) and
+    // repo.place_jobs (tdrcp: [placement] interval). Log what changed.
+    std::size_t sweep_workflows();
+    std::vector<cpdb::Reservation> place_jobs();
 
     const ApiOptions& options() const;
 

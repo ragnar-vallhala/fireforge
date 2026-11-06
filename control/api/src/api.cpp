@@ -146,7 +146,12 @@ struct ControlApi::Impl {
         add("POST", "/api/v1/artifacts/sha256/{hex}/release", &Impl::release_artifact);
         add("POST", "/api/v1/artifacts/sha256/{hex}/pin", &Impl::pin_artifact);
         add("POST", "/api/v1/artifacts/sha256/{hex}/unpin", &Impl::unpin_artifact);
+        add("POST", "/api/v1/workflows", &Impl::create_workflow);
+        add("GET", "/api/v1/workflows", &Impl::list_workflows);
+        add("GET", "/api/v1/workflows/{id}", &Impl::get_workflow);
+        add("POST", "/api/v1/workflows/{id}/cancel", &Impl::cancel_workflow);
         add("GET", "/api/v1/audit", &Impl::audit);
+        repo.set_workflow_limits(options.workflow_limits);
     }
 
     std::int64_t ttl_ms() const { return std::int64_t{options.lease_ttl_seconds} * 1000; }
@@ -157,6 +162,16 @@ struct ControlApi::Impl {
         return error_response(404, "not_found", "unknown campaign " + id);
     }
     static Response job_not_found(const std::string& id) { return error_response(404, "not_found", "unknown job " + id); }
+    static Response workflow_not_found(const std::string& id) {
+        return error_response(404, "not_found", "unknown workflow " + id);
+    }
+
+    // Step templates get the same max_attempts default as submitted jobs.
+    void apply_defaults(google::protobuf::RepeatedPtrField<tv1::StepSpec>& steps) const {
+        for (auto& s : steps)
+            if (s.job().policy().max_attempts() == 0)
+                s.mutable_job()->mutable_policy()->set_max_attempts(options.max_attempts_default);
+    }
 
     // The caller's node when node_id names it (mirrors the heartbeat check).
     std::expected<cv1::NodeInfo, Response> own_node(const Request& r, const std::string& node_id) {
@@ -498,6 +513,11 @@ struct ControlApi::Impl {
             if (!valid_artifact_id(o.artifact_id()))
                 return error_response(400, "bad_request",
                                       std::format("output '{}' is not artifact://sha256/<64 hex>", o.artifact_id()));
+        if (u.has_checkpoint() && !u.checkpoint().artifact_id().empty() && !valid_artifact_id(u.checkpoint().artifact_id()))
+            return error_response(400, "bad_request",
+                                  std::format("checkpoint '{}' is not artifact://sha256/<64 hex>",
+                                              u.checkpoint().artifact_id()));
+        apply_defaults(*u.mutable_spawn());  // spawn validity is the repository's (kInvalid -> 400)
         auto out = repo.update_job(id, node->node_id(), u, clock());
         switch (out.result) {
             case cpdb::UpdateResult::kNotFound: return job_not_found(id);
@@ -596,6 +616,67 @@ struct ControlApi::Impl {
     Response pin_artifact(Request& r) { return set_pinned(r, true); }
     Response unpin_artifact(Request& r) { return set_pinned(r, false); }
 
+    // ---- workflows (phase6.md §8) ---------------------------------------------------
+
+    Response create_workflow(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        cv1::CreateWorkflowRequest req;
+        if (auto e = parse_body(r, req)) return *e;
+        if (req.name().size() > 256) return error_response(400, "bad_request", "name must be at most 256 characters");
+        apply_defaults(*req.mutable_steps());
+        const auto actor = actor_of(*r.peer);
+        const auto now = clock();
+        auto w = repo.create_workflow(req, actor, now);
+        if (!w) return error_response(400, "bad_request", w.error());
+        boost::json::object details;
+        details["name"] = req.name();
+        details["campaign_id"] = req.campaign_id();
+        details["steps"] = req.steps_size();
+        repo.audit(actor, "workflow.create", w->workflow_id(), boost::json::serialize(details), now);
+        log_info("{} submitted workflow {} '{}' ({} steps){}{}", actor, w->workflow_id(), w->name(), req.steps_size(),
+                 req.campaign_id().empty() ? "" : " in campaign ", req.campaign_id());
+        return reply(*w, 201);
+    }
+
+    Response list_workflows(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        std::string state;
+        if (auto it = r.query.find("state"); it != r.query.end() && !it->second.empty()) {
+            state = upper(it->second);
+            if (state != "RUNNING" && state != "SUCCEEDED" && state != "FAILED" && state != "CANCELLED")
+                return error_response(400, "bad_request", "state must be RUNNING, SUCCEEDED, FAILED or CANCELLED");
+        }
+        std::string campaign;
+        if (auto it = r.query.find("campaign"); it != r.query.end()) campaign = it->second;
+        auto limit = parse_limit(r, 100, 1000);
+        if (!limit) return limit.error();
+        cv1::WorkflowList out;
+        for (auto& w : repo.list_workflows(state, campaign, *limit)) *out.add_workflows() = std::move(w);
+        return reply(out);
+    }
+
+    Response get_workflow(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        auto w = repo.get_workflow(r.params["id"], true);
+        if (!w) return workflow_not_found(r.params["id"]);
+        return reply(*w);
+    }
+
+    Response cancel_workflow(Request& r) {
+        if (auto e = check_role(r, kAdmin)) return *e;
+        const auto& id = r.params["id"];
+        cv1::CancelRequest req;
+        if (auto e = parse_body(r, req)) return *e;
+        const auto actor = actor_of(*r.peer);
+        const auto now = clock();
+        const std::string reason = req.reason().empty() ? "cancelled by " + actor : req.reason();
+        auto w = repo.cancel_workflow(id, reason, now);
+        if (!w) return workflow_not_found(id);
+        repo.audit(actor, "workflow.cancel", id, to_json(req), now);
+        log_info("{} cancelled workflow {} (now {})", actor, id, w->state());
+        return reply(*w);
+    }
+
     // ---- audit ----------------------------------------------------------------
 
     Response audit(Request& r) {
@@ -648,6 +729,19 @@ std::vector<cpdb::ExpiredLease> ControlApi::sweep_leases() {
         log_info("lease expired: job {} attempt {} on node {} -> {}", e.job_id, e.attempt_id, e.node_id,
                  tv1::JobState_Name(e.new_state));
     return expired;
+}
+
+std::size_t ControlApi::sweep_workflows() {
+    const auto changed = impl_->repo.sweep_workflows(impl_->clock());
+    if (changed > 0) log_info("workflow sweep: {} step(s) changed", changed);
+    return changed;
+}
+
+std::vector<cpdb::Reservation> ControlApi::place_jobs() {
+    auto rs = impl_->repo.place_jobs(impl_->options.placement, impl_->clock());
+    for (const auto& r : rs)
+        log_info("job {} reserved for node {} (cost {:.3f}) until {}", r.job_id, r.node_id, r.cost, r.until_ms);
+    return rs;
 }
 
 }  // namespace tdr::cpapi

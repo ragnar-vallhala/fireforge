@@ -289,6 +289,9 @@ struct Fixture {
             events.emplace_back(id, s);
             if (exec) exec->on_job_state(id, s);  // what tdrd does
         });
+        mgr->set_checkpoint_listener([this](const std::string& id, const tv1::NamedArtifact& a) {
+            if (exec) exec->on_checkpoint(id, a);  // what tdrd does
+        });
         mgr->recover();
     }
 
@@ -713,7 +716,7 @@ BOOST_FIXTURE_TEST_CASE(corrupt_state_file_is_moved_aside, Fixture) {
     make();
     BOOST_TEST(exec->active_leases().empty());
     BOOST_TEST(fs::exists(ropts.state_file.string() + ".corrupt"));
-    BOOST_TEST(state_file_text().find("\"version\":2") != std::string::npos);  // rewritten empty
+    BOOST_TEST(state_file_text().find("\"version\":3") != std::string::npos);  // rewritten empty
 }
 
 BOOST_FIXTURE_TEST_CASE(full_artifact_sync_pages, Fixture) {
@@ -1015,7 +1018,7 @@ BOOST_FIXTURE_TEST_CASE(version1_state_file_is_read, Fixture) {
     exec->on_registered("ff-node-1");
     BOOST_REQUIRE(run_until([&] { return has_terminal_update("old"); }));
     BOOST_TEST(last_update("old")->error() == "local job lost");
-    BOOST_TEST(state_file_text().find("\"version\":2") != std::string::npos);
+    BOOST_TEST(state_file_text().find("\"version\":3") != std::string::npos);
 }
 
 BOOST_FIXTURE_TEST_CASE(announce_reaches_client, Fixture) {
@@ -1035,6 +1038,252 @@ BOOST_FIXTURE_TEST_CASE(announce_reaches_client, Fixture) {
         }
         return false;
     }));
+}
+
+// ---- Phase 6: named outputs, spawn, checkpoints, resume ---------------------------
+
+namespace {
+// Runs until $FIREFORGE_WORKDIR/go exists, writing out.txt first.
+const std::vector<std::string> kWaitForGo = {
+    "/bin/sh", "-c",
+    "echo hello > \"$FIREFORGE_OUTPUT_DIR/out.txt\"; while [ ! -f \"$FIREFORGE_WORKDIR/go\" ]; do sleep 0.02; done"};
+
+fs::path workdir_of(const tdr::jobs::JobManager& m, const fs::path& root, const std::string& local) {
+    auto st = m.status(local);
+    return root / local / st->current_attempt_id();
+}
+
+tv1::WorkerResult named_result(const std::string& att) {
+    tv1::WorkerResult r;
+    r.set_attempt_id(att);
+    r.set_success(true);
+    auto* o = r.add_outputs();
+    o->set_path("out.txt");
+    o->set_name("greeting");
+    o->set_media_type("text/plain");
+    auto* sp = r.add_spawn();
+    sp->set_name("cand-1");
+    sp->mutable_job()->set_operation("relax");
+    r.add_spawn()->set_name("cand-2");
+    return r;
+}
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(completion_carries_named_outputs_and_spawn, Fixture) {
+    make();
+    lease_once({make_lease("job-s", kWaitForGo)});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return update_states("job-s").size() == 1u && exec->stats().pending_updates == 0; }));
+    const fs::path wd = workdir_of(*mgr, tmp.path / "work", "job-s.a1");
+    BOOST_REQUIRE(mgr->on_worker_result(named_result(mgr->status("job-s.a1")->current_attempt_id())).has_value());
+    std::ofstream(wd / "go") << "";
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-s"); }));
+    const auto* u = last_update("job-s");
+    BOOST_TEST(u->state() == tv1::COMPLETED);
+    BOOST_REQUIRE(u->outputs_size() == 1);
+    BOOST_TEST(u->outputs(0).name() == "greeting");
+    BOOST_TEST(u->outputs(0).size() == 6u);
+    BOOST_TEST(u->outputs(0).artifact_id() == mgr->status("job-s.a1")->output_artifacts(0));
+    BOOST_REQUIRE(u->spawn_size() == 2);
+    BOOST_TEST(u->spawn(0).name() == "cand-1");
+    BOOST_TEST(u->spawn(0).job().operation() == "relax");
+    BOOST_TEST(u->spawn(1).name() == "cand-2");
+    // The incremental announcement of the output has no name.
+    BOOST_REQUIRE(run_until([&] {
+        for (const auto& a : client.announces.requests)
+            if (a.sync_id().empty() && a.artifacts_size() == 1 && a.artifacts(0).artifact_id() == u->outputs(0).artifact_id())
+                return a.artifacts(0).name().empty();
+        return false;
+    }));
+}
+
+BOOST_FIXTURE_TEST_CASE(named_outputs_and_spawn_survive_executor_restart, Fixture) {
+    capacity = {4, 1024 * kMiB, 3};
+    make();
+    lease_once({make_lease("job-p", kWaitForGo), make_lease("job-q", kWaitForGo)});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] {
+        return update_states("job-p").size() == 1u && update_states("job-q").size() == 1u &&
+               exec->stats().pending_updates == 0;
+    }));
+    // job-p completes while disconnected: its COMPLETED update waits in the
+    // persisted outbox.
+    connected = false;
+    BOOST_REQUIRE(mgr->on_worker_result(named_result(mgr->status("job-p.a1")->current_attempt_id())).has_value());
+    std::ofstream(workdir_of(*mgr, tmp.path / "work", "job-p.a1") / "go") << "";
+    BOOST_REQUIRE(run_until([&] { return mgr->status("job-p.a1")->state() == tv1::COMPLETED; }));
+    BOOST_REQUIRE(run_until([&] { return exec->stats().pending_updates == 1u; }));
+    BOOST_TEST(state_file_text().find("cand-2") != std::string::npos);
+    BOOST_TEST(state_file_text().find("\"version\":3") != std::string::npos);
+    // job-q completes while no executor runs: start() queues it from the
+    // JobManager's status (journal).
+    exec.reset();
+    BOOST_REQUIRE(mgr->on_worker_result(named_result(mgr->status("job-q.a1")->current_attempt_id())).has_value());
+    std::ofstream(workdir_of(*mgr, tmp.path / "work", "job-q.a1") / "go") << "";
+    BOOST_REQUIRE(run_until([&] { return mgr->status("job-q.a1")->state() == tv1::COMPLETED; }));
+
+    const auto sent = client.updates.requests.size();
+    connected = true;
+    make_executor();
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-p") && has_terminal_update("job-q"); }));
+    BOOST_TEST(client.updates.requests.size() == sent + 2);
+    for (const auto* id : {"job-p", "job-q"}) {
+        const auto* u = last_update(id);
+        BOOST_TEST(u->state() == tv1::COMPLETED, id);
+        BOOST_REQUIRE(u->outputs_size() == 1);
+        BOOST_TEST(u->outputs(0).name() == "greeting", id);
+        BOOST_REQUIRE(u->spawn_size() == 2);
+        BOOST_TEST(u->spawn(1).name() == "cand-2", id);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(checkpoint_update_queued_coalesced_fenced_and_announced, Fixture) {
+    make();
+    auto l = make_lease("job-ck", kWaitForGo, 2);
+    l.mutable_spec()->mutable_policy()->set_checkpoint(true);
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return update_states("job-ck").size() == 1u && exec->stats().pending_updates == 0; }));
+    const auto att = mgr->status("job-ck.a2")->current_attempt_id();
+    const fs::path ckd = workdir_of(*mgr, tmp.path / "work", "job-ck.a2") / "checkpoints";
+    auto checkpoint = [&](const std::string& data) {
+        std::ofstream(ckd / "state.bin", std::ios::trunc) << data;
+        tv1::WorkerCheckpoint c;
+        c.set_attempt_id(att);
+        c.set_path("state.bin");
+        c.set_name("state");
+        c.set_media_type("application/x-state");
+        auto r = mgr->on_worker_checkpoint(c);
+        BOOST_REQUIRE_MESSAGE(r.has_value(), (r ? "" : r.error()));
+        return *r;
+    };
+
+    // Disconnected: two checkpoints coalesce into one queued update.
+    connected = false;
+    const auto first = checkpoint("step-1");
+    BOOST_TEST(exec->stats().pending_updates == 1u);
+    const auto second = checkpoint("step-2");
+    BOOST_TEST(exec->stats().pending_updates == 1u);
+    BOOST_TEST(first.artifact_id() != second.artifact_id());
+    BOOST_TEST(state_file_text().find(second.artifact_id()) != std::string::npos);
+    connected = true;
+    BOOST_REQUIRE(run_until([&] { return update_states("job-ck").size() == 2u && exec->stats().pending_updates == 0; }));
+    const auto* u = last_update("job-ck");
+    BOOST_TEST(u->state() == tv1::RUNNING);
+    BOOST_TEST(u->attempt_id() == "att-job-ck-2");
+    BOOST_TEST(u->fencing_token() == 2u);
+    BOOST_REQUIRE(u->has_checkpoint());
+    BOOST_TEST(u->checkpoint().artifact_id() == second.artifact_id());
+    BOOST_TEST(u->checkpoint().name() == "state");
+    BOOST_TEST(u->checkpoint().size() == 6u);
+    BOOST_TEST(u->checkpoint().media_type() == "application/x-state");
+
+    // In flight: a new checkpoint does not touch the update being sent.
+    client.updates.auto_reply = nullptr;
+    const auto third = checkpoint("step-3");
+    BOOST_REQUIRE(run_until([&] { return !client.updates.pending.empty(); }));
+    const auto fourth = checkpoint("step-4");
+    const auto fifth = checkpoint("step-5");  // coalesces with fourth
+    BOOST_TEST(exec->stats().pending_updates == 2u);
+    client.answer(client.updates, Result<cv1::Job>(cv1::Job{}));
+    BOOST_REQUIRE(run_until([&] { return client.updates.pending.size() == 1u; }));
+    client.answer(client.updates, Result<cv1::Job>(cv1::Job{}));
+    BOOST_REQUIRE(run_until([&] { return exec->stats().pending_updates == 0; }));
+    const auto& reqs = client.updates.requests;
+    BOOST_REQUIRE(reqs.size() >= 2u);
+    BOOST_TEST(reqs[reqs.size() - 2].update.checkpoint().artifact_id() == third.artifact_id());
+    BOOST_TEST(reqs.back().update.checkpoint().artifact_id() == fifth.artifact_id());
+    (void)fourth;
+
+    // Each checkpoint is announced (without a name).
+    BOOST_REQUIRE(run_until([&] {
+        std::set<std::string> ids;
+        for (const auto& a : client.announces.requests)
+            for (const auto& r : a.artifacts())
+                if (a.sync_id().empty() && r.name().empty()) ids.insert(r.artifact_id());
+        return ids.contains(first.artifact_id()) && ids.contains(fifth.artifact_id());
+    }));
+
+    // After the terminal update is queued, checkpoints no longer produce updates.
+    client.updates.auto_reply = [](const FakeClient::Update& up) {
+        cv1::Job j;
+        j.set_job_id(up.job_id);
+        return std::optional<Result<cv1::Job>>(j);
+    };
+    std::ofstream(workdir_of(*mgr, tmp.path / "work", "job-ck.a2") / "go") << "";
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-ck"); }));
+    const auto n = client.updates.requests.size();
+    exec->on_checkpoint("job-ck.a2", fifth);
+    run_for(100ms);
+    BOOST_TEST(client.updates.requests.size() == n);
+    // Local (non-lease) jobs: announced only, never reported.
+    exec->on_checkpoint("local-job", first);
+    run_for(50ms);
+    BOOST_TEST(client.updates.requests.size() == n);
+}
+
+BOOST_FIXTURE_TEST_CASE(resume_checkpoint_fetched_before_submit, Fixture) {
+    make_with_fetcher();
+    fetcher->mode = FakeFetcher::Mode::kHang;
+    const std::string ck = fetcher->add("checkpoint-bytes\n");
+    auto l = make_lease("job-rc", {"/bin/sh", "-c",
+                                   "cat \"$FIREFORGE_CHECKPOINT_DIR/resume/checkpoint\" > \"$FIREFORGE_OUTPUT_DIR/out.txt\""});
+    l.mutable_spec()->set_resume_checkpoint(ck);
+    l.mutable_spec()->mutable_policy()->set_checkpoint(true);
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return fetcher->hung.size() == 1u; }));
+    BOOST_TEST(fetcher->hung[0].first == ck);
+    BOOST_TEST(!mgr->status("job-rc.a1").has_value());  // not submitted while fetching
+    BOOST_TEST(exec->protected_inputs() == std::vector<std::string>{ck}, boost::test_tools::per_element());
+
+    // The fetch completes: into the store, then the job is submitted and runs.
+    {
+        const fs::path f = tmp.path / "fetched-ck";
+        std::ofstream(f) << "checkpoint-bytes\n";
+        auto m = store->ingest(f, "application/octet-stream", "", true);
+        BOOST_REQUIRE(m.has_value());
+        auto cb = std::move(fetcher->hung[0].second);
+        fetcher->hung.clear();
+        cb(*m);
+    }
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-rc"); }));
+    BOOST_TEST(last_update("job-rc")->state() == tv1::COMPLETED);
+    const auto st = mgr->status("job-rc.a1");
+    BOOST_REQUIRE(st->output_artifacts_size() == 1);
+    std::ifstream in(*store->path_of(st->output_artifacts(0)));
+    std::stringstream ss;
+    ss << in.rdbuf();
+    BOOST_TEST(ss.str() == "checkpoint-bytes\n");
+    BOOST_TEST(exec->protected_inputs().empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(resume_checkpoint_without_fetcher_fails_retryable, Fixture) {
+    make();
+    auto l = make_lease("job-nf", {"/bin/true"});
+    l.mutable_spec()->set_resume_checkpoint("artifact://sha256/" + std::string(64, 'c'));
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-nf"); }));
+    const auto* u = last_update("job-nf");
+    BOOST_TEST(u->state() == tv1::FAILED);
+    BOOST_TEST(u->retryable());
+    BOOST_TEST(u->error() == "artifact transfer unavailable");
+}
+
+BOOST_FIXTURE_TEST_CASE(version2_state_file_is_read, Fixture) {
+    fs::create_directories(ropts.state_file.parent_path());
+    std::ofstream(ropts.state_file) << R"({"version":2,"leases":[{"local_job_id":"v2.a1","job_id":"v2",
+        "attempt_id":"att-v2","fencing_token":1,"attempt_number":1,"terminal":true,"submitted":true}],
+        "outbox":[{"job_id":"v2","local_job_id":"v2.a1","terminal":true,
+        "update":{"attempt_id":"att-v2","fencing_token":"1","state":"COMPLETED"}}]})";
+    make();
+    BOOST_TEST(exec->stats().pending_updates == 1u);
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("v2"); }));
+    BOOST_TEST(last_update("v2")->state() == tv1::COMPLETED);
+    BOOST_TEST(last_update("v2")->spawn_size() == 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

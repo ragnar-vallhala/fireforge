@@ -107,7 +107,10 @@ def infra():
         yield base, pg, Pki(base)
     finally:
         pg.stop()
-        shutil.rmtree(base, ignore_errors=True)
+        if os.environ.get("FF_KEEP"):  # keep logs for debugging
+            print(f"kept {base}")
+        else:
+            shutil.rmtree(base, ignore_errors=True)
 
 
 # ---- per-test processes --------------------------------------------------------------

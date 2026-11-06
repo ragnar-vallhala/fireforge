@@ -641,7 +641,7 @@ Scheduling is hybrid:
 - **Push:** the control plane assigns jobs with strict placement needs (GPU, data locality) to a chosen node.
 - **Pull:** workers request leases for all other work when they have spare capacity.
 
-Pull is implemented first; push is added in Phase 6. The exact policy dividing the two remains open (§21).
+Pull was implemented first. Phase 6 implements push as reserve-and-rank: jobs with strict placement needs (a GPU, or large inputs) are reserved for the best-ranked node for a short window and handed out through that node's normal lease request; everything else is pulled ([Phase 6](docs/design/phase6.md) §7).
 
 Placement decisions have two stages.
 
@@ -863,7 +863,7 @@ Security requirements:
 | 8 | Scientific integration | Complete thermoelectric workflow |
 | 9 | Discovery intelligence | Automated candidate discovery |
 
-Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md), [Phase 4](docs/design/phase4.md), [Phase 5](docs/design/phase5.md).
+Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md), [Phase 4](docs/design/phase4.md), [Phase 5](docs/design/phase5.md), [Phase 6](docs/design/phase6.md).
 
 ## First Demonstration
 
@@ -908,7 +908,7 @@ Decided 2026-11-05.
 |---:|---|---|---|
 | 1 | Peer protocol | Custom 48-byte big-endian header for framing and routing; Protocol Buffers (proto3) payloads; message types from a protobuf enum (`proto/fireforge/tdr/v1/envelope.proto`) | Cheap fixed-size framing with a versioned, schema-evolving payload |
 | 2 | Metadata | Single PostgreSQL instance co-located with the control plane on the control node; replication later | Simple to operate at current scale |
-| 3 | Scheduling | Hybrid: control plane pushes jobs with strict placement needs (GPU, data locality); workers pull everything else via lease requests. Pull first, push added in Phase 6 | Pull is simple and self-balancing; push is needed where placement matters |
+| 3 | Scheduling | Hybrid: control plane pushes jobs with strict placement needs (GPU, data locality); workers pull everything else via lease requests. Pull first; push added in Phase 6 as reserve-and-rank over pull | Pull is simple and self-balancing; push is needed where placement matters |
 | 4 | Campaign authority | Control plane owns all campaign state in Postgres; recovery is restart and reload; nodes keep running jobs during an outage and reconcile afterwards | One source of truth without halting computation |
 | 5 | Peer discovery | Control-plane peer directory only; no LAN multicast | Works across LAN and Tailscale alike |
 | 6 | Artifact storage | Peer-local content-addressed storage (`/var/lib/fireforge/artifacts`) with direct peer-to-peer transfer; no shared filesystem | No shared-storage dependency; integrity from content addressing |
@@ -922,7 +922,6 @@ Decided 2026-11-05.
 
 **Still open:**
 
-- Exact hybrid push/pull policy (which jobs are pushed, and how push and pull interact).
 - cgroup delegation policy.
 
 # 22. Project Principles
@@ -974,3 +973,4 @@ The platform begins by integrating established scientific solvers and validating
 | 0.1 | — | Initial architecture specification. |
 | 0.2 | 2026-11-05 | Architectural decisions recorded (§21); roadmap gains a multi-node execution phase (§20). |
 | 0.3 | 2026-11-06 | Artifact retention decided (§21 #13); Phase 4 and 5 designs linked. |
+| 0.4 | 2026-11-06 | Push/pull policy resolved as reserve-and-rank (§14, §21 #3); Phase 6 design linked. |

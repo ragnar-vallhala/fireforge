@@ -31,7 +31,15 @@ struct JobRecord {
     std::uint32_t attempts_used = 0;
     std::string current_attempt_id;   // "" when no attempt yet
     std::string last_error;
+    // Distinct output artifact ids, in output order (JobStatus.output_artifacts).
     std::vector<std::string> output_artifacts;
+    // Phase 6: every named output in order (JobStatus.outputs). Two names may
+    // share an artifact id (identical content), so this can be longer than
+    // output_artifacts. Rows journaled before Phase 6 have empty names. On
+    // insert_job, an empty `outputs` means "output_artifacts, unnamed".
+    std::vector<v1::NamedArtifact> outputs;
+    std::vector<v1::StepSpec> spawn;  // Phase 6: WorkerResult.spawn of the committed attempt
+    v1::NamedArtifact checkpoint;     // Phase 6: latest checkpoint (empty artifact_id = none)
     std::int64_t created_unix_ms = 0;
     std::int64_t updated_unix_ms = 0;
     double progress_fraction = 0;
@@ -104,11 +112,17 @@ public:
 
     // ---- commit (fencing) --------------------------------------------------
     // Atomically: if job.state == COMMITTING and job.current_attempt_id ==
-    // attempt_id, store output artifacts, set state COMPLETED, mark the
-    // attempt kSucceeded and return true. Otherwise change nothing, return false.
-    // This is the local fencing check that stops a stale attempt from publishing.
+    // attempt_id, store the named outputs (in order) and the spawn list, set
+    // state COMPLETED, mark the attempt kSucceeded and return true. Otherwise
+    // change nothing, return false. This is the local fencing check that stops
+    // a stale attempt from publishing.
     virtual bool commit_outputs(const std::string& job_id, const std::string& attempt_id,
-                                const std::vector<std::string>& artifact_ids) = 0;
+                                const std::vector<v1::NamedArtifact>& outputs,
+                                const std::vector<v1::StepSpec>& spawn) = 0;
+
+    // ---- checkpoints (Phase 6) ---------------------------------------------
+    // Replaces the job's latest checkpoint; unknown job = no-op.
+    virtual void set_checkpoint(const std::string& job_id, const v1::NamedArtifact& checkpoint) = 0;
 
     // ---- artifacts ---------------------------------------------------------
     virtual void record_artifact(const ArtifactRow& row) = 0;  // upsert by id

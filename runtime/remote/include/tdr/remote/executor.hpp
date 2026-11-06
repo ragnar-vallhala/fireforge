@@ -100,6 +100,12 @@ public:
     // Inputs of leases still fetching or not yet submitted locally (GC must keep them).
     std::vector<std::string> protected_inputs() const;
 
+    // Phase 6 (phase6.md §5, §6): a local leased job checkpointed -> queue a
+    // fenced RUNNING JobUpdate with `checkpoint` (name set) and announce it.
+    // Leases with spec.resume_checkpoint fetch it like an input before submit.
+    // COMPLETED updates carry named outputs (JobStatus.outputs) and JobStatus.spawn.
+    void on_checkpoint(const std::string& local_job_id, const tv1::NamedArtifact& checkpoint);
+
     // Central job id of a local leased job, if it is one.
     std::optional<std::string> central_job_id(const std::string& local_job_id) const;
     RemoteStats stats() const;

@@ -33,5 +33,31 @@ offline_after = 90
 # any node may take it and fetch the inputs from a peer. 0 = any node at once.
 #locality_wait = 15
 
+[workflows]
+# Workflow engine (docs/design/phase6.md §3-§5). The engine runs whenever a
+# step's job finishes; this sweep (seconds) is only a safety net.
+#sweep_interval = 5
+# Steps per workflow (static + spawned), steps per fan-out, spawn nesting depth.
+#max_steps = 10000
+#max_spawn = 1000
+#max_depth = 8
+
+[placement]
+# Ranked placement (docs/design/phase6.md §7). Strict jobs (gpu_count > 0, or
+# inputs + checkpoint >= strict_input_mb MiB) are reserved for their best-ranked
+# node for reserve_window seconds, then the next one; after every eligible node
+# was tried, or max_reserve seconds after queueing, any node may take them.
+# Strict jobs are only leasable through this sweep, so interval must be > 0.
+#interval = 1
+#reserve_window = 5
+#max_reserve = 30
+#strict_input_mb = 64
+# Cost weights (each term is roughly 0..1; lowest total cost wins).
+#w_compute = 0.1
+#w_transfer = 0.5
+#w_queue = 0.2
+#w_memory = 0.1
+#w_contention = 0.1
+
 [log]
 level = info

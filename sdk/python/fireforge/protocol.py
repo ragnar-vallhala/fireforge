@@ -175,9 +175,17 @@ class FrameWriter:
         self._lock = threading.Lock()
         self.ids = ids or MessageIdCounter()
 
-    def send(self, msg_type: int, message, correlation_id: int = 0) -> int:
-        """Send one frame and return its message_id."""
+    def send(self, msg_type: int, message, correlation_id: int = 0, on_id=None) -> int:
+        """Send one frame and return its message_id.
+
+        ``on_id(message_id)`` (optional) runs after the id is assigned and
+        before the frame is written, so a caller can register for the reply
+        before it can possibly arrive.
+        """
         with self._lock:
             mid = self.ids.next()
-            self._sock.sendall(encode_frame(msg_type, message, mid, correlation_id))
+            frame = encode_frame(msg_type, message, mid, correlation_id)
+            if on_id is not None:
+                on_id(mid)
+            self._sock.sendall(frame)
             return mid

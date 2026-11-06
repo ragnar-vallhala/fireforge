@@ -3,6 +3,7 @@
 #include <string>
 
 #include "jobs.hpp"
+#include "workflows.hpp"
 #include "pg.hpp"
 #include "util.hpp"
 #include "tdr/common/common.hpp"
@@ -128,7 +129,10 @@ cv1::Campaign campaign_from(const Result& r, int row) {
 
 class PgRepository final : public IRepository {
 public:
-    explicit PgRepository(const std::string& conninfo) : c_(conninfo), jobs_(c_) { pg::migrate(c_); }
+    explicit PgRepository(const std::string& conninfo) : c_(conninfo), jobs_(c_), wf_(c_, jobs_) {
+        jobs_.set_workflows(&wf_);
+        pg::migrate(c_);
+    }
 
     cv1::NodeInfo register_node(const cv1::RegisterRequest& req, const std::string& cert_fingerprint,
                                 std::int64_t now_ms) override {
@@ -379,6 +383,30 @@ public:
         return jobs_.set_artifact_pinned(artifact_id, pinned, actor, now_ms);
     }
 
+    // ---- workflows (workflows.cpp) ----------------------------------------------
+
+    std::expected<cv1::Workflow, std::string> create_workflow(const cv1::CreateWorkflowRequest& req,
+                                                              const std::string& submitted_by,
+                                                              std::int64_t now_ms) override {
+        return wf_.create_workflow(req, submitted_by, now_ms);
+    }
+    std::optional<cv1::Workflow> get_workflow(const std::string& id, bool with_steps) override {
+        return wf_.get_workflow(id, with_steps);
+    }
+    std::vector<cv1::Workflow> list_workflows(const std::string& state, const std::string& campaign_id,
+                                              std::size_t limit) override {
+        return wf_.list_workflows(state, campaign_id, limit);
+    }
+    std::optional<cv1::Workflow> cancel_workflow(const std::string& id, const std::string& reason,
+                                                 std::int64_t now_ms) override {
+        return wf_.cancel_workflow(id, reason, now_ms);
+    }
+    std::size_t sweep_workflows(std::int64_t now_ms) override { return wf_.sweep_workflows(now_ms); }
+    void set_workflow_limits(const WorkflowLimits& limits) override { wf_.set_limits(limits); }
+    std::vector<Reservation> place_jobs(const PlacementOptions& options, std::int64_t now_ms) override {
+        return jobs_.place_jobs(options, now_ms);
+    }
+
     void audit(const std::string& actor, const std::string& action, const std::string& target,
                const std::string& details_json, std::int64_t now_ms) override {
         transact(c_, [&] {
@@ -423,6 +451,7 @@ private:
 
     Conn c_;
     JobStore jobs_;
+    WorkflowStore wf_;
 };
 
 #undef TS

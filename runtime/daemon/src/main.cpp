@@ -29,6 +29,7 @@
 #include <boost/asio/signal_set.hpp>
 #include <boost/program_options.hpp>
 
+#include "fireforge/tdr/v1/artifact.pb.h"
 #include "fireforge/tdr/v1/local.pb.h"
 #include "tdr/agent/agent.hpp"
 #include "tdr/peer/manager.hpp"
@@ -154,6 +155,16 @@ public:
             }
             if (remote_) remote_->on_job_state(job, s);
             if (s == v1::COMPLETED) gc_->run([](const v1::GcReport&) {});  // outputs may push the store over the cap
+        });
+
+        manager_->set_checkpoint_listener([this](const std::string& job, const v1::NamedArtifact& cp) {
+            tdr::log_info("job {} checkpoint {} ({} bytes)", job, cp.artifact_id(), cp.size());
+            if (gc_) {
+                gc_->note_added(cp.size());
+                gc_->touch(cp.artifact_id());
+            }
+            if (remote_) remote_->on_checkpoint(job, cp);
+            replicate(cp.artifact_id());
         });
 
         tdr::transfer::GcOptions gopts;
@@ -368,6 +379,7 @@ private:
                 std::max(cfg_.network.peer_ping_interval + 1, cfg_.network.peer_ping_timeout));
             peers_ = std::make_unique<tdr::peer::PeerManager>(io_, *transport_, popts);
             peers_->set_directory_refresh([this] { if (agent_) agent_->refresh_peers(); });
+            peers_->set_frame_handler([this](const std::string& from, Frame f) { on_peer_frame(from, std::move(f)); });
             peers_->set_state_listener([this](const std::string& id, tdr::peer::PeerState st) {
                 tdr::log_info("peer {} {}", peer_label(id), tdr::peer::to_string(st));
             });
@@ -392,12 +404,18 @@ private:
         tdr::transfer::TransferHooks hooks;
         hooks.holders = [this](const std::string& id, auto cb) {
             if (!agent_) return cb(std::unexpected(std::string("no control plane")));
-            agent_->client().get_artifact(id, [cb](tdr::agent::Result<tdr::agent::cv1::ArtifactInfo> r) {
+            std::string hint;
+            if (auto h = replica_hints_.find(id); h != replica_hints_.end()) hint = h->second;
+            agent_->client().get_artifact(id, [cb, hint](tdr::agent::Result<tdr::agent::cv1::ArtifactInfo> r) {
+                std::vector<std::string> nodes;
+                if (!hint.empty()) nodes.push_back(hint);  // replication sender first
                 if (!r) {
-                    if (r.error().http_status == 404) return cb(std::vector<std::string>{});
+                    if (r.error().http_status == 404 || !hint.empty()) return cb(nodes);
                     return cb(std::unexpected(error_text(r.error())));
                 }
-                cb(std::vector<std::string>(r->node_ids().begin(), r->node_ids().end()));
+                for (const auto& n : r->node_ids())
+                    if (n != hint) nodes.push_back(n);
+                cb(nodes);
             });
         };
         hooks.on_stored = [this](const tdr::artifacts::ArtifactMeta& m) {
@@ -413,6 +431,39 @@ private:
         if (remote_) remote_->set_fetcher(service_.get());
     }
 
+    // ---- checkpoint replication (phase6.md §6) ------------------------------------
+    // Ask the closest connected peers to fetch a new checkpoint from us.
+    void replicate(const std::string& id) {
+        if (!peers_ || cfg_.artifacts.checkpoint_replicas == 0) return;
+        auto snap = peers_->snapshot();
+        std::erase_if(snap, [](const auto& p) { return p.state() != "CONNECTED"; });
+        std::ranges::sort(snap, {}, [](const auto& p) { return p.rtt_ms() > 0 ? p.rtt_ms() : 1e9; });
+        v1::ArtifactReplicate msg;
+        msg.set_artifact_id(id);
+        std::size_t sent = 0;
+        for (const auto& p : snap) {
+            if (sent >= cfg_.artifacts.checkpoint_replicas) break;
+            if (peers_->send(p.node_id(), make_frame(v1::ARTIFACT_REPLICATE, msg, next_message_id()))) {
+                tdr::log_debug("asked {} to replicate {}", p.name(), id);
+                ++sent;
+            }
+        }
+    }
+
+    void on_peer_frame(const std::string& from, Frame f) {
+        if (f.type() != v1::ARTIFACT_REPLICATE) return;
+        v1::ArtifactReplicate msg;
+        if (!f.parse(msg) || !tdr::artifacts::parse_artifact_id(msg.artifact_id()) || !service_) return;
+        if (store_->contains(msg.artifact_id())) return;
+        replica_hints_[msg.artifact_id()] = from;  // the sender holds it even if not announced yet
+        service_->fetch(msg.artifact_id(), [this, id = msg.artifact_id(), from](
+                                               std::expected<tdr::artifacts::ArtifactMeta, std::string> r) {
+            replica_hints_.erase(id);
+            if (r) tdr::log_info("replicated {} from {}", id, peer_label(from));
+            else tdr::log_warn("replicating {} from {}: {}", id, peer_label(from), r.error());
+        });
+    }
+
     // Not evictable now: inputs of non-terminal local jobs or of leases still
     // fetching, and artifacts being transferred.
     bool artifact_protected(const std::string& id) const {
@@ -422,8 +473,12 @@ private:
                 if (in == id) return true;
         for (auto st : {v1::CREATED, v1::QUEUED, v1::ASSIGNED, v1::RUNNING, v1::COMMITTING, v1::RETRY_PENDING})
             for (const auto& j : manager_->list(st, 100000))
+            {
                 for (const auto& in : j.spec().input_artifacts())
                     if (in == id) return true;
+                // Phase 6: the checkpoint a job resumes from / its latest one.
+                if (j.spec().resume_checkpoint() == id || j.checkpoint().artifact_id() == id) return true;
+            }
         return false;
     }
 
@@ -788,6 +843,13 @@ private:
             manager_->on_worker_progress(p);
             return;
         }
+        case v1::WORKER_CHECKPOINT: {
+            v1::WorkerCheckpoint cp;
+            if (!f.parse(cp)) return reply_error(c, f, v1::BAD_REQUEST, "bad WorkerCheckpoint");
+            if (!owns(c, cp.attempt_id())) return reply_error(c, f, v1::UNAUTHORIZED, "attempt not bound to this connection");
+            if (auto ok = manager_->on_worker_checkpoint(cp); !ok) return reply_error(c, f, v1::BAD_REQUEST, ok.error());
+            return reply(c, f, v1::WORKER_ACK, v1::Ack{});
+        }
         case v1::WORKER_RESULT: {
             v1::WorkerResult r;
             if (!f.parse(r)) return reply_error(c, f, v1::BAD_REQUEST, "bad WorkerResult");
@@ -936,6 +998,7 @@ private:
     std::unique_ptr<tdr::transfer::StoreGc> gc_;
     std::unique_ptr<tdr::transfer::ArtifactService> service_;
     std::string peer_self_id_;  // node id the PeerManager was created with
+    std::unordered_map<std::string, std::string> replica_hints_;  // artifact -> peer asking us to replicate
     bool stopping_ = false;
     std::unordered_map<std::uint64_t, std::string> attempt_by_conn_;
     std::unordered_map<std::string, std::weak_ptr<Connection>> conn_by_attempt_;

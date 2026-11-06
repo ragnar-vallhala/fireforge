@@ -6,6 +6,7 @@ Phase 2 (control plane, `docs/design/phase2.md`) is done.
 Phase 3 (peer networking, `docs/design/phase3.md`) is done.
 Phase 4 (distributed execution: central queue + leases, `docs/design/phase4.md`) is done.
 Phase 5 (artifact infrastructure: peer transfer, placement, retention, `docs/design/phase5.md`) is done.
+Phase 6 (workflow engine: DAGs, fan-out, checkpoints, ranked placement, `docs/design/phase6.md`) is done.
 
 ## Memory cap — mandatory
 

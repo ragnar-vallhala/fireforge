@@ -54,6 +54,9 @@ gc_low = 80
 gc_interval = 60
 # Artifacts used within this many seconds are never evicted.
 gc_min_age = 600
+# Phase 6: ask this many connected peers (lowest RTT first) to copy each new job
+# checkpoint, so a retry on another node can resume after this node dies.
+checkpoint_replicas = 1
 
 [tls]
 # mTLS credentials for the control plane (issued with `tdrctl pki issue --role node`).

@@ -38,6 +38,7 @@ enum MessageType {
   ARTIFACT_REQUEST = 0x0303;    // ArtifactRequest    fetcher -> server (first frame)
   ARTIFACT_TRANSFER = 0x0304;   // ArtifactChunk      server -> fetcher
   ARTIFACT_CHUNK_ACK = 0x0305;  // ArtifactChunkAck   fetcher -> server
+  ARTIFACT_REPLICATE = 0x0306;  // ArtifactReplicate  peer link: fetch this from me (Phase 6)
 
   // ---- Peer: checkpoints --------------------------------------------------
   CHECKPOINT_CREATE = 0x0401;
@@ -49,7 +50,8 @@ enum MessageType {
   WORKER_PROGRESS = 0x1003;  // worker -> daemon   WorkerProgress (no reply)
   WORKER_RESULT = 0x1004;    // worker -> daemon   WorkerResult
   WORKER_CANCEL = 0x1005;    // daemon -> worker   WorkerCancel (unsolicited)
-  WORKER_ACK = 0x1006;       // daemon -> worker   Ack          (reply to RESULT)
+  WORKER_ACK = 0x1006;       // daemon -> worker   Ack          (reply to RESULT, CHECKPOINT)
+  WORKER_CHECKPOINT = 0x1007;  // worker -> daemon WorkerCheckpoint (Phase 6)
 
   // ---- Local: tdrctl <-> daemon (Phase 1) ---------------------------------
   CTL_SUBMIT = 0x1101;             // SubmitJobRequest  -> SubmitJobReply
