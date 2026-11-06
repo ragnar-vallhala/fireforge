@@ -81,18 +81,28 @@ message WorkerCancel {
 // Control protocol (tdrctl)
 // ---------------------------------------------------------------------------
 
-message SubmitJobRequest { JobSpec spec = 1; }
+message SubmitJobRequest {
+  JobSpec spec = 1;
+  bool remote = 2;      // Phase 4: submit to the control-plane queue via this node
+}
 message SubmitJobReply { string job_id = 1; }
 
-message GetJobRequest { string job_id = 1; }
+message GetJobRequest {
+  string job_id = 1;
+  bool remote = 2;      // central job (reply JobStatus with node_id set)
+}
 
 message ListJobsRequest {
   JobState state = 1;   // JOB_STATE_UNSPECIFIED = all
   uint32 limit = 2;     // 0 = 100
+  bool remote = 3;      // central jobs
 }
 message JobList { repeated JobStatus jobs = 1; }
 
-message CancelJobRequest { string job_id = 1; }
+message CancelJobRequest {
+  string job_id = 1;
+  bool remote = 2;
+}
 
 message NodeStatusRequest {}
 

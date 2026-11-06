@@ -26,6 +26,8 @@ using tdr::protocol::next_message_id;
 
 namespace {
 
+bool g_remote = false;  // --remote: central job queue (phase4.md §7)
+
 constexpr const char* kUsage = R"(usage: tdrctl [--socket PATH] <command> [args]
 
 commands:
@@ -38,6 +40,10 @@ commands:
   node [--json]                 includes control-plane state (Phase 2)
   peers [--json]                peer directory + live peer links (path, RTT)
   wait JOB_ID [--timeout S]     exit 0 iff the job COMPLETED
+
+  --remote (with submit/status/list/cancel/wait): use the control-plane job
+  queue through this node instead of local jobs (Phase 4). The job may run
+  on any eligible node.
 
   pki ...                       local CA and certificates   (tdrctl pki --help)
   cp ...                        control-plane admin (HTTPS)  (tdrctl cp --help)
@@ -78,6 +84,7 @@ public:
     v1::JobStatus get(const std::string& id) {
         v1::GetJobRequest req;
         req.set_job_id(id);
+        req.set_remote(g_remote);
         v1::JobStatus st;
         if (!call(v1::CTL_GET_JOB, req, v1::CTL_JOB_INFO).parse(st)) throw std::runtime_error("bad JobStatus reply");
         return st;
@@ -109,12 +116,15 @@ void print_status(const v1::JobStatus& s) {
     if (!s.spec().operation().empty()) std::cout << "operation: " << s.spec().operation() << "\n";
     if (s.progress_fraction() > 0 || !s.progress_message().empty())
         std::cout << "progress:  " << static_cast<int>(s.progress_fraction() * 100) << "% " << s.progress_message() << "\n";
+    if (!s.node_id().empty()) std::cout << "node:      " << s.node_id() << "\n";
+    if (!s.remote_job_id().empty()) std::cout << "remote:    leased from control-plane job " << s.remote_job_id() << "\n";
     if (!s.last_error().empty()) std::cout << "error:     " << s.last_error() << "\n";
     for (const auto& a : s.output_artifacts()) std::cout << "output:    " << a << "\n";
 }
 
 int cmd_submit(Client& cl, std::vector<std::string> a) {
     v1::SubmitJobRequest req;
+    req.set_remote(g_remote);
     auto* spec = req.mutable_spec();
     std::size_t i = 0;
     auto val = [&](const std::string& flag) -> std::string {
@@ -160,6 +170,7 @@ int cmd_status(Client& cl, const std::vector<std::string>& a) {
 
 int cmd_list(Client& cl, const std::vector<std::string>& a) {
     v1::ListJobsRequest req;
+    req.set_remote(g_remote);
     bool json = false;
     for (std::size_t i = 0; i < a.size(); ++i) {
         if (a[i] == "--json") json = true;
@@ -186,6 +197,7 @@ int cmd_cancel(Client& cl, const std::vector<std::string>& a) {
     if (a.empty()) throw UsageError("cancel needs JOB_ID");
     v1::CancelJobRequest req;
     req.set_job_id(a[0]);
+    req.set_remote(g_remote);
     cl.call(v1::CTL_CANCEL, req, v1::CTL_ACK);
     std::cout << "cancel requested: " << a[0] << "\n";
     return 0;
@@ -278,6 +290,12 @@ int main(int argc, char** argv) {
     }
     std::string cmd = args[0];
     args.erase(args.begin());
+    if (cmd == "submit" || cmd == "status" || cmd == "list" || cmd == "cancel" || cmd == "wait") {
+        // --remote anywhere before "--" (after it, it belongs to the job's argv).
+        for (auto it = args.begin(); it != args.end() && *it != "--"; ++it) {
+            if (*it == "--remote") { g_remote = true; args.erase(it); break; }
+        }
+    }
     try {
         if (cmd == "pki") return tdrctl::run_pki(args);
         if (cmd == "cp") return tdrctl::run_cp(args);

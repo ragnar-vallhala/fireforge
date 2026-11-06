@@ -109,7 +109,10 @@ std::expected<Config, std::string> config_from_ini(const IniFile& ini) {
     const std::map<std::string, std::map<std::string, Setter>> schema = {
         {"control", {{"address", str(c.control.address)},
                      {"port", num(c.control.port)},
-                     {"scheme", str(c.control.scheme)}}},
+                     {"scheme", str(c.control.scheme)},
+                     {"remote_jobs", str(c.control.remote_jobs)},
+                     {"lease_poll", num(c.control.lease_poll)},
+                     {"lease_poll_idle", num(c.control.lease_poll_idle)}}},
         {"node", {{"name", str(c.node.name)}, {"advertise_address", str(c.node.advertise_address)}}},
         {"network", {{"listen_address", str(c.network.listen_address)},
                      {"listen_port", num(c.network.listen_port)},

@@ -74,4 +74,6 @@ message JobStatus {
   int64 updated_unix_ms = 9;
   double progress_fraction = 10;   // last WORKER_PROGRESS, 0..1
   string progress_message = 11;
+  string node_id = 12;             // central jobs: executing node (Phase 4)
+  string remote_job_id = 13;       // local copy of a leased job: the central job id
 }

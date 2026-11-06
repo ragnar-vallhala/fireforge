@@ -1,10 +1,10 @@
 // PgRepository: IRepository on PostgreSQL (docs/design/phase2.md §4-§6).
-#include <google/protobuf/util/json_util.h>
-
 #include <limits>
 #include <string>
 
+#include "jobs.hpp"
 #include "pg.hpp"
+#include "util.hpp"
 #include "tdr/common/common.hpp"
 #include "tdr/cpdb/db.hpp"
 
@@ -18,21 +18,10 @@ using pg::transact;
 
 // ---- conversions ------------------------------------------------------------
 
-std::string to_json(const google::protobuf::Message& m) {
-    google::protobuf::util::JsonPrintOptions o;
-    o.preserve_proto_field_names = true;
-    std::string out;
-    auto st = google::protobuf::util::MessageToJsonString(m, &out, o);
-    if (!st.ok()) throw DbError("proto to json: " + std::string(st.message()));
-    return out;
-}
-
-void from_json(const std::string& s, google::protobuf::Message* m) {
-    google::protobuf::util::JsonParseOptions o;
-    o.ignore_unknown_fields = true;
-    auto st = google::protobuf::util::JsonStringToMessage(s, m, o);
-    if (!st.ok()) throw DbError("stored json does not parse: " + std::string(st.message()));
-}
+using detail::clamp_limit;
+using detail::from_json;
+using detail::short_id;
+using detail::to_json;
 
 // Repeated fields are stored as plain JSON arrays: serialize them through a
 // carrier message ({"addresses": [...]}) and keep only the array.
@@ -46,11 +35,7 @@ std::string addresses_json(const google::protobuf::RepeatedPtrField<cv1::NodeAdd
 }
 
 std::string capabilities_json(const google::protobuf::RepeatedPtrField<std::string>& caps) {
-    cv1::RegisterRequest carrier;
-    *carrier.mutable_capabilities() = caps;
-    std::string s = to_json(carrier);  // {"capabilities":[...]} or {}
-    auto b = s.find('['), e = s.rfind(']');
-    return b == std::string::npos ? "[]" : s.substr(b, e - b + 1);
+    return detail::string_array_json(caps);
 }
 
 std::string health_name(cv1::NodeHealth h) { return cv1::NodeHealth_Name(h); }
@@ -69,13 +54,6 @@ cv1::CampaignState parse_state(const Result& r, int row, int col) {
 }
 
 std::string json_or_empty_object(const std::string& s) { return s.empty() ? "{}" : s; }
-
-std::string short_id(std::string_view prefix) { return std::string(prefix) + new_secret().substr(0, 16); }
-
-std::int64_t clamp_limit(std::size_t n) {
-    constexpr auto max = static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
-    return static_cast<std::int64_t>(n > max ? max : n);
-}
 
 // SQL fragments. $n is a unix-ms bigint parameter.
 #define TS(n) "to_timestamp($" #n "::bigint / 1000.0)"
@@ -150,7 +128,7 @@ cv1::Campaign campaign_from(const Result& r, int row) {
 
 class PgRepository final : public IRepository {
 public:
-    explicit PgRepository(const std::string& conninfo) : c_(conninfo) { pg::migrate(c_); }
+    explicit PgRepository(const std::string& conninfo) : c_(conninfo), jobs_(c_) { pg::migrate(c_); }
 
     cv1::NodeInfo register_node(const cv1::RegisterRequest& req, const std::string& cert_fingerprint,
                                 std::int64_t now_ms) override {
@@ -358,6 +336,40 @@ public:
         });
     }
 
+    // ---- jobs (jobs.cpp) ------------------------------------------------------
+
+    std::expected<cv1::Job, std::string> create_job(const tv1::JobSpec& spec, const std::string& submitted_by,
+                                                    std::int64_t now_ms) override {
+        return jobs_.create_job(spec, submitted_by, now_ms);
+    }
+    std::optional<cv1::Job> get_job(const std::string& job_id, bool with_attempts) override {
+        return jobs_.get_job(job_id, with_attempts);
+    }
+    std::vector<cv1::Job> list_jobs(tv1::JobState state, const std::string& campaign_id, std::size_t limit) override {
+        return jobs_.list_jobs(state, campaign_id, limit);
+    }
+    CancelOutcome cancel_job(const std::string& job_id, const std::string& reason, std::int64_t now_ms) override {
+        return jobs_.cancel_job(job_id, reason, now_ms);
+    }
+    std::vector<cv1::Lease> lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl_ms, std::int64_t now_ms) override {
+        return jobs_.lease_jobs(req, ttl_ms, now_ms);
+    }
+    UpdateOutcome update_job(const std::string& job_id, const std::string& node_id, const cv1::JobUpdate& update,
+                             std::int64_t now_ms) override {
+        return jobs_.update_job(job_id, node_id, update, now_ms);
+    }
+    std::vector<cv1::LeaseRef> renew_leases(const std::string& node_id, const std::vector<cv1::LeaseRef>& leases,
+                                            std::int64_t ttl_ms, std::int64_t now_ms) override {
+        return jobs_.renew_leases(node_id, leases, ttl_ms, now_ms);
+    }
+    std::vector<ExpiredLease> expire_leases(std::int64_t now_ms) override { return jobs_.expire_leases(now_ms); }
+    bool announce_artifacts(const cv1::ArtifactAnnouncement& a, std::int64_t now_ms) override {
+        return jobs_.announce_artifacts(a, now_ms);
+    }
+    std::optional<cv1::ArtifactInfo> get_artifact(const std::string& artifact_id) override {
+        return jobs_.get_artifact(artifact_id);
+    }
+
     void audit(const std::string& actor, const std::string& action, const std::string& target,
                const std::string& details_json, std::int64_t now_ms) override {
         transact(c_, [&] {
@@ -401,6 +413,7 @@ private:
     }
 
     Conn c_;
+    JobStore jobs_;
 };
 
 #undef TS

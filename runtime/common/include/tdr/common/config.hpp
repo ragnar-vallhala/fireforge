@@ -26,6 +26,9 @@ struct Config {
         std::string address;          // empty = standalone (Phase 1)
         std::uint16_t port = 8080;
         std::string scheme = "https";
+        std::string remote_jobs = "on";   // Phase 4: "on" | "off" — lease jobs from the control plane
+        std::uint32_t lease_poll = 2;     // seconds between lease requests while leases keep coming
+        std::uint32_t lease_poll_idle = 10;  // seconds after an empty lease reply
     } control;
 
     struct Node {
@@ -73,6 +76,7 @@ struct Config {
     std::filesystem::path ctl_socket() const { return run_dir() / "ctl.sock"; }
     std::filesystem::path worker_socket() const { return run_dir() / "worker.sock"; }
     std::filesystem::path policy_cache() const { return paths.state_dir / "state" / "policy.json"; }
+    std::filesystem::path remote_state() const { return paths.state_dir / "state" / "remote.json"; }
 };
 
 // Unknown sections/keys are an error (catches typos). Missing keys keep defaults.

@@ -89,6 +89,43 @@ struct Rig {
             return http::Response{200, "not json"};
         });
 
+        // ---- Phase 4 routes ----
+        router.add("POST", "/api/v1/jobs", [this](http::Request& r) {
+            seen.push_back("submit " + r.body);
+            return http::Response{201, R"({"job_id": "job-1", "state": "QUEUED"})"};
+        });
+        router.add("GET", "/api/v1/jobs", [this](http::Request& r) {
+            std::string q;
+            for (const auto& [k, v] : r.query) q += k + "=" + v + ";";
+            seen.push_back("list_jobs " + q);
+            return http::Response{200, R"({"jobs": [{"job_id": "job-1"}, {"job_id": "job-2"}]})"};
+        });
+        router.add("GET", "/api/v1/jobs/{id}", [this](http::Request& r) {
+            seen.push_back("get " + r.params.at("id"));
+            if (r.params.at("id") != "job-1") return http::error_response(404, "not_found", "no such job");
+            return http::Response{200, R"({"job_id": "job-1", "state": "RUNNING"})"};
+        });
+        router.add("POST", "/api/v1/jobs/{id}/cancel", [this](http::Request& r) {
+            seen.push_back("cancel " + r.params.at("id") + " " + r.body);
+            return http::Response{200, R"({"job_id": "job-1", "cancel_requested": true})"};
+        });
+        router.add("POST", "/api/v1/jobs/{id}/status", [this](http::Request& r) {
+            seen.push_back("status " + r.params.at("id"));
+            if (r.body.find("att-old") != std::string::npos) return http::error_response(409, "stale", "stale attempt");
+            return http::Response{200, R"({"job_id": "job-1", "state": "COMPLETED"})"};
+        });
+        router.add("POST", "/api/v1/leases", [this](http::Request& r) {
+            seen.push_back("lease " + r.body);
+            return http::Response{200, R"({"leases": [{"job_id": "job-1", "attempt_id": "att-1",
+                "fencing_token": "1", "attempt_number": 1, "spec": {"command": {"argv": ["true"]}}}],
+                "lease_ttl_seconds": 60})"};
+        });
+        router.add("POST", "/api/v1/artifacts/announce", [this](http::Request& r) {
+            seen.push_back("announce " + r.body);
+            if (r.body.find("bad") != std::string::npos) return http::error_response(400, "bad_request", "bad id");
+            return http::Response{200, "{}"};
+        });
+
         http::ServerOptions so;
         so.listen_address = "127.0.0.1";
         so.port = 0;
@@ -185,6 +222,95 @@ BOOST_AUTO_TEST_CASE(round_trips_and_errors) {
     BOOST_TEST(off->error().http_status == 200);
     BOOST_TEST(off->error().message.starts_with("bad response"));
     BOOST_TEST(rig.seen.back() == R"(offline ff-node-00000000000000aa {"reason":"shutdown"})");
+}
+
+BOOST_AUTO_TEST_CASE(phase4_calls) {
+    Rig rig;
+    namespace tv1 = ::fireforge::tdr::v1;
+
+    std::optional<Result<cv1::Job>> job;
+    cv1::CreateJobRequest cr;
+    cr.mutable_spec()->mutable_command()->add_argv("true");
+    rig.client->submit_job(cr, [&](Result<cv1::Job> r) { job = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return job.has_value(); }));
+    BOOST_REQUIRE(job->has_value());
+    BOOST_TEST((*job)->job_id() == "job-1");
+    BOOST_TEST((*job)->state() == tv1::QUEUED);
+    BOOST_TEST(rig.seen.back() == R"(submit {"spec":{"command":{"argv":["true"]}}})");
+
+    job.reset();
+    rig.client->get_job("job-1", [&](Result<cv1::Job> r) { job = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return job.has_value(); }));
+    BOOST_REQUIRE(job->has_value());
+    BOOST_TEST((*job)->state() == tv1::RUNNING);
+
+    job.reset();
+    rig.client->get_job("nope", [&](Result<cv1::Job> r) { job = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return job.has_value(); }));
+    BOOST_REQUIRE(!job->has_value());
+    BOOST_TEST(job->error().http_status == 404);
+    BOOST_TEST(job->error().message == "no such job");
+
+    std::optional<Result<cv1::JobList>> list;
+    rig.client->list_jobs(tv1::RUNNING, "camp 1&x", 5, [&](Result<cv1::JobList> r) { list = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return list.has_value(); }));
+    BOOST_REQUIRE(list->has_value());
+    BOOST_TEST((*list)->jobs_size() == 2);
+    BOOST_TEST(rig.seen.back() == "list_jobs campaign=camp 1&x;limit=5;state=RUNNING;");  // encoded + decoded
+    list.reset();
+    rig.client->list_jobs(tv1::JOB_STATE_UNSPECIFIED, "", 0, [&](Result<cv1::JobList> r) { list = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return list.has_value(); }));
+    BOOST_TEST(rig.seen.back() == "list_jobs ");
+
+    job.reset();
+    rig.client->cancel_job("job-1", "user", [&](Result<cv1::Job> r) { job = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return job.has_value(); }));
+    BOOST_REQUIRE(job->has_value());
+    BOOST_TEST((*job)->cancel_requested());
+    BOOST_TEST(rig.seen.back() == R"(cancel job-1 {"reason":"user"})");
+
+    std::optional<Result<cv1::LeaseReply>> lease;
+    cv1::LeaseRequest lr;
+    lr.set_node_id("ff-node-00000000000000aa");
+    lr.set_max_jobs(2);
+    rig.client->lease(lr, [&](Result<cv1::LeaseReply> r) { lease = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return lease.has_value(); }));
+    BOOST_REQUIRE(lease->has_value());
+    BOOST_REQUIRE((*lease)->leases_size() == 1);
+    BOOST_TEST((*lease)->leases(0).fencing_token() == 1u);
+    BOOST_TEST((*lease)->leases(0).spec().command().argv(0) == "true");
+    BOOST_TEST((*lease)->lease_ttl_seconds() == 60u);
+
+    job.reset();
+    cv1::JobUpdate up;
+    up.set_attempt_id("att-old");
+    up.set_state(tv1::COMPLETED);
+    rig.client->update_job("job-1", up, [&](Result<cv1::Job> r) { job = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return job.has_value(); }));
+    BOOST_REQUIRE(!job->has_value());
+    BOOST_TEST(job->error().http_status == 409);
+    job.reset();
+    up.set_attempt_id("att-1");
+    rig.client->update_job("job-1", up, [&](Result<cv1::Job> r) { job = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return job.has_value(); }));
+    BOOST_REQUIRE(job->has_value());
+    BOOST_TEST(rig.seen.back() == "status job-1");
+
+    std::optional<Result<void>> ann;
+    cv1::ArtifactAnnouncement a;
+    a.set_node_id("n");
+    a.add_artifacts()->set_artifact_id("artifact://sha256/00");
+    a.set_full(true);
+    rig.client->announce_artifacts(a, [&](Result<void> r) { ann = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return ann.has_value(); }));
+    BOOST_TEST(ann->has_value());
+    ann.reset();
+    a.mutable_artifacts(0)->set_artifact_id("bad");
+    rig.client->announce_artifacts(a, [&](Result<void> r) { ann = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return ann.has_value(); }));
+    BOOST_REQUIRE(!ann->has_value());
+    BOOST_TEST(ann->error().http_status == 400);
+    BOOST_TEST(ann->error().message == "bad id");
 }
 
 BOOST_AUTO_TEST_CASE(transport_error_has_status_zero) {

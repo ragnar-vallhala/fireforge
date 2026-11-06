@@ -6,6 +6,7 @@
 #include <format>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@
 namespace tdr::cpapi::testing {
 
 namespace cv1 = ::fireforge::control::v1;
+namespace tv1 = ::fireforge::tdr::v1;
 
 class FakeRepository : public cpdb::IRepository {
 public:
@@ -188,6 +190,244 @@ public:
         return true;
     }
 
+
+    // ---- jobs (simplified mirror of the Postgres semantics) -----------------------
+
+    std::map<std::string, cv1::Job> jobs;                 // by job_id
+    std::vector<std::string> job_order;                   // creation order
+    // (artifact_id, node_id) -> ref
+    std::map<std::pair<std::string, std::string>, cv1::ArtifactRef> locations;
+    std::vector<cv1::ArtifactAnnouncement> announcements;
+
+    std::expected<cv1::Job, std::string> create_job(const tv1::JobSpec& in, const std::string& by,
+                                                    std::int64_t now) override {
+        maybe_fail();
+        tv1::JobSpec spec = in;
+        if (spec.job_id().empty()) spec.set_job_id(std::format("job-{:016x}", ++counter_));
+        if (jobs.contains(spec.job_id())) return std::unexpected("job id already exists");
+        if (!spec.campaign_id().empty() && !campaigns.contains(spec.campaign_id()))
+            return std::unexpected("unknown campaign");
+        cv1::Job j;
+        j.set_job_id(spec.job_id());
+        j.set_state(tv1::QUEUED);
+        *j.mutable_spec() = spec;
+        j.set_submitted_by(by);
+        j.set_created_unix_ms(now);
+        j.set_updated_unix_ms(now);
+        jobs[j.job_id()] = j;
+        job_order.push_back(j.job_id());
+        return j;
+    }
+
+    std::optional<cv1::Job> get_job(const std::string& id, bool with_attempts) override {
+        maybe_fail();
+        auto it = jobs.find(id);
+        if (it == jobs.end()) return std::nullopt;
+        cv1::Job j = it->second;
+        if (!with_attempts) j.clear_attempts();
+        return j;
+    }
+
+    std::vector<cv1::Job> list_jobs(tv1::JobState s, const std::string& campaign, std::size_t limit) override {
+        maybe_fail();
+        std::vector<cv1::Job> out;
+        for (auto it = job_order.rbegin(); it != job_order.rend() && out.size() < limit; ++it) {
+            auto j = jobs.at(*it);
+            if (s != tv1::JOB_STATE_UNSPECIFIED && j.state() != s) continue;
+            if (!campaign.empty() && j.spec().campaign_id() != campaign) continue;
+            j.clear_attempts();
+            out.push_back(j);
+        }
+        return out;
+    }
+
+    cpdb::CancelOutcome cancel_job(const std::string& id, const std::string& reason, std::int64_t now) override {
+        maybe_fail();
+        cpdb::CancelOutcome out;
+        auto it = jobs.find(id);
+        if (it == jobs.end()) return out;
+        auto& j = it->second;
+        const auto st = j.state();
+        if (terminal(st)) out.result = cpdb::CancelResult::kTerminal;
+        else if (st == tv1::LEASED || st == tv1::RUNNING) out.result = cpdb::CancelResult::kRequested;
+        else {
+            out.result = cpdb::CancelResult::kCancelled;
+            j.set_state(tv1::CANCELLED);
+        }
+        if (out.result != cpdb::CancelResult::kTerminal) {
+            j.set_cancel_requested(true);
+            j.set_last_error(reason);
+            j.set_updated_unix_ms(now);
+        }
+        out.job = j;
+        out.job->clear_attempts();
+        return out;
+    }
+
+    std::vector<cv1::Lease> lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl, std::int64_t now) override {
+        maybe_fail();
+        last_lease_request = req;
+        std::vector<cv1::Lease> out;
+        auto nit = nodes.find(req.node_id());
+        if (nit == nodes.end() || nit->second.health() != cv1::ONLINE) return out;
+        std::uint64_t cpu = req.free().cpu_cores(), mem = req.free().memory_bytes(), gpu = req.free().gpu_count();
+        for (const auto& id : job_order) {
+            if (out.size() >= req.max_jobs()) break;
+            auto& j = jobs.at(id);
+            if (j.state() != tv1::QUEUED) continue;
+            const auto& r = j.spec().resources();
+            const std::uint64_t jc = std::max<std::uint32_t>(r.cpu_cores(), 1);
+            if (jc > cpu || r.memory_bytes() > mem || r.gpu_count() > gpu) continue;
+            cpu -= jc;
+            mem -= r.memory_bytes();
+            gpu -= r.gpu_count();
+            const auto number = j.attempts_used() + 1;
+            auto* a = j.add_attempts();
+            a->set_attempt_id(std::format("att-{:016x}", ++counter_));
+            a->set_number(number);
+            a->set_fencing_token(number);
+            a->set_node_id(req.node_id());
+            a->set_state("LEASED");
+            a->set_leased_unix_ms(now);
+            a->set_expires_unix_ms(now + ttl);
+            j.set_state(tv1::LEASED);
+            j.set_attempts_used(number);
+            j.set_current_attempt_id(a->attempt_id());
+            j.set_node_id(req.node_id());
+            cv1::Lease l;
+            l.set_job_id(id);
+            l.set_attempt_id(a->attempt_id());
+            l.set_fencing_token(number);
+            l.set_attempt_number(number);
+            *l.mutable_spec() = j.spec();
+            l.set_expires_unix_ms(now + ttl);
+            out.push_back(l);
+        }
+        return out;
+    }
+
+    cpdb::UpdateOutcome update_job(const std::string& id, const std::string& node_id, const cv1::JobUpdate& u,
+                                   std::int64_t now) override {
+        maybe_fail();
+        cpdb::UpdateOutcome out;
+        auto it = jobs.find(id);
+        if (it == jobs.end()) return out;
+        auto& j = it->second;
+        static const std::set<tv1::JobState> ok = {tv1::RUNNING,   tv1::COMPLETED, tv1::FAILED,
+                                                   tv1::CANCELLED, tv1::EXPIRED,   tv1::VALIDATION_FAILED};
+        if (!ok.contains(u.state())) {
+            out.result = cpdb::UpdateResult::kInvalid;
+            out.message = "bad state";
+            return out;
+        }
+        cv1::JobAttempt* cur = current(j);
+        if ((j.state() != tv1::LEASED && j.state() != tv1::RUNNING) || !cur || cur->attempt_id() != u.attempt_id() ||
+            cur->fencing_token() != u.fencing_token() || cur->node_id() != node_id) {
+            out.result = cpdb::UpdateResult::kStale;
+            out.message = "not the current attempt";
+            return out;
+        }
+        j.set_updated_unix_ms(now);
+        switch (u.state()) {
+            case tv1::RUNNING:
+                j.set_state(tv1::RUNNING);
+                cur->set_state("RUNNING");
+                j.set_progress_fraction(u.progress_fraction());
+                j.set_progress_message(u.progress_message());
+                break;
+            case tv1::COMPLETED:
+                j.set_state(tv1::COMPLETED);
+                cur->set_state("SUCCEEDED");
+                *j.mutable_outputs() = u.outputs();
+                for (const auto& o : u.outputs()) locations[{o.artifact_id(), node_id}] = o;
+                break;
+            case tv1::FAILED: {
+                cur->set_state("FAILED");
+                const bool retry = u.retryable() && j.attempts_used() < j.spec().policy().max_attempts() &&
+                                   !j.cancel_requested();
+                j.set_state(retry ? tv1::QUEUED : tv1::FAILED);
+                j.set_last_error(u.error());
+                break;
+            }
+            case tv1::CANCELLED:
+                cur->set_state("CANCELLED");
+                j.set_state(tv1::CANCELLED);
+                break;
+            default:
+                cur->set_state("FAILED");
+                j.set_state(u.state());
+                j.set_last_error(u.error());
+                break;
+        }
+        out.result = cpdb::UpdateResult::kOk;
+        out.job = j;
+        out.job->clear_attempts();
+        return out;
+    }
+
+    std::vector<cv1::LeaseRef> renew_leases(const std::string& node_id, const std::vector<cv1::LeaseRef>& leases,
+                                            std::int64_t ttl, std::int64_t now) override {
+        maybe_fail();
+        std::vector<cv1::LeaseRef> revoked;
+        for (const auto& l : leases) {
+            auto it = jobs.find(l.job_id());
+            cv1::JobAttempt* cur = it == jobs.end() ? nullptr : current(it->second);
+            if (!cur || cur->attempt_id() != l.attempt_id() || cur->fencing_token() != l.fencing_token() ||
+                cur->node_id() != node_id || it->second.cancel_requested() ||
+                (it->second.state() != tv1::LEASED && it->second.state() != tv1::RUNNING)) {
+                revoked.push_back(l);
+                continue;
+            }
+            cur->set_expires_unix_ms(now + ttl);
+        }
+        return revoked;
+    }
+
+    std::vector<cpdb::ExpiredLease> expire_leases(std::int64_t now) override {
+        maybe_fail();
+        ++expire_calls;
+        std::vector<cpdb::ExpiredLease> out;
+        for (const auto& id : job_order) {
+            auto& j = jobs.at(id);
+            if (j.state() != tv1::LEASED && j.state() != tv1::RUNNING) continue;
+            auto* cur = current(j);
+            if (!cur || cur->expires_unix_ms() >= now) continue;
+            cur->set_state("ABANDONED");
+            cpdb::ExpiredLease e{id, cur->attempt_id(), cur->node_id(), tv1::FAILED};
+            if (j.cancel_requested()) e.new_state = tv1::CANCELLED;
+            else if (j.attempts_used() < j.spec().policy().max_attempts()) e.new_state = tv1::QUEUED;
+            j.set_state(e.new_state);
+            j.set_last_error("lease expired");
+            out.push_back(e);
+        }
+        return out;
+    }
+
+    bool announce_artifacts(const cv1::ArtifactAnnouncement& a, std::int64_t) override {
+        maybe_fail();
+        if (!nodes.contains(a.node_id())) return false;
+        announcements.push_back(a);
+        for (const auto& x : a.artifacts()) locations[{x.artifact_id(), a.node_id()}] = x;
+        return true;
+    }
+
+    std::optional<cv1::ArtifactInfo> get_artifact(const std::string& id) override {
+        maybe_fail();
+        std::optional<cv1::ArtifactInfo> out;
+        for (const auto& [key, ref] : locations) {
+            if (key.first != id) continue;
+            if (!out) {
+                out.emplace();
+                *out->mutable_artifact() = ref;
+            }
+            out->add_node_ids(key.second);
+        }
+        return out;
+    }
+
+    cv1::LeaseRequest last_lease_request;
+    int expire_calls = 0;
+
     void audit(const std::string& actor, const std::string& action, const std::string& target,
                const std::string& details, std::int64_t now) override {
         maybe_fail();
@@ -212,6 +452,15 @@ public:
     std::size_t event_count(const std::string& id) { return events_[id].size(); }
 
 private:
+    static bool terminal(tv1::JobState s) {
+        return s == tv1::COMPLETED || s == tv1::FAILED || s == tv1::CANCELLED || s == tv1::EXPIRED ||
+               s == tv1::VALIDATION_FAILED;
+    }
+    static cv1::JobAttempt* current(cv1::Job& j) {
+        for (auto& a : *j.mutable_attempts())
+            if (a.attempt_id() == j.current_attempt_id()) return &a;
+        return nullptr;
+    }
     void maybe_fail() {
         if (fail_all) throw cpdb::DbError("ERROR: relation \"nodes\" secret-sql-detail", "42P01");
     }

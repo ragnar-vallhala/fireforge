@@ -286,6 +286,7 @@ struct NodeAgent::Impl : std::enable_shared_from_this<Impl> {
         set_interval(r->heartbeat_interval_seconds() ? r->heartbeat_interval_seconds() : 10);
         schedule_heartbeat(interval);
         refresh_peers_now();
+        if (hooks.on_registered) hooks.on_registered(node_id);
     }
 
     // ---- heartbeat -------------------------------------------------------------
@@ -327,6 +328,10 @@ struct NodeAgent::Impl : std::enable_shared_from_this<Impl> {
             backoff = 0ms;
             set_interval(r->heartbeat_interval_seconds());
             schedule_heartbeat(interval);
+            if (r->revoked_size() > 0 && hooks.on_revoked) {
+                const std::vector<cv1::LeaseRef> revoked(r->revoked().begin(), r->revoked().end());
+                hooks.on_revoked(revoked);
+            }
             return;
         }
         last_error = describe(r.error());
@@ -397,6 +402,7 @@ void NodeAgent::refresh_peers() {
     if (!impl_->stopped && !impl_->node_id.empty()) impl_->refresh_peers_now();
 }
 void NodeAgent::stop(std::function<void()> done) { impl_->stop(std::move(done)); }
+IControlClient& NodeAgent::client() { return impl_->client; }
 
 ControlState NodeAgent::state() const { return impl_->state; }
 const std::string& NodeAgent::node_id() const { return impl_->node_id; }

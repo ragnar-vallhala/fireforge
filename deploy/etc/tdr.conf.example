@@ -6,6 +6,10 @@
 address =
 port = 8080
 scheme = https
+# Phase 4: run jobs leased from the control plane (on|off), and how often to ask (seconds).
+remote_jobs = on
+lease_poll = 2
+lease_poll_idle = 10
 
 [node]
 # Default: hostname

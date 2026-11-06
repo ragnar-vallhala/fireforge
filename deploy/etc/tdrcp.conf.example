@@ -21,5 +21,13 @@ heartbeat_interval = 10
 stale_after = 30
 offline_after = 90
 
+[jobs]
+# Central job queue (docs/design/phase4.md §3). Seconds. Leases are renewed
+# by heartbeats; keep lease_ttl >= 3 x heartbeat_interval. For lease_ttl after
+# tdrcp starts nothing expires, so nodes can renew after an outage.
+#lease_ttl = 60
+# Used when a submitted job leaves policy.max_attempts at 0.
+#max_attempts_default = 3
+
 [log]
 level = info

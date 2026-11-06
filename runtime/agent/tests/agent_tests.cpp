@@ -71,6 +71,25 @@ public:
         enqueue(off, std::move(cb));
     }
 
+    // Phase 4 calls are not used by NodeAgent itself; answer them with an error.
+    void submit_job(const cv1::CreateJobRequest&, std::function<void(Result<cv1::Job>)> cb) override { unused(cb); }
+    void get_job(const std::string&, std::function<void(Result<cv1::Job>)> cb) override { unused(cb); }
+    void list_jobs(::fireforge::tdr::v1::JobState, const std::string&, std::uint32_t,
+                   std::function<void(Result<cv1::JobList>)> cb) override {
+        unused(cb);
+    }
+    void cancel_job(const std::string&, const std::string&, std::function<void(Result<cv1::Job>)> cb) override {
+        unused(cb);
+    }
+    void lease(const cv1::LeaseRequest&, std::function<void(Result<cv1::LeaseReply>)> cb) override { unused(cb); }
+    void update_job(const std::string&, const cv1::JobUpdate&, std::function<void(Result<cv1::Job>)> cb) override {
+        unused(cb);
+    }
+    void announce_artifacts(const cv1::ArtifactAnnouncement&, std::function<void(Result<void>)> cb) override {
+        unused(cb);
+    }
+    int unused_calls = 0;
+
     template <class T>
     void answer(Kind<T>& k, Result<T> r) {
         BOOST_REQUIRE(!k.pending.empty());
@@ -80,6 +99,11 @@ public:
     }
 
 private:
+    template <class T>
+    void unused(std::function<void(Result<T>)>& cb) {
+        ++unused_calls;
+        asio::post(io_, [cb = std::move(cb)] { cb(std::unexpected(ClientError{501, "not implemented"})); });
+    }
     template <class T>
     void enqueue(Kind<T>& k, std::function<void(Result<T>)> cb) {
         ++k.calls;
@@ -117,6 +141,9 @@ struct Fixture {
     FakeControlClient client{io};
     std::vector<Capacity> applied;
     std::function<void(cv1::Heartbeat&)> fill;
+    std::vector<std::string> registered;
+    std::vector<std::vector<cv1::LeaseRef>> revoked;
+    bool phase4_hooks = true;  // false = leave on_registered / on_revoked empty
     AgentOptions opts;
     std::unique_ptr<NodeAgent> agent;
     std::chrono::milliseconds saved_unit = detail::g_interval_unit;
@@ -146,6 +173,10 @@ struct Fixture {
         hooks.fill_stats = [this](cv1::Heartbeat& h) {
             if (fill) fill(h);
         };
+        if (phase4_hooks) {
+            hooks.on_registered = [this](const std::string& id) { registered.push_back(id); };
+            hooks.on_revoked = [this](const std::vector<cv1::LeaseRef>& r) { revoked.push_back(r); };
+        }
         agent = std::make_unique<NodeAgent>(io, client, opts, std::move(hooks));
     }
 
@@ -498,6 +529,59 @@ BOOST_FIXTURE_TEST_CASE(stop_before_registration_posts_done, Fixture) {
     client.answer(client.reg, Result<cv1::RegisterReply>(register_reply(policy(1, 0, 0, 0))));
     run_for(50ms);
     BOOST_TEST(agent->state() == ControlState::kRegistering);
+}
+
+BOOST_FIXTURE_TEST_CASE(on_registered_fires_on_register_and_re_register, Fixture) {
+    connect(policy(1, 0, 0, 0));
+    BOOST_REQUIRE(registered.size() == 1u);
+    BOOST_TEST(registered[0] == "ff-node-0000000000000001");
+    BOOST_TEST(&agent->client() == static_cast<IControlClient*>(&client));
+
+    BOOST_REQUIRE(run_until([&] { return !client.hb.pending.empty(); }));
+    client.answer(client.hb, fail<cv1::HeartbeatReply>(404, "unknown node"));
+    BOOST_REQUIRE(run_until([&] { return client.reg.calls == 2; }));
+    BOOST_TEST(registered.size() == 1u);
+    auto rr = register_reply(policy(1, 0, 0, 0));
+    rr.set_node_id("ff-node-0000000000000002");
+    client.answer(client.reg, Result<cv1::RegisterReply>(rr));
+    BOOST_REQUIRE(run_until([&] { return registered.size() == 2u; }));
+    BOOST_TEST(registered[1] == "ff-node-0000000000000002");
+    BOOST_TEST(agent->node_id() == "ff-node-0000000000000002");
+}
+
+BOOST_FIXTURE_TEST_CASE(on_revoked_receives_list, Fixture) {
+    connect(policy(1, 0, 0, 0));
+    BOOST_REQUIRE(run_until([&] { return !client.hb.pending.empty(); }));
+    client.answer(client.hb, Result<cv1::HeartbeatReply>(cv1::HeartbeatReply{}));  // empty: no call
+    BOOST_REQUIRE(run_until([&] { return !client.hb.pending.empty(); }));
+    BOOST_TEST(revoked.empty());
+
+    cv1::HeartbeatReply r;
+    auto* a = r.add_revoked();
+    a->set_job_id("job-1");
+    a->set_attempt_id("att-1");
+    a->set_fencing_token(2);
+    r.add_revoked()->set_job_id("job-2");
+    client.answer(client.hb, Result<cv1::HeartbeatReply>(r));
+    BOOST_REQUIRE(run_until([&] { return revoked.size() == 1u; }));
+    BOOST_REQUIRE(revoked[0].size() == 2u);
+    BOOST_TEST(revoked[0][0].job_id() == "job-1");
+    BOOST_TEST(revoked[0][0].attempt_id() == "att-1");
+    BOOST_TEST(revoked[0][0].fencing_token() == 2u);
+    BOOST_TEST(revoked[0][1].job_id() == "job-2");
+    BOOST_TEST(agent->state() == ControlState::kConnected);
+}
+
+BOOST_FIXTURE_TEST_CASE(phase4_hooks_optional, Fixture) {
+    phase4_hooks = false;
+    connect(policy(1, 0, 0, 0));
+    BOOST_REQUIRE(run_until([&] { return !client.hb.pending.empty(); }));
+    cv1::HeartbeatReply r;
+    r.add_revoked()->set_job_id("job-1");
+    client.answer(client.hb, Result<cv1::HeartbeatReply>(r));
+    BOOST_REQUIRE(run_until([&] { return client.heartbeats.size() == 2u; }));
+    BOOST_TEST(registered.empty());
+    BOOST_TEST(revoked.empty());
 }
 
 BOOST_FIXTURE_TEST_CASE(destroy_with_pending_callbacks_is_safe, Fixture) {

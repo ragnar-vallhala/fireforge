@@ -49,6 +49,7 @@ add_subdirectory(runtime/tls)
 add_subdirectory(runtime/http)
 add_subdirectory(runtime/agent)
 add_subdirectory(runtime/peer)
+add_subdirectory(runtime/remote)
 add_subdirectory(control/db)
 add_subdirectory(control/api)
 

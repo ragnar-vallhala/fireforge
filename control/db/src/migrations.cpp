@@ -12,7 +12,7 @@ namespace {
 // Arbitrary constant: pg_advisory_xact_lock key for "fireforge schema".
 constexpr std::int64_t kMigrationLock = 0x4646'5343'4845'4d41;  // "FFSCHEMA"
 
-constexpr std::array<std::string_view, 1> kMigrations = {
+constexpr std::array<std::string_view, 2> kMigrations = {
     // 1: initial control-plane schema
     R"sql(
 CREATE TABLE nodes (
@@ -78,6 +78,75 @@ CREATE TABLE audit_log (
     details jsonb NOT NULL DEFAULT '{}'
 );
 CREATE INDEX audit_log_at_idx ON audit_log (at DESC);
+)sql",
+    // 2: central job queue, leases, artifact locations (docs/design/phase4.md §2-§4)
+    R"sql(
+CREATE TABLE jobs (
+    seq                   bigserial NOT NULL UNIQUE,
+    job_id                text PRIMARY KEY,
+    state                 text NOT NULL CHECK (state IN ('QUEUED', 'LEASED', 'RUNNING', 'RETRY_PENDING', 'COMPLETED',
+                                                         'FAILED', 'CANCELLED', 'EXPIRED', 'VALIDATION_FAILED')),
+    spec                  bytea NOT NULL,                -- serialized fireforge.tdr.v1.JobSpec
+    campaign_id           text REFERENCES campaigns (campaign_id),
+    cpu_cores             bigint NOT NULL DEFAULT 1 CHECK (cpu_cores >= 1),  -- max(1, spec)
+    memory_bytes          numeric(20, 0) NOT NULL DEFAULT 0 CHECK (memory_bytes >= 0),
+    gpu_count             bigint NOT NULL DEFAULT 0 CHECK (gpu_count >= 0),
+    required_capabilities jsonb NOT NULL DEFAULT '[]',
+    input_artifacts       jsonb NOT NULL DEFAULT '[]',
+    max_attempts          int NOT NULL CHECK (max_attempts >= 1),
+    attempts_used         int NOT NULL DEFAULT 0 CHECK (attempts_used >= 0),
+    current_attempt_id    text,
+    node_id               text,
+    cancel_requested      boolean NOT NULL DEFAULT false,
+    submitted_by          text NOT NULL DEFAULT '',
+    last_error            text NOT NULL DEFAULT '',
+    progress_fraction     double precision NOT NULL DEFAULT 0,
+    progress_message      text NOT NULL DEFAULT '',
+    outputs               jsonb NOT NULL DEFAULT '[]',   -- [ArtifactRef] (proto3 JSON)
+    created_at            timestamptz NOT NULL,
+    updated_at            timestamptz NOT NULL
+);
+CREATE INDEX jobs_queue_idx ON jobs (created_at, seq) WHERE state = 'QUEUED';
+CREATE INDEX jobs_state_idx ON jobs (state, created_at DESC);
+CREATE INDEX jobs_campaign_idx ON jobs (campaign_id, created_at DESC);
+CREATE INDEX jobs_created_idx ON jobs (created_at DESC, seq DESC);
+CREATE INDEX jobs_current_attempt_idx ON jobs (current_attempt_id);
+CREATE INDEX jobs_node_idx ON jobs (node_id) WHERE state IN ('LEASED', 'RUNNING');
+
+CREATE TABLE job_attempts (
+    attempt_id    text PRIMARY KEY,
+    job_id        text NOT NULL REFERENCES jobs (job_id) ON DELETE CASCADE,
+    number        int NOT NULL CHECK (number >= 1),
+    fencing_token bigint NOT NULL,
+    node_id       text NOT NULL,
+    state         text NOT NULL CHECK (state IN ('LEASED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'ABANDONED')),
+    error         text NOT NULL DEFAULT '',
+    leased_at     timestamptz NOT NULL,
+    expires_at    timestamptz NOT NULL,
+    ended_at      timestamptz,
+    UNIQUE (job_id, number)
+);
+CREATE INDEX job_attempts_live_idx ON job_attempts (expires_at) WHERE state IN ('LEASED', 'RUNNING');
+
+CREATE TABLE artifact_locations (
+    artifact_id  text NOT NULL,
+    node_id      text NOT NULL REFERENCES nodes (node_id) ON DELETE CASCADE,
+    size         numeric(20, 0) NOT NULL DEFAULT 0,
+    media_type   text NOT NULL DEFAULT '',
+    producer_job text NOT NULL DEFAULT '',
+    created_at   timestamptz NOT NULL,
+    seen_at      timestamptz NOT NULL,       -- last announcement / commit
+    sync_id      text NOT NULL DEFAULT '',   -- full sync that last listed it ('' = incremental)
+    PRIMARY KEY (artifact_id, node_id)
+);
+CREATE INDEX artifact_locations_node_idx ON artifact_locations (node_id);
+
+-- Full artifact sync in progress per node (ArtifactAnnouncement.sync_id).
+CREATE TABLE artifact_syncs (
+    node_id    text PRIMARY KEY REFERENCES nodes (node_id) ON DELETE CASCADE,
+    sync_id    text NOT NULL,
+    started_at timestamptz NOT NULL
+);
 )sql",
 };
 

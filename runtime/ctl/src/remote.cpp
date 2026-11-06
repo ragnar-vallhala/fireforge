@@ -18,6 +18,7 @@
 #include <google/protobuf/util/json_util.h>
 
 #include "fireforge/control/v1/control.pb.h"
+#include "fireforge/tdr/v1/job.pb.h"
 #include "tdr/http/http.hpp"
 #include "tdr/tls/tls.hpp"
 
@@ -180,6 +181,13 @@ constexpr const char* kCpUsage = R"(usage: tdrctl cp [--url URL] [--ca F] [--cer
   campaign-create NAME [--domain D] [--description TEXT] [--params JSON]
   campaign-set ID [--state S] [--description TEXT] [--params JSON]
   audit [--limit N]
+  jobs [--state S] [--campaign ID] [--limit N]     central job queue (Phase 4)
+  job ID                                           job with all attempts
+  job-cancel ID [--reason TEXT]
+  job-submit [--cpus N] [--memory-mb N] [--timeout S] [--attempts N] [--operation OP]
+             [--params JSON] [--input ARTIFACT]... [--env KEY=VALUE]... [--campaign ID]
+             [--material ID] [--capability C]... -- argv...
+  artifact ID                                      which nodes hold an artifact
 
 connection: --url/--ca/--cert/--key, else $TDR_CP_URL, $TDR_CP_CA, $TDR_CP_CERT, $TDR_CP_KEY
             (an admin certificate: tdrctl pki issue DIR --role admin NAME)
@@ -289,6 +297,43 @@ void print_campaign(const cv1::Campaign& c) {
               << "updated:     " << fmt_time(c.updated_unix_ms()) << "\n";
 }
 
+std::string short_spec(const ::fireforge::tdr::v1::JobSpec& s) {
+    std::string what = s.operation();
+    if (what.empty() && s.command().argv_size()) what = s.command().argv(0);
+    return what;
+}
+
+void print_jobs(const cv1::JobList& l) {
+    std::cout << std::format("{:<26} {:<18} {:>8} {:<26} {:<20} {}\n", "JOB_ID", "STATE", "ATTEMPTS", "NODE", "UPDATED",
+                             "OPERATION/COMMAND");
+    for (const auto& j : l.jobs())
+        std::cout << std::format("{:<26} {:<18} {:>8} {:<26} {:<20} {}\n", j.job_id(),
+                                 ::fireforge::tdr::v1::JobState_Name(j.state()),
+                                 std::format("{}/{}", j.attempts_used(), j.spec().policy().max_attempts()),
+                                 j.node_id().empty() ? "-" : j.node_id(), fmt_time(j.updated_unix_ms()),
+                                 short_spec(j.spec()));
+}
+
+void print_job(const cv1::Job& j) {
+    std::cout << "job:        " << j.job_id() << "\n"
+              << "state:      " << ::fireforge::tdr::v1::JobState_Name(j.state())
+              << (j.cancel_requested() ? " (cancel requested)" : "") << "\n"
+              << "attempts:   " << j.attempts_used() << "/" << j.spec().policy().max_attempts() << "\n"
+              << "submitted:  " << fmt_time(j.created_unix_ms()) << " by " << j.submitted_by() << "\n";
+    if (!j.spec().campaign_id().empty()) std::cout << "campaign:   " << j.spec().campaign_id() << "\n";
+    std::cout << "command:    ";
+    for (int i = 0; i < j.spec().command().argv_size(); ++i) std::cout << (i ? " " : "") << j.spec().command().argv(i);
+    std::cout << "\n";
+    if (!j.node_id().empty()) std::cout << "node:       " << j.node_id() << "\n";
+    if (j.progress_fraction() > 0 || !j.progress_message().empty())
+        std::cout << "progress:   " << static_cast<int>(j.progress_fraction() * 100) << "% " << j.progress_message() << "\n";
+    if (!j.last_error().empty()) std::cout << "error:      " << j.last_error() << "\n";
+    for (const auto& o : j.outputs()) std::cout << "output:     " << o.artifact_id() << " (" << o.size() << " bytes)\n";
+    for (const auto& at : j.attempts())
+        std::cout << std::format("attempt {}:  {} on {} {}{}\n", at.number(), at.state(), at.node_id(),
+                                 fmt_time(at.leased_unix_ms()), at.error().empty() ? "" : " — " + at.error());
+}
+
 cv1::CampaignState parse_campaign_state(const std::string& s) {
     cv1::CampaignState st{};
     if (!cv1::CampaignState_Parse(s, &st) || st == cv1::CAMPAIGN_STATE_UNSPECIFIED)
@@ -296,10 +341,17 @@ cv1::CampaignState parse_campaign_state(const std::string& s) {
     return st;
 }
 
-int cp(const std::vector<std::string>& in) {
+int cp(const std::vector<std::string>& all_args) {
+    // job-submit: everything after "--" is the job's argv.
+    std::vector<std::string> in = all_args, job_argv;
+    if (auto dd = std::find(in.begin(), in.end(), "--"); dd != in.end()) {
+        job_argv.assign(dd + 1, in.end());
+        in.erase(dd, in.end());
+    }
     auto a = parse(in, {"--url", "--ca", "--cert", "--key", "--health", "--profile", "--cpus", "--memory-mb", "--jobs",
                         "--disk-mb", "--gpus", "--reason", "--limit", "--state", "--domain", "--description",
-                        "--params"});
+                        "--params", "--campaign", "--timeout", "--attempts", "--operation", "--input", "--env",
+                        "--material", "--capability"});
     if (a.positional.empty()) throw UsageError(std::string("cp needs a command\n") + kCpUsage);
     const std::string cmd = a.positional[0];
     auto need_arg = [&](const char* what) -> const std::string& {
@@ -396,6 +448,62 @@ int cp(const std::vector<std::string>& in) {
             for (const auto& e : l.entries())
                 std::cout << fmt_time(e.at_unix_ms()) << "  " << e.actor() << "  " << e.action() << "  " << e.target()
                           << "  " << e.details_json() << "\n";
+        });
+    }
+    if (cmd == "jobs") {
+        std::string t = "/api/v1/jobs";
+        std::string sep = "?";
+        if (auto s = a.get("--state")) { t += sep + "state=" + *s; sep = "&"; }
+        if (auto s = a.get("--campaign")) { t += sep + "campaign=" + *s; sep = "&"; }
+        if (auto l = a.get("--limit")) t += sep + "limit=" + std::to_string(to_u64("--limit", *l));
+        auto l = c.get<cv1::JobList>("GET", t);
+        return out(l, [&] { print_jobs(l); });
+    }
+    if (cmd == "job") {
+        auto j = c.get<cv1::Job>("GET", "/api/v1/jobs/" + need_arg("ID"));
+        return out(j, [&] { print_job(j); });
+    }
+    if (cmd == "job-cancel") {
+        cv1::CancelRequest req;
+        req.set_reason(a.get("--reason").value_or(""));
+        auto j = c.get<cv1::Job>("POST", "/api/v1/jobs/" + need_arg("ID") + "/cancel", to_json(req, false));
+        return out(j, [&] { print_job(j); });
+    }
+    if (cmd == "job-submit") {
+        cv1::CreateJobRequest req;
+        auto* spec = req.mutable_spec();
+        if (auto v = a.get("--cpus")) spec->mutable_resources()->set_cpu_cores(static_cast<std::uint32_t>(to_u64("--cpus", *v)));
+        if (auto v = a.get("--memory-mb")) spec->mutable_resources()->set_memory_bytes(to_u64("--memory-mb", *v) * kMiB);
+        if (auto v = a.get("--timeout")) spec->mutable_policy()->set_timeout_seconds(to_u64("--timeout", *v));
+        if (auto v = a.get("--attempts")) spec->mutable_policy()->set_max_attempts(static_cast<std::uint32_t>(to_u64("--attempts", *v)));
+        if (auto v = a.get("--operation")) spec->set_operation(*v);
+        if (auto v = a.get("--params")) spec->set_parameters_json(*v);
+        if (auto v = a.get("--campaign")) spec->set_campaign_id(*v);
+        if (auto v = a.get("--material")) spec->set_material_id(*v);
+        for (const auto& v : a.all("--input")) spec->add_input_artifacts(v);
+        for (const auto& v : a.all("--capability")) spec->add_required_capabilities(v);
+        for (const auto& kv : a.all("--env")) {
+            auto eq = kv.find('=');
+            if (eq == std::string::npos || eq == 0) throw UsageError("--env needs KEY=VALUE");
+            (*spec->mutable_command()->mutable_env())[kv.substr(0, eq)] = kv.substr(eq + 1);
+        }
+        for (const auto& v : job_argv) spec->mutable_command()->add_argv(v);
+        if (job_argv.empty()) throw UsageError("cp job-submit needs a command after --");
+        auto j = c.get<cv1::Job>("POST", "/api/v1/jobs", to_json(req, false));
+        if (json) std::cout << to_json(j) << "\n";
+        else std::cout << j.job_id() << "\n";
+        return 0;
+    }
+    if (cmd == "artifact") {
+        auto id = need_arg("ID");
+        constexpr std::string_view kPrefix = "artifact://sha256/";
+        std::string hex = id.starts_with(kPrefix) ? id.substr(kPrefix.size()) : id;
+        auto info = c.get<cv1::ArtifactInfo>("GET", "/api/v1/artifacts/sha256/" + hex);
+        return out(info, [&] {
+            std::cout << "artifact:   " << info.artifact().artifact_id() << "\n"
+                      << "size:       " << info.artifact().size() << " bytes\n";
+            if (!info.artifact().media_type().empty()) std::cout << "media type: " << info.artifact().media_type() << "\n";
+            for (const auto& n : info.node_ids()) std::cout << "on node:    " << n << "\n";
         });
     }
     throw UsageError("unknown cp command: " + cmd + "\n" + kCpUsage);

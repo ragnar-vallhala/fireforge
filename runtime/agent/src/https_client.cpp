@@ -4,6 +4,7 @@
 #include <google/protobuf/util/json_util.h>
 
 #include <format>
+#include <string_view>
 
 #include "tdr/agent/agent.hpp"
 
@@ -48,6 +49,31 @@ Result<Reply> decode(const std::expected<http::ClientResponse, std::string>& r) 
     return reply;
 }
 
+// Percent-encodes everything except RFC 3986 unreserved characters.
+std::string url_encode(std::string_view in) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+            c == '_' || c == '~') {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0xF];
+        }
+    }
+    return out;
+}
+
+Result<void> decode_void(const std::expected<http::ClientResponse, std::string>& r) {
+    // Reuse the error mapping; the 2xx body (normally "{}") is ignored.
+    if (!r) return std::unexpected(ClientError{0, r.error()});
+    if (r->status >= 200 && r->status < 300) return {};
+    return std::unexpected(decode<cv1::ApiError>(r).error());  // non-2xx: always an error
+}
+
 class HttpsControlClient final : public IControlClient {
 public:
     HttpsControlClient(boost::asio::io_context& io, std::shared_ptr<boost::asio::ssl::context> ctx,
@@ -67,7 +93,51 @@ public:
                  std::function<void(Result<cv1::NodeInfo>)> cb) override {
         cv1::OfflineRequest req;
         req.set_reason(reason);
-        call<cv1::NodeInfo>("POST", "/api/v1/nodes/" + node_id + "/offline", to_json(req), std::move(cb));
+        call<cv1::NodeInfo>("POST", "/api/v1/nodes/" + url_encode(node_id) + "/offline", to_json(req), std::move(cb));
+    }
+
+    void submit_job(const cv1::CreateJobRequest& req, std::function<void(Result<cv1::Job>)> cb) override {
+        call<cv1::Job>("POST", "/api/v1/jobs", to_json(req), std::move(cb));
+    }
+    void get_job(const std::string& job_id, std::function<void(Result<cv1::Job>)> cb) override {
+        call<cv1::Job>("GET", "/api/v1/jobs/" + url_encode(job_id), {}, std::move(cb));
+    }
+    void list_jobs(::fireforge::tdr::v1::JobState state, const std::string& campaign_id, std::uint32_t limit,
+                   std::function<void(Result<cv1::JobList>)> cb) override {
+        std::string target = "/api/v1/jobs";
+        char sep = '?';
+        auto add = [&](std::string_view key, const std::string& value) {
+            target += sep;
+            target += key;
+            target += '=';
+            target += url_encode(value);
+            sep = '&';
+        };
+        if (state != ::fireforge::tdr::v1::JOB_STATE_UNSPECIFIED) {
+            add("state", ::fireforge::tdr::v1::JobState_Name(state));
+        }
+        if (!campaign_id.empty()) add("campaign", campaign_id);
+        if (limit > 0) add("limit", std::to_string(limit));
+        call<cv1::JobList>("GET", target, {}, std::move(cb));
+    }
+    void cancel_job(const std::string& job_id, const std::string& reason,
+                    std::function<void(Result<cv1::Job>)> cb) override {
+        cv1::CancelRequest req;
+        req.set_reason(reason);
+        call<cv1::Job>("POST", "/api/v1/jobs/" + url_encode(job_id) + "/cancel", to_json(req), std::move(cb));
+    }
+    void lease(const cv1::LeaseRequest& req, std::function<void(Result<cv1::LeaseReply>)> cb) override {
+        call<cv1::LeaseReply>("POST", "/api/v1/leases", to_json(req), std::move(cb));
+    }
+    void update_job(const std::string& job_id, const cv1::JobUpdate& update,
+                    std::function<void(Result<cv1::Job>)> cb) override {
+        call<cv1::Job>("POST", "/api/v1/jobs/" + url_encode(job_id) + "/status", to_json(update), std::move(cb));
+    }
+    void announce_artifacts(const cv1::ArtifactAnnouncement& a, std::function<void(Result<void>)> cb) override {
+        client_.request("POST", "/api/v1/artifacts/announce", to_json(a),
+                        [cb = std::move(cb)](std::expected<http::ClientResponse, std::string> r) {
+                            cb(decode_void(r));
+                        });
     }
 
 private:

@@ -84,6 +84,29 @@ std::optional<std::string> check_parameters_json(const std::string& s) {
     return std::nullopt;
 }
 
+
+namespace tv1 = ::fireforge::tdr::v1;
+
+// [A-Za-z0-9._-]{1,100}
+bool valid_job_id(const std::string& id) {
+    if (id.empty() || id.size() > 100) return false;
+    return std::all_of(id.begin(), id.end(),
+                       [](unsigned char c) { return std::isalnum(c) || c == '.' || c == '_' || c == '-'; });
+}
+
+bool valid_sha256_hex(std::string_view h) {
+    return h.size() == 64 && std::all_of(h.begin(), h.end(), [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+constexpr std::string_view kArtifactPrefix = "artifact://sha256/";
+
+// "artifact://sha256/<64 lowercase hex>"
+bool valid_artifact_id(const std::string& id) {
+    return id.starts_with(kArtifactPrefix) && valid_sha256_hex(std::string_view(id).substr(kArtifactPrefix.size()));
+}
+
 }  // namespace
 
 struct ControlApi::Impl {
@@ -91,10 +114,12 @@ struct ControlApi::Impl {
     ApiOptions options;
     std::function<std::int64_t()> clock;
     http::Router router;
+    std::int64_t started_ms = 0;  // lease-expiry grace starts here (phase4.md §3)
 
     Impl(cpdb::IRepository& r, ApiOptions o, std::function<std::int64_t()> c)
         : repo(r), options(o), clock(std::move(c)) {
         if (!clock) clock = [] { return unix_ms(); };
+        started_ms = clock();
         auto add = [this](const char* method, const char* pattern, Response (Impl::*fn)(Request&)) {
             router.add(method, pattern, [this, fn](Request& req) { return (this->*fn)(req); });
         };
@@ -110,12 +135,34 @@ struct ControlApi::Impl {
         add("GET", "/api/v1/campaigns", &Impl::list_campaigns);
         add("GET", "/api/v1/campaigns/{id}", &Impl::get_campaign);
         add("PATCH", "/api/v1/campaigns/{id}", &Impl::patch_campaign);
+        add("POST", "/api/v1/jobs", &Impl::create_job);
+        add("GET", "/api/v1/jobs", &Impl::list_jobs);
+        add("GET", "/api/v1/jobs/{id}", &Impl::get_job);
+        add("POST", "/api/v1/jobs/{id}/cancel", &Impl::cancel_job);
+        add("POST", "/api/v1/jobs/{id}/status", &Impl::job_status);
+        add("POST", "/api/v1/leases", &Impl::lease);
+        add("POST", "/api/v1/artifacts/announce", &Impl::announce);
+        add("GET", "/api/v1/artifacts/sha256/{hex}", &Impl::get_artifact);
         add("GET", "/api/v1/audit", &Impl::audit);
     }
+
+    std::int64_t ttl_ms() const { return std::int64_t{options.lease_ttl_seconds} * 1000; }
 
     static Response node_not_found(const std::string& id) { return error_response(404, "not_found", "unknown node " + id); }
     static Response campaign_not_found(const std::string& id) {
         return error_response(404, "not_found", "unknown campaign " + id);
+    }
+    static Response job_not_found(const std::string& id) { return error_response(404, "not_found", "unknown job " + id); }
+
+    // The caller's node when node_id names it (mirrors the heartbeat check).
+    std::expected<cv1::NodeInfo, Response> own_node(const Request& r, const std::string& node_id) {
+        if (node_id.empty()) return std::unexpected(error_response(400, "bad_request", "node_id is required"));
+        auto node = repo.get_node(node_id);
+        if (!node) return std::unexpected(node_not_found(node_id));
+        if (node->name() != r.peer->name)
+            return std::unexpected(
+                error_response(403, "forbidden", std::format("node {} does not belong to {}", node_id, r.peer->name)));
+        return *node;
     }
 
     Response healthz(Request&) {
@@ -164,6 +211,13 @@ struct ControlApi::Impl {
         if (node->policy().version() != hb.policy_version()) *out.mutable_policy() = node->policy();
         out.set_heartbeat_interval_seconds(options.heartbeat_interval_seconds);
         out.set_server_time_unix_ms(now);
+        if (!hb.leases().empty()) {
+            const std::vector<cv1::LeaseRef> held(hb.leases().begin(), hb.leases().end());
+            for (auto& rv : repo.renew_leases(hb.node_id(), held, ttl_ms(), now)) {
+                log_info("node {} lease of job {} attempt {} revoked", node->name(), rv.job_id(), rv.attempt_id());
+                *out.add_revoked() = std::move(rv);
+            }
+        }
         return reply(out);
     }
 
@@ -343,6 +397,166 @@ struct ControlApi::Impl {
         return reply(*fresh);
     }
 
+    // ---- jobs (phase4.md §2, §6) ------------------------------------------------
+
+    Response create_job(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        cv1::CreateJobRequest req;
+        if (auto e = parse_body(r, req)) return *e;
+        tv1::JobSpec spec = req.spec();
+        if (spec.command().argv().empty() || spec.command().argv(0).empty())
+            return error_response(400, "bad_request", "spec.command.argv must not be empty");
+        if (!spec.job_id().empty() && !valid_job_id(spec.job_id()))
+            return error_response(400, "bad_request", "job_id must be 1-100 characters of [A-Za-z0-9._-]");
+        for (const auto& a : spec.input_artifacts())
+            if (!valid_artifact_id(a))
+                return error_response(400, "bad_request",
+                                      std::format("input artifact '{}' is not artifact://sha256/<64 hex>", a));
+        if (!spec.campaign_id().empty() && !repo.get_campaign(spec.campaign_id()))
+            return error_response(400, "bad_request", "unknown campaign " + spec.campaign_id());
+        if (spec.policy().max_attempts() == 0) spec.mutable_policy()->set_max_attempts(options.max_attempts_default);
+
+        const auto actor = actor_of(*r.peer);
+        const auto now = clock();
+        auto job = repo.create_job(spec, actor, now);
+        if (!job) {
+            if (job.error() == "unknown campaign")
+                return error_response(400, "bad_request", "unknown campaign " + spec.campaign_id());
+            return error_response(409, "conflict", job.error());
+        }
+        boost::json::object details;
+        details["operation"] = spec.operation();
+        details["campaign_id"] = spec.campaign_id();
+        details["max_attempts"] = spec.policy().max_attempts();
+        repo.audit(actor, "job.submit", job->job_id(), boost::json::serialize(details), now);
+        log_info("{} submitted job {}{}{}", actor, job->job_id(), spec.campaign_id().empty() ? "" : " in campaign ",
+                 spec.campaign_id());
+        return reply(*job, 201);
+    }
+
+    Response list_jobs(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        tv1::JobState s = tv1::JOB_STATE_UNSPECIFIED;
+        if (auto it = r.query.find("state"); it != r.query.end() && !it->second.empty()) {
+            if (!tv1::JobState_Parse(upper(it->second), &s) || s == tv1::JOB_STATE_UNSPECIFIED)
+                return error_response(400, "bad_request", "unknown job state '" + it->second + "'");
+        }
+        std::string campaign;
+        if (auto it = r.query.find("campaign"); it != r.query.end()) campaign = it->second;
+        auto limit = parse_limit(r, 100, 1000);
+        if (!limit) return limit.error();
+        cv1::JobList out;
+        for (auto& j : repo.list_jobs(s, campaign, *limit)) *out.add_jobs() = std::move(j);
+        return reply(out);
+    }
+
+    Response get_job(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        auto job = repo.get_job(r.params["id"], true);
+        if (!job) return job_not_found(r.params["id"]);
+        return reply(*job);
+    }
+
+    Response cancel_job(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        const auto& id = r.params["id"];
+        cv1::CancelRequest req;
+        if (auto e = parse_body(r, req)) return *e;
+        const auto actor = actor_of(*r.peer);
+        const auto now = clock();
+        const std::string reason = req.reason().empty() ? "cancelled by " + actor : req.reason();
+        auto out = repo.cancel_job(id, reason, now);
+        switch (out.result) {
+            case cpdb::CancelResult::kNotFound: return job_not_found(id);
+            case cpdb::CancelResult::kTerminal:
+                return error_response(409, "conflict",
+                                      std::format("job {} is already {}", id,
+                                                  out.job ? tv1::JobState_Name(out.job->state()) : "finished"));
+            case cpdb::CancelResult::kCancelled: log_info("{} cancelled job {}", actor, id); break;
+            case cpdb::CancelResult::kRequested:
+                log_info("{} requested cancel of job {} (running on {})", actor, id, out.job ? out.job->node_id() : "");
+                break;
+        }
+        repo.audit(actor, "job.cancel", id, to_json(req), now);
+        if (!out.job) return job_not_found(id);
+        return reply(*out.job);
+    }
+
+    Response job_status(Request& r) {
+        if (auto e = check_role(r, kNode)) return *e;
+        const auto& id = r.params["id"];
+        cv1::JobUpdate u;
+        if (auto e = parse_body(r, u)) return *e;
+        auto node = repo.find_node_by_name(r.peer->name);
+        if (!node) return error_response(403, "forbidden", "node " + r.peer->name + " is not registered");
+        if (u.attempt_id().empty()) return error_response(400, "bad_request", "attempt_id is required");
+        for (const auto& o : u.outputs())
+            if (!valid_artifact_id(o.artifact_id()))
+                return error_response(400, "bad_request",
+                                      std::format("output '{}' is not artifact://sha256/<64 hex>", o.artifact_id()));
+        auto out = repo.update_job(id, node->node_id(), u, clock());
+        switch (out.result) {
+            case cpdb::UpdateResult::kNotFound: return job_not_found(id);
+            case cpdb::UpdateResult::kInvalid: return error_response(400, "bad_request", out.message);
+            case cpdb::UpdateResult::kStale:
+                log_info("stale update for job {} from {} ({}): {}", id, node->name(), tv1::JobState_Name(u.state()),
+                         out.message);
+                return error_response(409, "stale", out.message);
+            case cpdb::UpdateResult::kOk: break;
+        }
+        if (!out.job) return job_not_found(id);
+        if (u.state() != tv1::RUNNING || out.job->state() != tv1::RUNNING)
+            log_info("job {} attempt {} on {}: {} -> job {}{}{}", id, u.attempt_id(), node->name(),
+                     tv1::JobState_Name(u.state()), tv1::JobState_Name(out.job->state()), u.error().empty() ? "" : ": ",
+                     u.error());
+        return reply(*out.job);
+    }
+
+    Response lease(Request& r) {
+        if (auto e = check_role(r, kNode)) return *e;
+        cv1::LeaseRequest req;
+        if (auto e = parse_body(r, req)) return *e;
+        auto node = own_node(r, req.node_id());
+        if (!node) return node.error();
+        cv1::LeaseReply out;
+        out.set_lease_ttl_seconds(options.lease_ttl_seconds);
+        for (auto& l : repo.lease_jobs(req, ttl_ms(), clock())) {
+            log_info("job {} attempt {} (#{}) leased to {}", l.job_id(), l.attempt_id(), l.attempt_number(),
+                     node->name());
+            *out.add_leases() = std::move(l);
+        }
+        return reply(out);
+    }
+
+    // ---- artifact locations (phase4.md §4) ------------------------------------------
+
+    Response announce(Request& r) {
+        if (auto e = check_role(r, kNode)) return *e;
+        cv1::ArtifactAnnouncement a;
+        if (auto e = parse_body(r, a)) return *e;
+        auto node = own_node(r, a.node_id());
+        if (!node) return node.error();
+        for (const auto& x : a.artifacts())
+            if (!valid_artifact_id(x.artifact_id()))
+                return error_response(400, "bad_request",
+                                      std::format("artifact '{}' is not artifact://sha256/<64 hex>", x.artifact_id()));
+        if (!repo.announce_artifacts(a, clock())) return node_not_found(a.node_id());
+        if (a.full())
+            log_info("node {} finished artifact sync {} ({} in last page)", node->name(), a.sync_id(),
+                     a.artifacts_size());
+        return Response{200, "{}", "application/json"};
+    }
+
+    Response get_artifact(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        const auto& hex = r.params["hex"];
+        if (!valid_sha256_hex(hex)) return error_response(400, "bad_request", "expected 64 lowercase hex characters");
+        const std::string id = std::string(kArtifactPrefix) + hex;
+        auto info = repo.get_artifact(id);
+        if (!info) return error_response(404, "not_found", "no node holds " + id);
+        return reply(*info);
+    }
+
     // ---- audit ----------------------------------------------------------------
 
     Response audit(Request& r) {
@@ -384,6 +598,17 @@ std::vector<cpdb::HealthChange> ControlApi::sweep() {
         log_info("node {} health {} -> {}{}{}", c.node_id, cv1::NodeHealth_Name(c.from), cv1::NodeHealth_Name(c.to),
                  c.reason.empty() ? "" : ": ", c.reason);
     return changes;
+}
+
+std::vector<cpdb::ExpiredLease> ControlApi::sweep_leases() {
+    const auto now = impl_->clock();
+    // Startup grace: give nodes a full lease_ttl to renew after a control-plane outage.
+    if (now - impl_->started_ms < impl_->ttl_ms()) return {};
+    auto expired = impl_->repo.expire_leases(now);
+    for (const auto& e : expired)
+        log_info("lease expired: job {} attempt {} on node {} -> {}", e.job_id, e.attempt_id, e.node_id,
+                 tv1::JobState_Name(e.new_state));
+    return expired;
 }
 
 }  // namespace tdr::cpapi

@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package fireforge.control.v1;
 
+import "fireforge/tdr/v1/job.proto";
+
 // ---- nodes ----------------------------------------------------------------
 
 message NodeAddress {
@@ -71,6 +73,7 @@ message Heartbeat {
   uint64 policy_version = 12;          // version the node has applied
   repeated NodeAddress addresses = 13; // may change (DHCP, Tailscale up/down)
   repeated PeerReachability peers = 14; // this node's view of its peer links (Phase 3)
+  repeated LeaseRef leases = 15;       // leases this node holds; renewed by this heartbeat (Phase 4)
 }
 
 // One peer as seen by the reporting node (docs/design/phase3.md §5).
@@ -90,6 +93,7 @@ message HeartbeatReply {
   ResourcePolicy policy = 1;           // set only when version != applied policy_version
   uint32 heartbeat_interval_seconds = 2;
   int64 server_time_unix_ms = 3;
+  repeated LeaseRef revoked = 4;       // leases from `leases` that are no longer valid: stop + discard
 }
 
 message NodeInfo {
@@ -169,6 +173,108 @@ message UpdateCampaignRequest {
 }
 
 message CampaignList { repeated Campaign campaigns = 1; }
+
+// ---- jobs and leases (docs/design/phase4.md) ----------------------------------
+//
+// Central job states reuse fireforge.tdr.v1.JobState:
+// QUEUED, LEASED, RUNNING, RETRY_PENDING, COMPLETED, FAILED, CANCELLED,
+// EXPIRED, VALIDATION_FAILED.
+
+message ArtifactRef {
+  string artifact_id = 1;          // "artifact://sha256/<64 hex>"
+  uint64 size = 2;
+  string media_type = 3;
+  string producer_job = 4;
+  int64 created_unix_ms = 5;
+}
+
+message JobAttempt {
+  string attempt_id = 1;           // "att-<16 hex>"
+  uint32 number = 2;               // 1-based
+  uint64 fencing_token = 3;        // == number (strictly increasing per job)
+  string node_id = 4;
+  string state = 5;                // "LEASED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED" | "ABANDONED"
+  string error = 6;
+  int64 leased_unix_ms = 7;
+  int64 expires_unix_ms = 8;
+  int64 ended_unix_ms = 9;
+}
+
+message Job {
+  string job_id = 1;               // "job-<16 hex>" unless the submitter chose one
+  fireforge.tdr.v1.JobState state = 2;
+  fireforge.tdr.v1.JobSpec spec = 3;  // spec.job_id == job_id
+  uint32 attempts_used = 4;
+  string current_attempt_id = 5;
+  string node_id = 6;              // node of the current/last attempt ("" if never leased)
+  string last_error = 7;
+  repeated ArtifactRef outputs = 8;
+  string submitted_by = 9;         // "<role>:<CN>"
+  bool cancel_requested = 10;
+  int64 created_unix_ms = 11;
+  int64 updated_unix_ms = 12;
+  double progress_fraction = 13;
+  string progress_message = 14;
+  repeated JobAttempt attempts = 15;  // filled by GET /jobs/{id} only, oldest first
+}
+
+message CreateJobRequest { fireforge.tdr.v1.JobSpec spec = 1; }
+message JobList { repeated Job jobs = 1; }
+message CancelRequest { string reason = 1; }
+
+// POST /jobs/{id}/status, sent by the lease holder. Fenced: attempt_id and
+// fencing_token must match the job's current attempt (else 409 "stale").
+message JobUpdate {
+  string attempt_id = 1;
+  uint64 fencing_token = 2;
+  fireforge.tdr.v1.JobState state = 3;  // RUNNING | COMPLETED | FAILED | CANCELLED | EXPIRED | VALIDATION_FAILED
+  string error = 4;
+  bool retryable = 5;              // FAILED only
+  repeated ArtifactRef outputs = 6;   // COMPLETED only
+  double progress_fraction = 7;    // RUNNING only (optional)
+  string progress_message = 8;
+}
+
+message LeaseRequest {
+  string node_id = 1;              // must be the caller
+  NodeResources free = 2;          // spare capacity right now (cpu_cores, memory_bytes, gpu_count)
+  uint32 max_jobs = 3;             // free job slots
+}
+
+message Lease {
+  string job_id = 1;
+  string attempt_id = 2;
+  uint64 fencing_token = 3;
+  uint32 attempt_number = 4;
+  fireforge.tdr.v1.JobSpec spec = 5;
+  int64 expires_unix_ms = 6;
+}
+
+message LeaseReply {
+  repeated Lease leases = 1;
+  uint32 lease_ttl_seconds = 2;
+}
+
+message LeaseRef {
+  string job_id = 1;
+  string attempt_id = 2;
+  uint64 fencing_token = 3;
+}
+
+// POST /artifacts/announce. A full sync is one or more pages with the same
+// sync_id; the page with full=true ends it and drops this node's rows not
+// seen in the sync. Incremental announcements leave sync_id empty.
+message ArtifactAnnouncement {
+  string node_id = 1;
+  repeated ArtifactRef artifacts = 2;
+  string sync_id = 3;
+  bool full = 4;
+}
+
+message ArtifactInfo {
+  ArtifactRef artifact = 1;
+  repeated string node_ids = 2;    // nodes holding a copy, by name order
+}
 
 // ---- audit / errors ---------------------------------------------------------
 

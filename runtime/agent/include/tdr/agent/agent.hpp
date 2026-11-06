@@ -45,6 +45,20 @@ public:
     virtual void list_nodes(std::function<void(Result<cv1::NodeList>)> cb) = 0;
     virtual void offline(const std::string& node_id, const std::string& reason,
                          std::function<void(Result<cv1::NodeInfo>)> cb) = 0;
+
+    // ---- Phase 4 (docs/design/phase4.md §6) ----
+    virtual void submit_job(const cv1::CreateJobRequest& req, std::function<void(Result<cv1::Job>)> cb) = 0;
+    virtual void get_job(const std::string& job_id, std::function<void(Result<cv1::Job>)> cb) = 0;
+    // state UNSPECIFIED / campaign "" = all; limit 0 = server default.
+    virtual void list_jobs(::fireforge::tdr::v1::JobState state, const std::string& campaign_id, std::uint32_t limit,
+                           std::function<void(Result<cv1::JobList>)> cb) = 0;
+    virtual void cancel_job(const std::string& job_id, const std::string& reason,
+                            std::function<void(Result<cv1::Job>)> cb) = 0;
+    virtual void lease(const cv1::LeaseRequest& req, std::function<void(Result<cv1::LeaseReply>)> cb) = 0;
+    // 409 -> ClientError{409, "stale..."}.
+    virtual void update_job(const std::string& job_id, const cv1::JobUpdate& update,
+                            std::function<void(Result<cv1::Job>)> cb) = 0;
+    virtual void announce_artifacts(const cv1::ArtifactAnnouncement& a, std::function<void(Result<void>)> cb) = 0;
 };
 
 // Over http::AsyncClient, proto3 JSON bodies; non-2xx -> ClientError{status, ApiError.message}.
@@ -95,6 +109,10 @@ struct AgentHooks {
     std::function<void(cv1::Heartbeat&)> fill_stats;
     // Called after every successful peer-directory refresh (Phase 3: PeerManager).
     std::function<void(const cv1::NodeList&)> on_directory;
+    // Phase 4: after every successful (re-)registration, with the node id.
+    std::function<void(const std::string& node_id)> on_registered;
+    // Phase 4: HeartbeatReply.revoked, when non-empty (fill_stats sets Heartbeat.leases).
+    std::function<void(const std::vector<cv1::LeaseRef>&)> on_revoked;
 };
 
 class NodeAgent {
@@ -110,6 +128,8 @@ public:
     // Best-effort POST /offline (bounded by offline_timeout), cancels timers,
     // then calls `done` (always, exactly once).
     void stop(std::function<void()> done);
+    // The typed client (tdrd forwards remote tdrctl requests through it).
+    IControlClient& client();
     // Fetch the peer directory now (no-op before registration or while a fetch
     // is in flight). Used when an unknown peer says hello (phase3.md §2).
     void refresh_peers();

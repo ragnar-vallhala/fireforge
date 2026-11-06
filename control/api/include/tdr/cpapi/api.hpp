@@ -23,6 +23,8 @@ struct ApiOptions {
     std::uint32_t heartbeat_interval_seconds = 10;
     std::uint32_t stale_after_seconds = 30;
     std::uint32_t offline_after_seconds = 90;
+    std::uint32_t lease_ttl_seconds = 60;      // phase4.md §3
+    std::uint32_t max_attempts_default = 3;    // when a submitted spec leaves it 0
 };
 
 // §8.3 presets. nullopt for an unknown profile name.
@@ -47,6 +49,9 @@ public:
 
     // Runs repo.sweep_health and logs changes. tdrcp calls this on a timer.
     std::vector<cpdb::HealthChange> sweep();
+    // Runs repo.expire_leases unless still within lease_ttl of construction
+    // (startup grace, phase4.md §3). Logs each expiry. tdrcp calls it with sweep().
+    std::vector<cpdb::ExpiredLease> sweep_leases();
 
     const ApiOptions& options() const;
 

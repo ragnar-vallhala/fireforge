@@ -77,6 +77,7 @@ std::expected<CpConfig, std::string> load(const fs::path& path) {
         {"health", {{"heartbeat_interval", num(c.api.heartbeat_interval_seconds)},
                     {"stale_after", num(c.api.stale_after_seconds)},
                     {"offline_after", num(c.api.offline_after_seconds)}}},
+        {"jobs", {{"lease_ttl", num(c.api.lease_ttl_seconds)}, {"max_attempts_default", num(c.api.max_attempts_default)}}},
         {"log", {{"level", str(c.log_level)}}},
     };
     for (const auto& [sec, keys] : ini->sections) {
@@ -99,6 +100,9 @@ std::expected<void, std::string> validate(const CpConfig& c) {
         return std::unexpected("health.stale_after must exceed heartbeat_interval");
     if (a.offline_after_seconds <= a.stale_after_seconds)
         return std::unexpected("health.offline_after must exceed stale_after");
+    if (a.lease_ttl_seconds <= a.heartbeat_interval_seconds)
+        return std::unexpected("jobs.lease_ttl must exceed health.heartbeat_interval");
+    if (a.max_attempts_default == 0) return std::unexpected("jobs.max_attempts_default must be >= 1");
     return {};
 }
 
@@ -109,6 +113,9 @@ int run(const CpConfig& cfg, const std::string& port_file) {
     tdr::log_info("database ready (schema version {})", tdr::cpdb::schema_version(cfg.conninfo));
 
     tdr::cpapi::ControlApi api(*repo, cfg.api, [] { return tdr::unix_ms(); });
+    if (cfg.api.lease_ttl_seconds < 3 * cfg.api.heartbeat_interval_seconds)
+        tdr::log_warn("jobs.lease_ttl {} s is less than 3 heartbeat intervals; leases may expire on a missed heartbeat",
+                      cfg.api.lease_ttl_seconds);
 
     auto ctx = tdr::tls::make_server_context(cfg.tls);
     tdr::http::ServerOptions sopts;
@@ -123,7 +130,7 @@ int run(const CpConfig& cfg, const std::string& port_file) {
         fs::rename(tmp, port_file);
     }
 
-    // Health sweep on the heartbeat interval. A database outage only logs;
+    // Health and lease-expiry sweeps on the heartbeat interval. A database outage only logs;
     // the next tick retries (the repository reconnects).
     asio::steady_timer sweep_timer(io);
     std::function<void()> arm = [&] {
@@ -134,6 +141,11 @@ int run(const CpConfig& cfg, const std::string& port_file) {
                 api.sweep();
             } catch (const std::exception& e) {
                 tdr::log_warn("health sweep failed: {}", e.what());
+            }
+            try {
+                api.sweep_leases();
+            } catch (const std::exception& e) {
+                tdr::log_warn("lease sweep failed: {}", e.what());
             }
             arm();
         });

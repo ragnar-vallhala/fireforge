@@ -3,7 +3,8 @@
 // Wiring only: config -> supervisor (first, it may move this process into a
 // cgroup) -> journal -> artifact store -> JobManager -> two Unix sockets
 // -> NodeAgent (only when [control] address is set; phase2.md §7)
-// -> peer listener + PeerManager, started on the first directory (phase3.md).
+// -> peer listener + PeerManager, started on the first directory (phase3.md)
+// -> RemoteExecutor: leases from the control plane run as local jobs (phase4.md).
 // Everything runs on one io_context thread.
 
 #include <csignal>
@@ -36,6 +37,7 @@
 #include "tdr/jobs/jobs.hpp"
 #include "tdr/journal/journal.hpp"
 #include "tdr/protocol/envelope.hpp"
+#include "tdr/remote/executor.hpp"
 #include "tdr/supervisor/supervisor.hpp"
 #include "tdr/tls/tls.hpp"
 
@@ -139,8 +141,9 @@ public:
         manager_->set_cancel_notifier([this](const std::string& attempt, const std::string& reason) {
             notify_cancel(attempt, reason);
         });
-        manager_->set_state_listener([](const std::string& job, v1::JobState s) {
+        manager_->set_state_listener([this](const std::string& job, v1::JobState s) {
             tdr::log_debug("job {} -> {}", job, tdr::jobs::to_string(s));
+            if (remote_) remote_->on_job_state(job, s);
         });
 
         worker_server_ = std::make_unique<tdr::ipc::UnixServer>(
@@ -179,6 +182,7 @@ public:
             stopping_ = true;
             tdr::log_info("signal {}: going offline, then shutting down (running jobs are recovered on next start)", sig);
             if (peers_) peers_->stop();
+            if (remote_) remote_->stop();
             signals.async_wait(on_signal);
             agent_->stop(finish);
         };
@@ -195,6 +199,7 @@ public:
         ctl_server_.reset();
         worker_server_.reset();
         peers_.reset();
+        remote_.reset();
         if (transport_) transport_->stop();
         transport_.reset();
         agent_.reset();
@@ -275,6 +280,29 @@ private:
         };
         hooks.fill_stats = [this](tdr::agent::cv1::Heartbeat& hb) { fill_heartbeat(hb); };
         hooks.on_directory = [this](const tdr::agent::cv1::NodeList& nodes) { on_directory(nodes); };
+        hooks.on_registered = [this](const std::string& node_id) {
+            if (remote_ && !stopping_) remote_->on_registered(node_id);
+        };
+        hooks.on_revoked = [this](const std::vector<tdr::agent::cv1::LeaseRef>& revoked) {
+            if (remote_) remote_->on_revoked(revoked);
+        };
+
+        if (cfg_.control.remote_jobs != "on" && cfg_.control.remote_jobs != "off")
+            throw std::runtime_error("control.remote_jobs must be on|off, got '" + cfg_.control.remote_jobs + "'");
+        tdr::remote::RemoteOptions ropts;
+        ropts.state_file = cfg_.remote_state();
+        ropts.enabled = cfg_.control.remote_jobs == "on";
+        ropts.poll_interval = std::chrono::seconds(std::max(1u, cfg_.control.lease_poll));
+        ropts.poll_idle = std::max(ropts.poll_interval, std::chrono::milliseconds(
+                                                             std::chrono::seconds(cfg_.control.lease_poll_idle)));
+        ropts.default_job_memory_bytes = res_.default_job_memory;
+        tdr::remote::RemoteHooks rhooks;
+        rhooks.connected = [this] { return agent_ && agent_->state() == tdr::agent::ControlState::kConnected; };
+        rhooks.list_local_artifacts = [this] { return local_artifacts(); };
+        rhooks.artifact_meta = [this](const std::string& id) { return artifact_ref(id); };
+        remote_ = std::make_unique<tdr::remote::RemoteExecutor>(io_, *control_client_, *manager_, std::move(ropts),
+                                                                std::move(rhooks));
+        remote_->start();  // after JobManager::recover(): reconciles leases with local jobs
 
         agent_ = std::make_unique<tdr::agent::NodeAgent>(io_, *control_client_, std::move(aopts), std::move(hooks));
         agent_->start();
@@ -366,7 +394,160 @@ private:
         return out;
     }
 
+    // ---- remote jobs (phase4.md) -------------------------------------------------
+    std::optional<tdr::agent::cv1::ArtifactRef> artifact_ref(const std::string& id) const {
+        auto row = journal_->get_artifact(id);
+        if (!row) {
+            auto p = store_->path_of(id);
+            if (!p) return std::nullopt;
+            tdr::agent::cv1::ArtifactRef r;
+            r.set_artifact_id(id);
+            std::error_code ec;
+            auto size = fs::file_size(*p, ec);
+            if (!ec) r.set_size(size);
+            return r;
+        }
+        tdr::agent::cv1::ArtifactRef r;
+        r.set_artifact_id(row->id);
+        r.set_size(row->size);
+        r.set_media_type(row->media_type);
+        r.set_producer_job(row->producer_job);
+        r.set_created_unix_ms(row->created_unix_ms);
+        return r;
+    }
+
+    // Everything in the local store: <root>/sha256/<2 hex>/<64 hex>.
+    std::vector<tdr::agent::cv1::ArtifactRef> local_artifacts() const {
+        std::vector<tdr::agent::cv1::ArtifactRef> out;
+        std::error_code ec;
+        for (fs::recursive_directory_iterator it(store_->root() / "sha256", ec), end; !ec && it != end; it.increment(ec)) {
+            if (!it->is_regular_file(ec)) continue;
+            auto id = tdr::artifacts::make_artifact_id(it->path().filename().string());
+            if (!tdr::artifacts::parse_artifact_id(id)) continue;
+            if (auto r = artifact_ref(id)) out.push_back(std::move(*r));
+        }
+        return out;
+    }
+
+    // Central job id of a local job that ran a lease. The executor knows live
+    // leases; finished ones are recognised by the "<central id>.a<N>" local id.
+    std::optional<std::string> central_of(const std::string& local_id) const {
+        if (remote_)
+            if (auto c = remote_->central_job_id(local_id)) return c;
+        if (!agent_) return std::nullopt;
+        auto dot = local_id.rfind(".a");
+        if (dot == std::string::npos || dot == 0 || dot + 2 >= local_id.size()) return std::nullopt;
+        for (auto i = dot + 2; i < local_id.size(); ++i)
+            if (local_id[i] < '0' || local_id[i] > '9') return std::nullopt;
+        return local_id.substr(0, dot);
+    }
+
+    // tdrctl --remote: forward to the control plane with this node's identity.
+    static v1::ErrorCode error_code_of(const tdr::agent::ClientError& e) {
+        switch (e.http_status) {
+            case 400: return v1::BAD_REQUEST;
+            case 403: return v1::UNAUTHORIZED;
+            case 404: return v1::NOT_FOUND;
+            case 409: return v1::CONFLICT;
+            default: return v1::INTERNAL;
+        }
+    }
+    static std::string error_text(const tdr::agent::ClientError& e) {
+        if (e.http_status == 0) return "control plane unreachable: " + e.message;
+        return e.message.empty() ? "control plane error " + std::to_string(e.http_status) : e.message;
+    }
+    static v1::JobStatus to_job_status(const tdr::agent::cv1::Job& j) {
+        v1::JobStatus st;
+        st.set_job_id(j.job_id());
+        st.set_state(j.state());
+        *st.mutable_spec() = j.spec();
+        st.set_attempts_used(j.attempts_used());
+        st.set_current_attempt_id(j.current_attempt_id());
+        st.set_last_error(j.last_error());
+        for (const auto& o : j.outputs()) st.add_output_artifacts(o.artifact_id());
+        st.set_created_unix_ms(j.created_unix_ms());
+        st.set_updated_unix_ms(j.updated_unix_ms());
+        st.set_progress_fraction(j.progress_fraction());
+        st.set_progress_message(j.progress_message());
+        st.set_node_id(j.node_id());
+        return st;
+    }
+
+    // Returns false (after replying with an error) when there is no control plane.
+    bool require_control(const std::shared_ptr<Connection>& c, const Frame& f) {
+        if (agent_) return true;
+        reply_error(c, f, v1::BAD_REQUEST, "no control plane configured ([control] address); remote jobs unavailable");
+        return false;
+    }
+
+    void on_remote_ctl(const std::shared_ptr<Connection>& c, Frame f) {
+        if (!require_control(c, f)) return;
+        auto req = std::make_shared<Frame>(std::move(f));
+        auto& client = agent_->client();
+        auto fail = [c, req](const tdr::agent::ClientError& e) { reply_error(c, *req, error_code_of(e), error_text(e)); };
+        switch (req->type()) {
+        case v1::CTL_SUBMIT: {
+            v1::SubmitJobRequest r;
+            if (!req->parse(r)) return reply_error(c, *req, v1::BAD_REQUEST, "bad SubmitJobRequest");
+            tdr::agent::cv1::CreateJobRequest cr;
+            *cr.mutable_spec() = r.spec();
+            client.submit_job(cr, [c, req, fail](tdr::agent::Result<tdr::agent::cv1::Job> res) {
+                if (!res) return fail(res.error());
+                v1::SubmitJobReply rep;
+                rep.set_job_id(res->job_id());
+                reply(c, *req, v1::CTL_SUBMIT_REPLY, rep);
+            });
+            return;
+        }
+        case v1::CTL_GET_JOB: {
+            v1::GetJobRequest r;
+            if (!req->parse(r)) return reply_error(c, *req, v1::BAD_REQUEST, "bad GetJobRequest");
+            client.get_job(r.job_id(), [c, req, fail](tdr::agent::Result<tdr::agent::cv1::Job> res) {
+                if (!res) return fail(res.error());
+                reply(c, *req, v1::CTL_JOB_INFO, to_job_status(*res));
+            });
+            return;
+        }
+        case v1::CTL_LIST_JOBS: {
+            v1::ListJobsRequest r;
+            if (!req->parse(r)) return reply_error(c, *req, v1::BAD_REQUEST, "bad ListJobsRequest");
+            client.list_jobs(r.state(), "", r.limit(), [c, req, fail](tdr::agent::Result<tdr::agent::cv1::JobList> res) {
+                if (!res) return fail(res.error());
+                v1::JobList list;
+                for (const auto& j : res->jobs()) *list.add_jobs() = to_job_status(j);
+                reply(c, *req, v1::CTL_JOB_LIST, list);
+            });
+            return;
+        }
+        case v1::CTL_CANCEL: {
+            v1::CancelJobRequest r;
+            if (!req->parse(r)) return reply_error(c, *req, v1::BAD_REQUEST, "bad CancelJobRequest");
+            client.cancel_job(r.job_id(), "cancelled via tdrctl on " + node_name(),
+                              [c, req, fail](tdr::agent::Result<tdr::agent::cv1::Job> res) {
+                if (!res) return fail(res.error());
+                reply(c, *req, v1::CTL_ACK, v1::Ack{});
+            });
+            return;
+        }
+        default:
+            return reply_error(c, *req, v1::UNSUPPORTED, "not a remote-capable request");
+        }
+    }
+
+    // Is this tdrctl request flagged `remote`? (Parsed twice; requests are tiny.)
+    static bool is_remote(const Frame& f) {
+        switch (f.type()) {
+            case v1::CTL_SUBMIT: { v1::SubmitJobRequest r; return f.parse(r) && r.remote(); }
+            case v1::CTL_GET_JOB: { v1::GetJobRequest r; return f.parse(r) && r.remote(); }
+            case v1::CTL_LIST_JOBS: { v1::ListJobsRequest r; return f.parse(r) && r.remote(); }
+            case v1::CTL_CANCEL: { v1::CancelJobRequest r; return f.parse(r) && r.remote(); }
+            default: return false;
+        }
+    }
+
     void fill_heartbeat(tdr::agent::cv1::Heartbeat& hb) {
+        if (remote_)
+            for (auto& l : remote_->active_leases()) *hb.add_leases() = std::move(l);
         if (peers_)
             for (auto& p : peers_->snapshot()) *hb.add_peers() = std::move(p);
         auto u = manager_->usage();
@@ -454,6 +635,7 @@ private:
 
     // ---- control socket ---------------------------------------------------
     void on_ctl_frame(const std::shared_ptr<Connection>& c, Frame f) {
+        if (is_remote(f)) return on_remote_ctl(c, std::move(f));
         switch (f.type()) {
         case v1::CTL_SUBMIT: {
             v1::SubmitJobRequest req;
@@ -469,13 +651,17 @@ private:
             if (!f.parse(req)) return reply_error(c, f, v1::BAD_REQUEST, "bad GetJobRequest");
             auto st = manager_->status(req.job_id());
             if (!st) return reply_error(c, f, v1::NOT_FOUND, "no such job: " + req.job_id());
+            if (auto central = central_of(req.job_id())) st->set_remote_job_id(*central);
             return reply(c, f, v1::CTL_JOB_INFO, *st);
         }
         case v1::CTL_LIST_JOBS: {
             v1::ListJobsRequest req;
             if (!f.parse(req)) return reply_error(c, f, v1::BAD_REQUEST, "bad ListJobsRequest");
             v1::JobList list;
-            for (auto& s : manager_->list(req.state(), req.limit() ? req.limit() : 100)) *list.add_jobs() = std::move(s);
+            for (auto& s : manager_->list(req.state(), req.limit() ? req.limit() : 100)) {
+                if (auto central = central_of(s.job_id())) s.set_remote_job_id(*central);
+                *list.add_jobs() = std::move(s);
+            }
             return reply(c, f, v1::CTL_JOB_LIST, list);
         }
         case v1::CTL_CANCEL: {
@@ -548,6 +734,7 @@ private:
     tdr::tls::Credentials peer_creds_;
     std::unique_ptr<tdr::peer::TlsTransport> transport_;
     std::unique_ptr<tdr::peer::PeerManager> peers_;
+    std::unique_ptr<tdr::remote::RemoteExecutor> remote_;
     std::string peer_self_id_;  // node id the PeerManager was created with
     bool stopping_ = false;
     std::unordered_map<std::uint64_t, std::string> attempt_by_conn_;
