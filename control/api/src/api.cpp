@@ -107,6 +107,32 @@ bool valid_artifact_id(const std::string& id) {
     return id.starts_with(kArtifactPrefix) && valid_sha256_hex(std::string_view(id).substr(kArtifactPrefix.size()));
 }
 
+// MPI rules (phase7.md §2); "" = valid. Mirrors the repository's workflow-step check.
+std::string check_mpi(const tv1::JobSpec& j, const cpdb::GangOptions& g) {
+    const auto& m = j.mpi();
+    if (m.ranks() == 0) {
+        if (m.max_ranks_per_node() != 0 || !m.mpirun_args().empty())
+            return "mpi.max_ranks_per_node and mpi.mpirun_args need mpi.ranks > 0";
+        return {};
+    }
+    if (m.ranks() > g.max_ranks) return std::format("mpi.ranks {} exceeds the maximum of {}", m.ranks(), g.max_ranks);
+    if (m.max_ranks_per_node() > 0) {
+        const std::uint64_t nodes = (std::uint64_t{m.ranks()} + m.max_ranks_per_node() - 1) / m.max_ranks_per_node();
+        if (nodes > g.max_nodes)
+            return std::format("mpi.ranks {} at {} per node needs {} nodes (at most {})", m.ranks(),
+                               m.max_ranks_per_node(), nodes, g.max_nodes);
+    }
+    if (!j.command().argv().empty()) {
+        const std::string& a0 = j.command().argv(0);
+        const auto slash = a0.rfind('/');
+        const std::string base = slash == std::string::npos ? a0 : a0.substr(slash + 1);
+        if (base == "mpirun" || base == "mpiexec" || base == "orterun" || base == "prterun")
+            return std::format("command.argv is the program every rank runs; it must not start with {} (TDR adds mpirun)",
+                               base);
+    }
+    return {};
+}
+
 }  // namespace
 
 struct ControlApi::Impl {
@@ -152,6 +178,7 @@ struct ControlApi::Impl {
         add("POST", "/api/v1/workflows/{id}/cancel", &Impl::cancel_workflow);
         add("GET", "/api/v1/audit", &Impl::audit);
         repo.set_workflow_limits(options.workflow_limits);
+        repo.set_gang_options(options.gangs);
     }
 
     std::int64_t ttl_ms() const { return std::int64_t{options.lease_ttl_seconds} * 1000; }
@@ -427,6 +454,7 @@ struct ControlApi::Impl {
             return error_response(400, "bad_request", "spec.command.argv must not be empty");
         if (!spec.job_id().empty() && !valid_job_id(spec.job_id()))
             return error_response(400, "bad_request", "job_id must be 1-100 characters of [A-Za-z0-9._-]");
+        if (auto e = check_mpi(spec, options.gangs); !e.empty()) return error_response(400, "bad_request", "spec." + e);
         for (const auto& a : spec.input_artifacts())
             if (!valid_artifact_id(a))
                 return error_response(400, "bad_request",
@@ -624,6 +652,9 @@ struct ControlApi::Impl {
         if (auto e = parse_body(r, req)) return *e;
         if (req.name().size() > 256) return error_response(400, "bad_request", "name must be at most 256 characters");
         apply_defaults(*req.mutable_steps());
+        for (const auto& s : req.steps())
+            if (auto e = check_mpi(s.job(), options.gangs); !e.empty())
+                return error_response(400, "bad_request", std::format("step {}: job.{}", s.name(), e));
         const auto actor = actor_of(*r.peer);
         const auto now = clock();
         auto w = repo.create_workflow(req, actor, now);

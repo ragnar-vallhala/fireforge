@@ -10,6 +10,10 @@ configurable ERROR), and can push WORKER_CANCEL::
         proc = d.run_worker("my_worker.py")
         assert proc.returncode == 0
         assert d.result.success
+
+Phase 7: ``run_worker(..., mpi_rank=1, mpi_size=4)`` (or ``mpi_env``)
+launches the worker as a simulated MPI rank; a non-root rank must leave
+``d.connections == 0``.
 """
 
 from __future__ import annotations
@@ -26,11 +30,37 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import _pb
+from . import _pb, mpi as _mpi
 from ._pb import local_pb2
 from .protocol import FrameReader, FrameWriter
 
 SDK_ROOT = Path(__file__).resolve().parent.parent  # directory containing the fireforge package
+
+_MPI_FLAVOURS = {
+    "ompi": ("OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"),
+    "pmi": ("PMI_RANK", "PMI_SIZE"),
+    "pmix": ("PMIX_RANK", None),
+}
+
+
+def mpi_env(rank: int, size: int | None = None, *, flavour: str = "ompi",
+            operation: str | None = None, params: Any = None) -> dict[str, str]:
+    """Env variables that make a worker see itself as MPI rank ``rank``.
+
+    ``flavour``: "ompi" (OMPI_COMM_WORLD_*), "pmi" (PMI_RANK/PMI_SIZE) or
+    "pmix" (PMIX_RANK only, no size). ``operation`` / ``params`` set
+    FIREFORGE_MPI_OPERATION / FIREFORGE_MPI_PARAMS (params JSON-encoded
+    unless a str).
+    """
+    rank_var, size_var = _MPI_FLAVOURS[flavour]
+    env = {rank_var: str(rank)}
+    if size_var is not None and size is not None:
+        env[size_var] = str(size)
+    if operation is not None:
+        env[_mpi.ENV_OPERATION] = operation
+    if params is not None:
+        env[_mpi.ENV_PARAMS] = params if isinstance(params, str) else json.dumps(params)
+    return env
 
 
 class FakeDaemon:
@@ -114,6 +144,7 @@ class FakeDaemon:
         self.checkpoint_files: list[bytes | None] = []
         self.cancel_sent = False
         self.errors: list[str] = []
+        self.connections = 0   # accepted worker connections
 
         self._lock = threading.Lock()
         self._result_event = threading.Event()
@@ -141,6 +172,9 @@ class FakeDaemon:
     def env(self, *, include_os_environ: bool = True, pythonpath: bool = True) -> dict[str, str]:
         """Environment for launching a worker against this fake daemon."""
         env = dict(os.environ) if include_os_environ else {}
+        # Don't let an outer MPI launcher leak in: the default is "not under MPI".
+        for k in (*_mpi.RANK_VARS, *_mpi.SIZE_VARS, _mpi.ENV_OPERATION, _mpi.ENV_PARAMS):
+            env.pop(k, None)
         env.update({
             "FIREFORGE_IPC_SOCKET": str(self.socket_path),
             "FIREFORGE_JOB_ID": self.job_id,
@@ -214,9 +248,17 @@ class FakeDaemon:
         return [sys.executable, str(script)]
 
     def run_worker(self, script: str | os.PathLike, timeout: float = 20.0,
-                   extra_env: dict[str, str] | None = None, **kwargs) -> subprocess.CompletedProcess:
-        """Run ``python script`` with this daemon's env (cwd = workdir)."""
+                   extra_env: dict[str, str] | None = None, *, mpi_rank: int | None = None,
+                   mpi_size: int | None = None, mpi_flavour: str = "ompi",
+                   **kwargs) -> subprocess.CompletedProcess:
+        """Run ``python script`` with this daemon's env (cwd = workdir).
+
+        ``mpi_rank`` (with ``mpi_size``, ``mpi_flavour``) simulates an MPI
+        rank via ``mpi_env``; ``extra_env`` is applied last.
+        """
         env = self.env()
+        if mpi_rank is not None:
+            env.update(mpi_env(mpi_rank, mpi_size, flavour=mpi_flavour))
         if extra_env:
             env.update(extra_env)
         return subprocess.run(self.worker_argv(script), env=env, cwd=self.workdir,
@@ -247,6 +289,7 @@ class FakeDaemon:
             except OSError:
                 return
             self._conns.append(conn)
+            self.connections += 1
             try:
                 self._handle(conn)
             except Exception as exc:  # recorded for assertions

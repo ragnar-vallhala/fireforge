@@ -190,7 +190,8 @@ constexpr const char* kCpUsage = R"(usage: tdrctl cp [--url URL] [--ca F] [--cer
   job-cancel ID [--reason TEXT]
   job-submit [--cpus N] [--memory-mb N] [--timeout S] [--attempts N] [--operation OP]
              [--params JSON] [--input ARTIFACT]... [--env KEY=VALUE]... [--campaign ID]
-             [--material ID] [--capability C]... -- argv...
+             [--material ID] [--capability C]...
+             [--ranks N [--max-ranks-per-node K] [--mpirun-arg A]...] -- argv...   (multi-node MPI, Phase 7)
   workflow-submit FILE                             CreateWorkflowRequest JSON ("-" = stdin) (Phase 6)
   workflows [--state S] [--campaign ID] [--limit N]
   workflow ID                                      steps: state, job, node, dependencies
@@ -363,6 +364,13 @@ void print_job(const cv1::Job& j) {
     if (j.progress_fraction() > 0 || !j.progress_message().empty())
         std::cout << "progress:   " << static_cast<int>(j.progress_fraction() * 100) << "% " << j.progress_message() << "\n";
     if (!j.workflow_id().empty()) std::cout << "workflow:   " << j.workflow_id() << " step " << j.step() << "\n";
+    if (j.spec().mpi().ranks() > 0) std::cout << "mpi:        " << j.spec().mpi().ranks() << " ranks\n";
+    if (!j.pending_reason().empty()) std::cout << "pending:    " << j.pending_reason() << "\n";
+    for (const auto& m : j.gang())
+        std::cout << std::format("gang {}:     {} ({}) ranks {}-{} {}\n", m.member_index(),
+                                 m.name().empty() ? m.node_id() : m.name(),
+                                 m.role() == cv1::GANG_HEAD ? "head" : "member", m.rank_offset(),
+                                 m.rank_offset() + m.ranks() - (m.ranks() ? 1 : 0), m.state());
     if (!j.reserved_node().empty())
         std::cout << "reserved:   for " << j.reserved_node() << " until " << fmt_time(j.reserved_until_unix_ms()) << "\n";
     if (!j.last_error().empty()) std::cout << "error:      " << j.last_error() << "\n";
@@ -394,6 +402,7 @@ int cp(const std::vector<std::string>& all_args) {
     auto a = parse(in, {"--url", "--ca", "--cert", "--key", "--health", "--profile", "--cpus", "--memory-mb", "--jobs",
                         "--disk-mb", "--gpus", "--reason", "--limit", "--state", "--domain", "--description",
                         "--params", "--campaign", "--timeout", "--attempts", "--operation", "--input", "--env",
+                        "--ranks", "--max-ranks-per-node", "--mpirun-arg",
                         "--material", "--capability"});
     if (a.positional.empty()) throw UsageError(std::string("cp needs a command\n") + kCpUsage);
     const std::string cmd = a.positional[0];
@@ -525,6 +534,10 @@ int cp(const std::vector<std::string>& all_args) {
         if (auto v = a.get("--material")) spec->set_material_id(*v);
         for (const auto& v : a.all("--input")) spec->add_input_artifacts(v);
         for (const auto& v : a.all("--capability")) spec->add_required_capabilities(v);
+        if (auto v = a.get("--ranks")) spec->mutable_mpi()->set_ranks(static_cast<std::uint32_t>(to_u64("--ranks", *v)));
+        if (auto v = a.get("--max-ranks-per-node"))
+            spec->mutable_mpi()->set_max_ranks_per_node(static_cast<std::uint32_t>(to_u64("--max-ranks-per-node", *v)));
+        for (const auto& v : a.all("--mpirun-arg")) spec->mutable_mpi()->add_mpirun_args(v);
         for (const auto& kv : a.all("--env")) {
             auto eq = kv.find('=');
             if (eq == std::string::npos || eq == 0) throw UsageError("--env needs KEY=VALUE");

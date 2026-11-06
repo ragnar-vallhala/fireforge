@@ -28,6 +28,7 @@ struct ApiOptions {
     std::uint32_t locality_wait_seconds = 15;  // phase5.md §4 (0 = any node at once)
     cpdb::WorkflowLimits workflow_limits;      // phase6.md §9 [workflows]
     cpdb::PlacementOptions placement;          // phase6.md §7 [placement]
+    cpdb::GangOptions gangs;                   // phase7.md §7 [gangs]
 };
 
 // §8.3 presets. nullopt for an unknown profile name.

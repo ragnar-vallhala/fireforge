@@ -24,6 +24,10 @@ Phase 6 (docs/design/phase6.md): named inputs (``context.input(name)``),
 checkpoints (``context.checkpoint`` / ``context.load_checkpoint``) and
 dynamic fan-out (``context.spawn``) for workflow steps.
 
+Phase 7 (docs/design/phase7.md §8): under MPI (``JobSpec.mpi``) only rank 0
+talks to the daemon; other ranks run the task with a detached context (see
+``Worker.run`` and ``fireforge.mpi``).
+
 Exit codes of ``Worker.run()``: 0 = task succeeded, 1 = task failed or the
 daemon refused the attempt, 2 = FIREFORGE_* environment missing/invalid.
 """
@@ -47,7 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-from . import _pb
+from . import _pb, mpi as _mpi
 from ._pb import local_pb2
 from ._version import __version__
 from .protocol import FrameReader, FrameWriter, ProtocolError
@@ -323,7 +327,7 @@ class Context:
     def __init__(self, task: "local_pb2.WorkerTask", env: dict[str, str],
                  session: "_Session | None" = None, *,
                  clock: Callable[[], float] | None = None,
-                 background_flush: bool = True) -> None:
+                 background_flush: bool = True, detached: bool = False) -> None:
         self.job_id: str = task.job_id or env.get("FIREFORGE_JOB_ID", "")
         self.attempt_id: str = task.attempt_id or env.get("FIREFORGE_ATTEMPT_ID", "")
         self.attempt_number: int = task.attempt_number
@@ -352,12 +356,24 @@ class Context:
         self.output_dir: Path = _dir(task.output_dir, "FIREFORGE_OUTPUT_DIR", str(self.workdir / "outputs"))
         self.checkpoint_dir: Path = _dir(task.checkpoint_dir, "FIREFORGE_CHECKPOINT_DIR",
                                          str(self.workdir / "checkpoints"))
-        self._session = session
+        # Phase 7: MPI rank of this process (0/1 when not under MPI).
+        info = _mpi.detect(env)
+        self.mpi_rank: int = info.rank
+        self.mpi_size: int = info.size
+        # A detached context (non-root MPI rank) never talks to the daemon:
+        # progress / checkpoints are no-ops, cancellation never fires.
+        self.detached: bool = detached
+        self._session = None if detached else session
         self._cancel_event = threading.Event()
         self.cancel_reason: str = ""
         self._saved: dict[str, OutputRef] = {}  # by relative path, insertion-ordered
         self._spawned: list[Any] = []           # job_pb2.StepSpec, in call order
         self._ck = _Checkpointer(self, clock or time.monotonic, background_flush)
+
+    @property
+    def is_root(self) -> bool:
+        """True for MPI rank 0 (and outside MPI): the rank whose outputs count."""
+        return self.mpi_rank == 0
 
     # -- cancellation -------------------------------------------------------
 
@@ -536,7 +552,23 @@ class Context:
 
         Raises CheckpointError before writing anything if checkpointing is not
         enabled for the job (``ExecutionPolicy.checkpoint``).
+
+        In a detached context (non-root MPI rank) nothing is written or sent
+        (ranks on the head node share rank 0's ``checkpoint_dir``); the path
+        the file would have is returned.
         """
+        if self.detached:
+            if not isinstance(name, str) or not STEP_NAME_RE.fullmatch(name) or name in (".", ".."):
+                raise ValueError(f"invalid checkpoint name {name!r}: must match [A-Za-z0-9_.-]{{1,64}}")
+            if isinstance(data, os.PathLike):
+                ext = "".join(Path(data).suffixes)
+            elif isinstance(data, (bytes, bytearray, memoryview)):
+                ext = ".bin"
+            elif isinstance(data, str):
+                ext = ".txt"
+            else:
+                ext = ".json"
+            return self.checkpoint_dir / (name if Path(name).suffix else name + ext)
         if not self.checkpoint_enabled:
             raise CheckpointError("checkpointing not enabled for this job "
                                   "(ExecutionPolicy.checkpoint / spawn(..., checkpoint=True))")
@@ -548,6 +580,8 @@ class Context:
 
     def flush_checkpoints(self) -> None:
         """Send every pending (rate-limited) checkpoint now and wait for the replies."""
+        if self.detached:
+            return
         self._ck.flush(raise_errors=True)
 
     def _write_checkpoint_file(self, data, name: str, media_type: str | None) -> tuple[Path, str]:
@@ -615,7 +649,9 @@ class Context:
               params: Any = None, inputs=(), depends_on=(), resources: dict | None = None,
               run_if: str = "all_succeeded", allow_failure: bool = False, input_artifacts=(),
               capabilities=(), max_attempts: int | None = None, timeout: float | None = None,
-              checkpoint: bool = False, env: dict[str, str] | None = None) -> str:
+              checkpoint: bool = False, env: dict[str, str] | None = None,
+              ranks: int | None = None, max_ranks_per_node: int | None = None,
+              mpirun_args=()) -> str:
         """Add a step to this job's workflow; returns ``name``.
 
         The step is stored as ``<this step>/<name>`` by the control plane and
@@ -628,6 +664,11 @@ class Context:
         disk_bytes / gpu_count. ``input_artifacts``: artifact ids, or a dict
         ``{input_name: artifact_id}``. ``timeout`` in seconds.
         ``checkpoint=True`` enables checkpoints for the child.
+        ``ranks=N`` (1..4096) makes the child a multi-node MPI gang job
+        (``JobSpec.mpi``; ``resources`` then per rank); ``max_ranks_per_node``
+        caps ranks per node (0/None = no cap), ``mpirun_args`` go before the
+        program. ``argv`` must not start with mpirun/mpiexec (TDR adds it).
+        In a detached context (non-root MPI rank) spawns are never sent.
 
         ``argv=None`` runs the same worker program as this process
         (``[sys.executable, <abs path of sys.argv[0]>, *sys.argv[1:]]``, or
@@ -660,7 +701,8 @@ class Context:
                                    allow_failure=allow_failure, input_artifacts=input_artifacts,
                                    capabilities=capabilities, max_attempts=max_attempts,
                                    timeout=timeout, checkpoint=checkpoint, env=env,
-                                   allow_self_input=True)
+                                   ranks=ranks, max_ranks_per_node=max_ranks_per_node,
+                                   mpirun_args=mpirun_args, allow_self_input=True)
         except WorkflowError as exc:
             raise ValueError(f"spawn: {exc}") from None
         self._spawned.append(spec)
@@ -870,9 +912,23 @@ class Worker:
 
     # -- entry point --------------------------------------------------------
 
-    def run(self, *, exit: bool = True, env: dict[str, str] | None = None) -> int:
-        """Run one attempt. Calls sys.exit(code) unless ``exit=False``."""
-        code = self._run(dict(os.environ) if env is None else env)
+    def run(self, *, exit: bool = True, env: dict[str, str] | None = None,
+            mpi_operation: str | None = None) -> int:
+        """Run one attempt. Calls sys.exit(code) unless ``exit=False``.
+
+        Under MPI (``fireforge.mpi.detect``) rank 0 runs exactly as without
+        MPI. Any other rank never connects to the daemon: it runs the task
+        for ``FIREFORGE_MPI_OPERATION`` (env), else ``mpi_operation``, else
+        the only registered task, with a detached context; parameters come
+        from ``FIREFORGE_MPI_PARAMS`` (JSON, default ``{}``). See
+        ``_run_detached``.
+        """
+        env = dict(os.environ) if env is None else env
+        info = _mpi.detect(env)
+        if info.active and not info.is_root:
+            code = self._run_detached(env, mpi_operation)
+        else:
+            code = self._run(env)
         sys.stdout.flush()
         sys.stderr.flush()
         if exit:
@@ -905,6 +961,65 @@ class Worker:
             return EXIT_FAILURE
         finally:
             session.close()
+
+    def _run_detached(self, env: dict[str, str], mpi_operation: str | None) -> int:
+        """Non-root MPI rank: run the task locally, never talk to the daemon.
+
+        The context has the local node's job dirs (FIREFORGE_WORKDIR, ...),
+        job/attempt ids from env, ``inputs`` = the files in ``input_dir``
+        (unnamed; inputs are materialised on every member node) and no
+        resume checkpoint. ``save_output`` writes the file (on the head node
+        that is rank 0's ``output_dir``, so guard writes with
+        ``context.is_root`` unless that is intended); checkpoints, progress
+        and spawns are no-ops; cancellation never fires (tdrd stops the gang
+        by killing mpirun). The return value is ignored except that an
+        explicit failure (``JobResult(success=False)`` / ``False``) exits 1
+        like an exception does (traceback on stderr). Exit 2: no task to run
+        or bad ``FIREFORGE_MPI_PARAMS``.
+        """
+        rank = _mpi.detect(env).rank
+        op = env.get(_mpi.ENV_OPERATION) or mpi_operation
+        if op:
+            fn = self.tasks.get(op)
+            if fn is None:
+                known = ", ".join(sorted(self.tasks)) or "none"
+                print(f"fireforge: MPI rank {rank}: unknown operation {op!r} (registered: {known})",
+                      file=sys.stderr)
+                return EXIT_CONFIG
+        elif len(self.tasks) == 1:
+            op, fn = next(iter(self.tasks.items()))
+        else:
+            known = ", ".join(sorted(self.tasks)) or "none"
+            print(f"fireforge: MPI rank {rank}: cannot choose a task (registered: {known}); set "
+                  f"{_mpi.ENV_OPERATION} or pass Worker.run(mpi_operation=...)", file=sys.stderr)
+            return EXIT_CONFIG
+        params_json = env.get(_mpi.ENV_PARAMS, "")
+        try:
+            if params_json.strip():
+                json.loads(params_json)
+        except ValueError as exc:
+            print(f"fireforge: MPI rank {rank}: invalid {_mpi.ENV_PARAMS}: {exc}", file=sys.stderr)
+            return EXIT_CONFIG
+        task = local_pb2.WorkerTask(operation=op, parameters_json=params_json)
+        context = Context(task, env, None, detached=True, background_flush=False)
+        input_dir = context.input_dir
+        if input_dir.is_dir():
+            for p in sorted(input_dir.iterdir()):
+                if p.is_file():
+                    aid = (f"artifact://sha256/{p.name}" if len(p.name) == 64
+                           and all(c in "0123456789abcdef" for c in p.name) else "")
+                    context.inputs.append(InputRef(aid, p, ""))
+        try:
+            value = fn(context)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            return EXIT_FAILURE
+        if value is False or (isinstance(value, JobResult) and not value.success):
+            err = value.error if isinstance(value, JobResult) else ""
+            print(f"fireforge: MPI rank {rank}: task reported failure{': ' + err if err else ''}",
+                  file=sys.stderr)
+            return EXIT_FAILURE
+        return EXIT_OK
 
     def _serve(self, session: _Session, env: dict[str, str], attempt_id: str) -> int:
         hello = local_pb2.WorkerHello(attempt_id=attempt_id, token=env["FIREFORGE_ATTEMPT_TOKEN"],

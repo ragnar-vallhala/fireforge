@@ -72,3 +72,13 @@ log_file =
 [log]
 # debug | info | warn | error
 level = info
+
+# Phase 7: multi-node MPI (docs/design/phase7.md §7).
+[mpi]
+mpirun = mpirun
+# launcher = /usr/lib/fireforge/tdr-launch   # default: tdr-launch next to tdrd
+# Interface or CIDR for MPI TCP traffic (oob + btl), e.g. tailscale0 or 100.64.0.0/10.
+if_include =
+# Extra MCA params, k=v,k=v
+mca =
+launch_timeout = 120

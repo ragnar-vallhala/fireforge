@@ -42,6 +42,14 @@ message Command {
   map<string, string> env = 2;       // added to the minimal child environment
 }
 
+// Multi-node MPI (docs/design/phase7.md §2). JobSpec.resources is then per rank
+// (disk_bytes per node), and command.argv is the program every rank runs.
+message MpiSpec {
+  uint32 ranks = 1;                 // > 0 makes the job a gang job
+  uint32 max_ranks_per_node = 2;    // 0 = no cap
+  repeated string mpirun_args = 3;  // extra mpirun args placed before the program
+}
+
 message JobSpec {
   string job_id = 1;          // empty on submit = daemon assigns one
   string campaign_id = 2;
@@ -66,6 +74,9 @@ message JobSpec {
   string resume_checkpoint = 15;        // artifact id of the checkpoint to resume from ("" = none)
   string workflow_id = 16;              // set by the control plane for workflow steps
   string step = 17;                     // full step name within the workflow
+
+  // ---- Phase 7 (docs/design/phase7.md) ----
+  MpiSpec mpi = 18;                     // ranks > 0: multi-node MPI job
 }
 
 // An output (or checkpoint) with its logical name (phase6.md §2).

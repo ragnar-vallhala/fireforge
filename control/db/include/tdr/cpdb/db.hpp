@@ -64,6 +64,15 @@ struct PlacementOptions {
     double w_compute = 0.1, w_transfer = 0.5, w_queue = 0.2, w_memory = 0.1, w_contention = 0.1;
 };
 
+// Phase 7 gangs (docs/design/phase7.md §3, §7: tdrcp [gangs]).
+struct GangOptions {
+    std::int64_t drain_timeout_ms = 600000;  // a hold older than this is dropped and re-picked
+    std::int64_t ready_window_ms = 5000;     // every member ready within this -> gang lease
+    std::uint32_t max_nodes = 16;
+    std::uint32_t max_ranks = 4096;
+    std::int64_t poll_recent_ms = 30000;     // eligible only if it polled lease_jobs this recently
+};
+
 struct Reservation {
     std::string job_id;
     std::string node_id;
@@ -233,6 +242,34 @@ public:
     // Reserve QUEUED strict jobs for their best-ranked untried eligible node;
     // release reservations past max_reserve. Returns the reservations made.
     virtual std::vector<Reservation> place_jobs(const PlacementOptions& options, std::int64_t now_ms) = 0;
+
+    // ---- gangs (docs/design/phase7.md §3, §4) -----------------------------------
+    // A job is a gang job iff spec.mpi.ranks > 0 (resources are per rank). Gangs are
+    // placed by place_jobs (same pass, before strict jobs): slots per node from its
+    // heartbeat capacity, members chosen by slots desc then Phase 6 cost, pairwise
+    // CONNECTED peers, head = first; holds inserted (gang_holds) and Job.gang /
+    // pending_reason updated; holds older than drain_timeout dropped (members ->
+    // gang_tried) and re-picked; not coverable -> pending_reason only. Gang
+    // reservations are not returned in the Reservation list.
+    //
+    // lease_jobs (gang parts): records the caller's poll time (eligibility); subtracts
+    // other jobs' holds on the caller from req.free before granting ordinary jobs;
+    // marks the caller's member ready when req.free covers its hold; when every member
+    // is ready within ready_window creates the gang attempt (one attempt id + token,
+    // job_attempt_members rows, job LEASED, node_id = head, holds deleted) and returns
+    // the caller's Lease with `gang`; undelivered member leases are returned on that
+    // member's next call (once). A gang lease uses one job slot of req.max_jobs.
+    //
+    // update_job from a gang member (fenced by attempt id + token + membership):
+    // RUNNING marks the member; a terminal report from the head decides the job as for
+    // a normal job and revokes the other members; FAILED / CANCELLED from a non-head
+    // member (or any member's lease expiring, in expire_leases) fails the attempt
+    // ("member <name> failed: ...", retryable unless the member said otherwise) and
+    // revokes the rest; COMPLETED from a non-head member only marks it SUCCEEDED.
+    // renew_leases renews per member; a member of an attempt that is no longer
+    // current, or of a cancel_requested job, is revoked.
+    // Job / JobAttempt protos fill gang / members / pending_reason.
+    virtual void set_gang_options(const GangOptions& options) = 0;
 
     virtual void audit(const std::string& actor, const std::string& action, const std::string& target,
                        const std::string& details_json, std::int64_t now_ms) = 0;

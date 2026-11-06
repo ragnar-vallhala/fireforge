@@ -35,6 +35,8 @@ public:
                                           std::int64_t now_ms);
 
     std::vector<Reservation> place_jobs(const PlacementOptions& options, std::int64_t now_ms);
+    // Phase 7 (phase7.md §3, §4): drain timeout, ready window, max_nodes, poll recency.
+    void set_gang_options(const GangOptions& o) { gang_ = o; }
 
     // ---- inside the caller's transaction ----------------------------------------
     // Inserts a QUEUED job (spec.job_id set if empty; workflow_id/step columns from
@@ -51,10 +53,30 @@ private:
     // jobs.strict from gpu_count and input + checkpoint bytes (phase6.md §7).
     void refresh_strict(const std::string& job_id);
 
+    // ---- gangs (phase7.md §3, §4), inside the caller's transaction ----------------
+    // Members of a gang attempt, by member_index (names from nodes).
+    std::vector<cv1::GangMember> attempt_members(const std::string& attempt_id);
+    // Job.gang: the current attempt's members, or the holds while QUEUED.
+    void fill_gang(cv1::Job& j);
+    // Checkpoint artifact a new attempt resumes from ("" = none an ONLINE node holds).
+    std::string resume_checkpoint(const std::string& job_id);
+    // The Lease of node_id's member of a gang attempt.
+    cv1::Lease gang_lease(const std::string& job_id, const std::string& attempt_id, std::uint32_t number,
+                          const tv1::JobSpec& spec, const std::string& node_id, std::int64_t expires_ms);
+    // Hands out node_id's undelivered member leases (jobs locked SKIP LOCKED).
+    // Calls take(cpu, memory, gpus) for each.
+    template <class Take>
+    void deliver_members(const std::string& node_id, std::int64_t expires_ms, std::vector<cv1::Lease>& out,
+                         Take&& take);
+    // gang_holds -> attempt + members; job LEASED (job row locked, QUEUED).
+    cv1::Lease create_gang_attempt(const std::string& job_id, std::uint32_t number, const tv1::JobSpec& spec,
+                                   const std::string& caller, std::int64_t now_ms, std::int64_t expires_ms);
+
     pg::Conn& c_;
     WorkflowStore* wf_ = nullptr;
     // Threshold for jobs.strict; updated by every place_jobs call.
     std::uint64_t strict_bytes_ = PlacementOptions{}.strict_input_bytes;
+    GangOptions gang_;
 };
 
 }  // namespace tdr::cpdb

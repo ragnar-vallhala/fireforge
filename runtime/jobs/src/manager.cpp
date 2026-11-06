@@ -868,6 +868,19 @@ struct JobManager::Impl {
         return t;
     }
 
+    // Same check as on_worker_hello, without binding anything (phase7.md §5).
+    std::expected<std::string, std::string> verify_attempt(const std::string& attempt_id,
+                                                           const std::string& token) const {
+        auto it = attempts.find(attempt_id);
+        if (it == attempts.end() || !constant_time_equal(token, it->second->token)) {
+            return std::unexpected("unknown attempt or bad token");
+        }
+        const Attempt& a = *it->second;
+        if (a.phase != Phase::kRunning) return std::unexpected("attempt is not running");
+        if (a.cancel_requested) return std::unexpected("attempt is being cancelled");
+        return a.job_id;
+    }
+
     void on_worker_progress(const v1::WorkerProgress& p) {
         Attempt* a = running_attempt(p.attempt_id());
         if (!a) return;
@@ -983,6 +996,11 @@ Capacity JobManager::capacity() const { return impl_->opts.capacity; }
 
 std::expected<v1::WorkerTask, std::string> JobManager::on_worker_hello(const v1::WorkerHello& hello) {
     return impl_->on_worker_hello(hello);
+}
+
+std::expected<std::string, std::string> JobManager::verify_attempt(const std::string& attempt_id,
+                                                                  const std::string& token) const {
+    return impl_->verify_attempt(attempt_id, token);
 }
 
 void JobManager::on_worker_progress(const v1::WorkerProgress& progress) { impl_->on_worker_progress(progress); }

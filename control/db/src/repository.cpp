@@ -403,6 +403,10 @@ public:
     }
     std::size_t sweep_workflows(std::int64_t now_ms) override { return wf_.sweep_workflows(now_ms); }
     void set_workflow_limits(const WorkflowLimits& limits) override { wf_.set_limits(limits); }
+    void set_gang_options(const GangOptions& options) override {
+        jobs_.set_gang_options(options);
+        wf_.set_gang_options(options);
+    }
     std::vector<Reservation> place_jobs(const PlacementOptions& options, std::int64_t now_ms) override {
         return jobs_.place_jobs(options, now_ms);
     }

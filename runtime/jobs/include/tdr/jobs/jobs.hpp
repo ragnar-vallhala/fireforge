@@ -120,6 +120,11 @@ public:
     // task to send back, or an error string (daemon replies ERROR UNAUTHORIZED).
     std::expected<v1::WorkerTask, std::string> on_worker_hello(const v1::WorkerHello& hello);
     void on_worker_progress(const v1::WorkerProgress& progress);
+    // Phase 7 (phase7.md §5): attempt id + token of a RUNNING attempt -> its job
+    // id (for WORKER_GANG_LAUNCH, sent on a connection that is not the
+    // worker's hello connection). Error string otherwise.
+    std::expected<std::string, std::string> verify_attempt(const std::string& attempt_id,
+                                                           const std::string& token) const;
     // Stores the result; the outcome is applied when the process exits.
     // Phase 6: result.spawn is kept with the job (JobStatus.spawn) when it
     // completes; output names (JobStatus.outputs) come from OutputFile.name, else

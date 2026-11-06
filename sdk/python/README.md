@@ -52,6 +52,7 @@ Dependency: `protobuf>=4.21,<5`. `pymatgen` is optional.
 | `flush_checkpoints()` | send rate-limited checkpoints now |
 | `load_checkpoint()`, `load_checkpoint_json(default=None)` | resume checkpoint path / parsed JSON, or None |
 | `spawn(name, *, operation, ...)` | see Workflows |
+| `mpi_rank`, `mpi_size`, `is_root`, `detached` | see MPI (Phase 7) |
 
 Output names: `save_output(name, ...)` sends `OutputFile.name = name`; other
 outputs (scanned or declared by path) are named by their path relative to
@@ -144,6 +145,55 @@ workflow's `argv`; one of them is required). Names (`[A-Za-z0-9_.-]{1,64}`,
 unique), known dependencies, acyclicity and the 10 000-step limit are checked
 client-side (`WorkflowError`).
 
+## MPI (Phase 7)
+
+A step with `ranks=N` (`JobSpec.mpi`) is a multi-node gang job: TDR places
+the ranks, adds mpirun and runs `command.argv` once per rank
+(`docs/design/phase7.md`). `argv` is the per-rank program and must not
+start with `mpirun`/`mpiexec`/`orterun`/`prterun` (also `mpirun.openmpi`
+etc.); `resources` is per rank.
+
+```python
+wf.step("relax", operation="dft.relax", ranks=64, max_ranks_per_node=16,
+        mpirun_args=["--bind-to", "core"], resources={"cpu_cores": 1})
+context.spawn("md", operation="md.run", ranks=8)     # same keywords
+```
+
+Validation (`WorkflowError` / `ValueError` from `spawn`): `ranks` int
+1..4096, `max_ranks_per_node` int >= 0 (0/None = no cap),
+`max_ranks_per_node`/`mpirun_args` only together with `ranks`.
+
+Rank of the current process (`fireforge.mpi.detect()`, also
+`context.mpi_rank`, `context.mpi_size`, `context.is_root`): rank from
+`OMPI_COMM_WORLD_RANK`, else `PMI_RANK`, else `PMIX_RANK`; size from
+`OMPI_COMM_WORLD_SIZE`, else `PMI_SIZE`. Not under MPI: rank 0, size 1. A
+rank without a size variable (bare PMIx): size 0 = unknown.
+
+`worker.run()` under MPI:
+
+- **Rank 0** (on the head node) behaves exactly as without MPI: it talks to
+  tdrd, its outputs, result, checkpoints and spawns are the job's.
+- **Every other rank** never connects to the daemon (it may see another
+  job's `FIREFORGE_*` env). It runs the task with a *detached* context
+  (`context.detached`): the local node's `workdir`/`input_dir`/
+  `output_dir`/`checkpoint_dir`, `job_id`/`attempt_id` from env, `inputs` =
+  the files in `input_dir` (unnamed, so `input(name)` raises), no resume
+  checkpoint. `report_progress`, `checkpoint` (writes nothing, returns the
+  path), `flush_checkpoints` and spawns are no-ops; cancellation never
+  fires (tdrd stops the gang by killing mpirun). `save_output` still
+  writes the file: ranks on the head node share rank 0's `output_dir`, so
+  guard output writes with `if context.is_root:`. The return value is
+  ignored; the process exits 0, or 1 on an exception (traceback on stderr)
+  or an explicit failure (`JobResult(success=False)` / `False`).
+- Which task a non-root rank runs: `FIREFORGE_MPI_OPERATION` if set, else
+  `worker.run(mpi_operation="...")`, else the only registered task; with
+  several tasks and neither given it exits 2 with an error. Its `params`
+  come from `FIREFORGE_MPI_PARAMS` (JSON, default `{}`). tdrd does not set
+  these; pass them yourself if one script registers several tasks (e.g.
+  `mpirun_args=["-x", "FIREFORGE_MPI_OPERATION=dft.relax"]`, or
+  `command.env`/`env=`). Typical pattern: rank 0 reads params/inputs and
+  broadcasts them (e.g. with mpi4py).
+
 ## Testing
 
 `fireforge.testing.FakeDaemon` plays the daemon side on a temp Unix socket:
@@ -160,5 +210,11 @@ with FakeDaemon("transport.calculate", {"t": 300}) as d:
 Phase 6 options: `add_input(data, name=...)`, `FakeDaemon(workflow_id=, step=,
 checkpoint_enabled=, resume_checkpoint=b"..." | Path, checkpoint_error="msg")`;
 recorded: `d.checkpoints`, `d.checkpoint_files`, `d.spawned`.
+
+Phase 7: `d.run_worker(script, mpi_rank=1, mpi_size=4, mpi_flavour="ompi"|"pmi"|"pmix")`
+simulates an MPI rank (`fireforge.testing.mpi_env(rank, size, flavour=,
+operation=, params=)` returns the variables); `d.connections` counts worker
+connections (a non-root rank must leave it at 0). `d.env()` strips inherited
+MPI rank variables.
 
 Tests: `tools/pytest.sh` (runs under the shared memory cap).

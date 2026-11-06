@@ -147,12 +147,14 @@ BOOST_AUTO_TEST_CASE(migrates_v1_database_to_latest) {
     auto n = db.node("alpha");
     // Roll this database back to a v1 schema that holds data.
     psql(db.conninfo,
-         "DROP TABLE workflow_step_deps, workflow_steps, artifact_pins, artifact_syncs, artifact_locations, job_attempts,"
+         "DROP TABLE gang_holds, job_attempt_members;"
+         " ALTER TABLE nodes DROP COLUMN last_lease_poll;"
+         " DROP TABLE workflow_step_deps, workflow_steps, artifact_pins, artifact_syncs, artifact_locations, job_attempts,"
          " jobs, workflows;"
          " DELETE FROM schema_migrations WHERE version >= 2");
     BOOST_TEST(schema_version(db.conninfo) == 1);
     auto repo = open_pg_repository(db.conninfo);
-    BOOST_TEST(schema_version(db.conninfo) == 4);
+    BOOST_TEST(schema_version(db.conninfo) == 5);
     BOOST_TEST(repo->get_node(n)->name() == "alpha");
     auto j = repo->create_job(spec(), "admin:a", T0);
     BOOST_REQUIRE(j);

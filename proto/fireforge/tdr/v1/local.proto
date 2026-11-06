@@ -87,6 +87,27 @@ message WorkerCheckpoint {
   string name = 4;        // logical name ("" = "checkpoint")
 }
 
+// ---- Phase 7 gangs (phase7.md §5) ----
+// daemon -> `tdr-launch member` (WORKER_EXEC, unsolicited): exec /bin/sh -c command.
+message WorkerExec {
+  string command = 1;
+}
+
+// `tdr-launch agent` -> daemon (WORKER_GANG_LAUNCH) on a fresh connection.
+// Reply WORKER_ACK once the member started it, or ERROR.
+message GangLaunchRequest {
+  string attempt_id = 1;   // the head job's local attempt (FIREFORGE_ATTEMPT_ID)
+  string token = 2;        // FIREFORGE_ATTEMPT_TOKEN
+  string host = 3;         // member node id from the hostfile
+  string command = 4;      // shell words joined, --daemonize removed
+}
+
+// daemon -> agent (WORKER_GANG_EXIT, unsolicited): the remote command ended.
+message GangExitNotice {
+  int32 exit_code = 1;     // 128+signal, -1 unknown
+  string error = 2;
+}
+
 message WorkerCancel {
   string attempt_id = 1;
   string reason = 2;

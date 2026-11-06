@@ -12,7 +12,7 @@ namespace {
 // Arbitrary constant: pg_advisory_xact_lock key for "fireforge schema".
 constexpr std::int64_t kMigrationLock = 0x4646'5343'4845'4d41;  // "FFSCHEMA"
 
-constexpr std::array<std::string_view, 4> kMigrations = {
+constexpr std::array<std::string_view, 5> kMigrations = {
     // 1: initial control-plane schema
     R"sql(
 CREATE TABLE nodes (
@@ -221,6 +221,52 @@ ALTER TABLE jobs
     ADD COLUMN reserve_done   boolean NOT NULL DEFAULT false;  -- released to every node
 CREATE INDEX jobs_workflow_idx ON jobs (workflow_id) WHERE workflow_id IS NOT NULL;
 CREATE INDEX jobs_placement_idx ON jobs (created_at, seq) WHERE state = 'QUEUED' AND strict AND NOT reserve_done;
+)sql",
+    // 5: Phase 7 gangs: multi-node MPI jobs (docs/design/phase7.md §3, §4)
+    R"sql(
+ALTER TABLE jobs
+    ADD COLUMN is_gang        boolean NOT NULL DEFAULT false,  -- spec.mpi.ranks > 0
+    ADD COLUMN pending_reason text NOT NULL DEFAULT '',        -- why a QUEUED gang isn't running
+    ADD COLUMN gang_tried     text[] NOT NULL DEFAULT '{}';    -- members of holds that timed out
+CREATE INDEX jobs_gang_queue_idx ON jobs (created_at, seq) WHERE state = 'QUEUED' AND is_gang;
+
+-- Last lease_jobs call (gang eligibility: the node takes remote work).
+ALTER TABLE nodes ADD COLUMN last_lease_poll timestamptz;
+
+-- Capacity held (and drained) for a QUEUED gang job, one row per member node.
+CREATE TABLE gang_holds (
+    job_id       text NOT NULL REFERENCES jobs (job_id) ON DELETE CASCADE,
+    node_id      text NOT NULL REFERENCES nodes (node_id) ON DELETE CASCADE,
+    member_index int NOT NULL CHECK (member_index >= 0),       -- 0 = head
+    rank_offset  int NOT NULL CHECK (rank_offset >= 0),
+    ranks        int NOT NULL CHECK (ranks >= 1),
+    cpu          bigint NOT NULL CHECK (cpu >= 0),             -- ranks x per-rank request
+    memory       numeric(20, 0) NOT NULL CHECK (memory >= 0),
+    gpus         bigint NOT NULL CHECK (gpus >= 0),
+    ready_at     timestamptz,                                  -- last poll with free >= hold
+    created_at   timestamptz NOT NULL,
+    PRIMARY KEY (job_id, member_index),
+    UNIQUE (job_id, node_id)
+);
+CREATE INDEX gang_holds_node_idx ON gang_holds (node_id);
+
+-- Members of a gang attempt (one job_attempts row; node_id there is the head).
+CREATE TABLE job_attempt_members (
+    attempt_id   text NOT NULL REFERENCES job_attempts (attempt_id) ON DELETE CASCADE,
+    node_id      text NOT NULL,
+    member_index int NOT NULL CHECK (member_index >= 0),
+    rank_offset  int NOT NULL CHECK (rank_offset >= 0),
+    ranks        int NOT NULL CHECK (ranks >= 1),
+    role         text NOT NULL CHECK (role IN ('HEAD', 'MEMBER')),
+    state        text NOT NULL CHECK (state IN ('LEASED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'ABANDONED')),
+    delivered    boolean NOT NULL DEFAULT false,               -- lease handed to the member
+    expires_at   timestamptz NOT NULL,
+    error        text NOT NULL DEFAULT '',
+    PRIMARY KEY (attempt_id, member_index),
+    UNIQUE (attempt_id, node_id)
+);
+CREATE INDEX job_attempt_members_live_idx ON job_attempt_members (expires_at) WHERE state IN ('LEASED', 'RUNNING');
+CREATE INDEX job_attempt_members_undelivered_idx ON job_attempt_members (node_id) WHERE NOT delivered;
 )sql",
 };
 

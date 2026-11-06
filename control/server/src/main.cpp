@@ -2,7 +2,8 @@
 //
 // Wiring only: config -> Postgres repository (runs migrations) -> ControlApi
 // -> mTLS HttpsServer, plus health/lease, workflow and placement timers. One
-// io_context thread. ControlApi applies [workflows] limits to the repository.
+// io_context thread. ControlApi applies [workflows] limits and [gangs] options to
+// the repository; gangs are placed by the placement timer.
 
 #include <charconv>
 #include <chrono>
@@ -48,6 +49,9 @@ struct CpConfig {
     std::uint32_t reserve_window_seconds = 5;
     std::uint32_t max_reserve_seconds = 30;
     std::uint64_t strict_input_mb = 64;
+    // Phase 7 [gangs] (seconds).
+    std::uint32_t drain_timeout_seconds = 600;
+    std::uint32_t ready_window_seconds = 5;
 };
 
 template <class T>
@@ -64,6 +68,9 @@ void apply_placement(CpConfig& c) {
     p.reserve_window_ms = std::int64_t{c.reserve_window_seconds} * 1000;
     p.max_reserve_ms = std::int64_t{c.max_reserve_seconds} * 1000;
     p.strict_input_bytes = c.strict_input_mb << 20;
+    auto& g = c.api.gangs;
+    g.drain_timeout_ms = std::int64_t{c.drain_timeout_seconds} * 1000;
+    g.ready_window_ms = std::int64_t{c.ready_window_seconds} * 1000;
 }
 
 std::expected<CpConfig, std::string> load(const fs::path& path) {
@@ -107,6 +114,10 @@ std::expected<CpConfig, std::string> load(const fs::path& path) {
                        {"w_queue", num(c.api.placement.w_queue)},
                        {"w_memory", num(c.api.placement.w_memory)},
                        {"w_contention", num(c.api.placement.w_contention)}}},
+        {"gangs", {{"drain_timeout", num(c.drain_timeout_seconds)},
+                   {"ready_window", num(c.ready_window_seconds)},
+                   {"max_nodes", num(c.api.gangs.max_nodes)},
+                   {"max_ranks", num(c.api.gangs.max_ranks)}}},
         {"log", {{"level", str(c.log_level)}}},
     };
     for (const auto& [sec, keys] : ini->sections) {
@@ -143,6 +154,10 @@ std::expected<void, std::string> validate(const CpConfig& c) {
     const auto& p = a.placement;
     for (double w : {p.w_compute, p.w_transfer, p.w_queue, p.w_memory, p.w_contention})
         if (!(w >= 0)) return std::unexpected("placement weights must be >= 0");
+    if (c.drain_timeout_seconds == 0) return std::unexpected("gangs.drain_timeout must be > 0");
+    if (c.ready_window_seconds == 0) return std::unexpected("gangs.ready_window must be > 0");
+    if (a.gangs.max_nodes == 0 || a.gangs.max_ranks == 0)
+        return std::unexpected("gangs.max_nodes and max_ranks must be >= 1");
     return {};
 }
 

@@ -26,19 +26,31 @@
 // one for the same lease is replaced instead (coalesced). A lease's
 // spec.resume_checkpoint is fetched like an input and protected while waiting.
 //
+// Phase 7 (phase7.md §5): a lease with `gang` is turned into a `tdr-launch`
+// local job when accepted (local spec rewritten, spec.mpi cleared so nothing
+// downstream wraps it again): HEAD writes <gang_dir>/<attempt>.json and runs
+// `launcher head --gang <file> -- argv...`; MEMBER runs `launcher member` with
+// FIREFORGE_GANG_ID / FIREFORGE_GANG_HEAD. Resources are ranks on this node x
+// the per-rank request (disk as is). A lease that can't be turned into a local
+// job (no launcher, bad gang info, gang file write) fails retryable. The gang
+// file is removed once the lease's outcome is queued.
+//
 // State file (RemoteOptions::state_file, replaced atomically: tmp + fsync +
-// rename), version 3 (version 1 files, which lack "submitted"/"spec", are
+// rename), version 4 (version 1 files, which lack "submitted"/"spec", are
 // read as all submitted; version 2 files are read as is: v3 only adds the
-// Phase 6 JobUpdate fields, spawn/checkpoint/output names, inside "update"):
+// Phase 6 JobUpdate fields, spawn/checkpoint/output names, inside "update";
+// v4 only adds the optional lease fields "gang" and "gang_file"):
 //
 //   {
-//     "version": 3,
+//     "version": 4,
 //     "leases": [                      // mapping, keyed by local job id
 //       {"local_job_id": "job-x.a2", "job_id": "job-x", "attempt_id": "att-...",
 //        "fencing_token": 2, "attempt_number": 2,
 //        "terminal": false,            // true once the outcome update is queued
 //        "submitted": true,            // false: local job not submitted yet (fetching inputs)
-//        "spec": {...}}                // JobSpec as proto3 JSON, only while not submitted
+//        "spec": {...},                // JobSpec as proto3 JSON, only while not submitted
+//        "gang": {...},                // GangInfo as proto3 JSON, gang leases only
+//        "gang_file": "/.../att.json"} // HEAD only
 //     ],
 //     "outbox": [                      // pending status updates, oldest first
 //       {"job_id": "job-x", "local_job_id": "job-x.a2", "terminal": false,
@@ -67,6 +79,7 @@
 #include <cstring>
 #include <deque>
 #include <format>
+#include <limits>
 #include <fstream>
 #include <map>
 #include <set>
@@ -74,6 +87,7 @@
 #include <system_error>
 
 #include "tdr/common/common.hpp"
+#include "tdr/launch/launch.hpp"
 
 namespace tdr::remote {
 
@@ -136,7 +150,7 @@ bool write_atomic(const fs::path& path, const std::string& data) {
         ok = !ec;
     }
     if (!ok) {
-        log_error("remote: cannot write state file {}", path.string());
+        log_error("remote: cannot write {}", path.string());
         fs::remove(tmp, ec);
     }
     return ok;
@@ -163,7 +177,12 @@ bool bool_field(const json::object& o, std::string_view key, bool dflt = false) 
 // JobManager::submit: "input artifact not found locally: ..." or
 // "resume checkpoint not found locally: ...".
 constexpr std::string_view kInputMissing = "not found locally";
-constexpr std::uint64_t kStateVersion = 3;
+constexpr std::uint64_t kStateVersion = 4;
+
+std::uint32_t clamp32(std::uint64_t v) {
+    return v > std::numeric_limits<std::uint32_t>::max() ? std::numeric_limits<std::uint32_t>::max()
+                                                         : static_cast<std::uint32_t>(v);
+}
 
 }  // namespace
 
@@ -176,6 +195,8 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         bool terminal = false;  // outcome update queued
         bool submitted = true;  // local job submitted (false while fetching inputs)
         tv1::JobSpec spec;      // local spec, kept until submitted
+        std::optional<cv1::GangInfo> gang;  // Phase 7 gang lease
+        fs::path gang_file;                 // HEAD: the gang file it wrote
         // memory only
         bool fetching = false;
         std::size_t fetch_remaining = 0;
@@ -265,6 +286,12 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
                 (void)pbu::MessageToJsonString(l.spec, &sj, po);
                 o["spec"] = json::parse(sj);
             }
+            if (l.gang) {
+                std::string gj;
+                (void)pbu::MessageToJsonString(*l.gang, &gj, po);
+                o["gang"] = json::parse(gj);
+            }
+            if (!l.gang_file.empty()) o["gang_file"] = l.gang_file.string();
             ls.push_back(std::move(o));
         }
         json::array ob;
@@ -311,6 +338,15 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
                     auto st = pbu::JsonStringToMessage(json::serialize(*sp), &l.spec, po);
                     if (!st.ok()) throw std::runtime_error("bad spec: " + st.ToString());
                 }
+                if (const auto* g = o.if_contains("gang"); g && version >= 4) {
+                    cv1::GangInfo info;
+                    auto st = pbu::JsonStringToMessage(json::serialize(*g), &info, po);
+                    if (!st.ok()) throw std::runtime_error("bad gang: " + st.ToString());
+                    l.gang = std::move(info);
+                }
+                if (const auto* f = o.if_contains("gang_file"); f && f->is_string()) {
+                    l.gang_file = std::string(f->as_string());
+                }
                 ls[str_field(o, "local_job_id")] = std::move(l);
             }
             for (const auto& v : root.at("outbox").as_array()) {
@@ -350,6 +386,7 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
                 const bool queued = std::ranges::any_of(
                     outbox, [&](const Pending& p) { return p.terminal && p.local_id == local; });
                 if (!queued) {
+                    remove_gang_file(l);
                     it = leases.erase(it);  // already reported
                     continue;
                 }
@@ -448,17 +485,16 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         const std::uint32_t cpu = cap.cpu_cores > used_cpu ? static_cast<std::uint32_t>(cap.cpu_cores - used_cpu) : 0;
         const std::uint64_t used_mem = use.allocated.memory_bytes + held.memory_bytes;
         const std::uint64_t mem = cap.memory_bytes > used_mem ? cap.memory_bytes - used_mem : 0;
-        if (use.queued > 0 || slots == 0 || cpu == 0 || mem == 0) {
-            // Busy: a terminal local job triggers a prompt poll; this is the fallback.
-            schedule_poll(opts.poll_interval);
-            return;
-        }
+        // A busy node still polls, offering nothing: the control plane needs recent
+        // polls to pick it for a gang and to see a held node drain (phase7.md §3), and
+        // undelivered gang member leases (already accounted) still come back.
+        const bool busy_now = use.queued > 0 || slots == 0 || cpu == 0 || mem == 0;
         cv1::LeaseRequest req;
         req.set_node_id(node_id);
-        req.mutable_free()->set_cpu_cores(cpu);
-        req.mutable_free()->set_memory_bytes(mem);
-        req.mutable_free()->set_gpu_count(0);
-        req.set_max_jobs(slots);
+        req.mutable_free()->set_cpu_cores(busy_now ? 0 : cpu);
+        req.mutable_free()->set_memory_bytes(busy_now ? 0 : mem);
+        req.mutable_free()->set_gpu_count(0);  // node-side GPU accounting does not exist yet
+        req.set_max_jobs(busy_now ? 0 : slots);
         lease_in_flight = true;
         poll_again = false;
         const auto gen = ++lease_gen;
@@ -503,10 +539,124 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         l.spec = lease.spec();
         l.spec.set_job_id(local);
         l.spec.mutable_policy()->set_max_attempts(1);  // the control plane owns retries
-        leases[local] = std::move(l);
+        std::string gang_error;
+        if (lease.has_gang()) {
+            if (auto r = make_gang_job(l, lease.gang()); !r) gang_error = r.error();
+        }
+        Lease& stored = leases[local] = std::move(l);
+        if (!gang_error.empty()) {
+            log_warn("remote: gang lease {} rejected locally: {}", lease.job_id(), gang_error);
+            queue_outcome(local, stored, tv1::FAILED, "gang: " + gang_error, /*retryable=*/true, {});
+            save();
+            send_next_update();
+            return;
+        }
         save();  // mapping first: a crash after submit must still find it
-        log_info("remote: lease {} attempt {} -> local job {}", lease.job_id(), lease.attempt_number(), local);
+        log_info("remote: lease {} attempt {} -> local job {}{}", lease.job_id(), lease.attempt_number(), local,
+                 stored.gang ? (stored.gang->role() == cv1::GANG_HEAD ? " (gang head)" : " (gang member)") : "");
         prepare(local);
+    }
+
+    // ---- gangs (phase7.md §5) ---------------------------------------------------------
+
+    fs::path gang_dir() const {
+        if (!opts.gang_dir.empty()) return opts.gang_dir;
+        return opts.state_file.empty() ? fs::path("gangs") : opts.state_file.parent_path() / "gangs";
+    }
+
+    static void remove_gang_file(Lease& l) {
+        if (l.gang_file.empty()) return;
+        std::error_code ec;
+        fs::remove(l.gang_file, ec);
+        l.gang_file.clear();
+    }
+
+    // Rewrites l.spec (already the local spec) into the tdr-launch job of this
+    // node's gang role; HEAD also writes the gang file. Sets l.gang.
+    std::expected<void, std::string> make_gang_job(Lease& l, const cv1::GangInfo& info_in) {
+        cv1::GangInfo info = info_in;
+        l.gang = info;
+        std::vector<cv1::GangMember> members(info.members().begin(), info.members().end());
+        std::ranges::stable_sort(members, {}, &cv1::GangMember::member_index);
+        const auto self = std::ranges::find(members, info.member_index(), &cv1::GangMember::member_index);
+        if (self == members.end()) return std::unexpected(std::format("no member {} in gang", info.member_index()));
+        const std::uint32_t ranks_here = self->ranks();
+        if (ranks_here == 0) return std::unexpected("no ranks on this node");
+        if (opts.launcher.empty()) return std::unexpected("no tdr-launch launcher configured");
+        if (info.role() != cv1::GANG_HEAD && info.role() != cv1::GANG_MEMBER) return std::unexpected("no gang role");
+
+        tv1::JobSpec& spec = l.spec;
+        // Per-rank request -> this node's total.
+        auto* res = spec.mutable_resources();
+        const std::uint64_t cpu = res->cpu_cores() == 0 ? 1 : res->cpu_cores();
+        const std::uint64_t mem = res->memory_bytes() == 0 ? opts.default_job_memory_bytes : res->memory_bytes();
+        res->set_cpu_cores(clamp32(cpu * ranks_here));
+        res->set_memory_bytes(mem * ranks_here);
+        res->set_gpu_count(clamp32(std::uint64_t{res->gpu_count()} * ranks_here));
+
+        const std::vector<std::string> program(spec.command().argv().begin(), spec.command().argv().end());
+        std::vector<std::string> mpirun_args(spec.mpi().mpirun_args().begin(), spec.mpi().mpirun_args().end());
+        spec.clear_mpi();
+        auto* argv = spec.mutable_command()->mutable_argv();
+        argv->Clear();
+        *argv->Add() = opts.launcher.string();
+        if (info.role() == cv1::GANG_HEAD) {
+            if (program.empty()) return std::unexpected("empty command");
+            launch::GangFile g;
+            g.gang_id = l.attempt_id;
+            g.self_node_id = info.head_node_id().empty() ? self->node_id() : info.head_node_id();
+            std::uint32_t total = 0;
+            for (const auto& m : members) {
+                g.members.push_back({m.node_id(), m.name(), m.ranks()});
+                total += m.ranks();
+            }
+            g.ranks = info.ranks() == 0 ? total : info.ranks();
+            g.mpirun = opts.mpirun;
+            g.if_include = opts.mpi_if_include;
+            g.mca = opts.mpi_mca;
+            g.launch_timeout = opts.launch_timeout_s;
+            g.mpirun_args = std::move(mpirun_args);
+            const fs::path file = gang_dir() / (l.attempt_id + ".json");
+            if (!write_atomic(file, launch::to_json(g))) {
+                return std::unexpected("cannot write gang file " + file.string());
+            }
+            l.gang_file = file;
+            *argv->Add() = "head";
+            *argv->Add() = "--gang";
+            *argv->Add() = file.string();
+            *argv->Add() = "--";
+            for (const auto& a : program) *argv->Add() = a;
+        } else {
+            *argv->Add() = "member";
+            auto& env = *spec.mutable_command()->mutable_env();
+            env["FIREFORGE_GANG_ID"] = l.attempt_id;
+            env["FIREFORGE_GANG_HEAD"] = info.head_node_id();
+        }
+        // hwloc's GL component probes X11 ("Authorization required" noise in orted).
+        auto& env = *spec.mutable_command()->mutable_env();
+        if (env.find("HWLOC_COMPONENTS") == env.end()) env["HWLOC_COMPONENTS"] = "-gl";
+        return {};
+    }
+
+    std::optional<GangLocal> gang_local(const std::string& local, const Lease& l) const {
+        if (!l.gang) return std::nullopt;
+        return GangLocal{l.attempt_id, l.job_id, local, *l.gang};
+    }
+
+    std::optional<GangLocal> gang_by_id(const std::string& gang_id) const {
+        std::optional<GangLocal> found;
+        for (const auto& [local, l] : leases) {
+            if (!l.gang || l.attempt_id != gang_id) continue;
+            if (!l.terminal) return gang_local(local, l);
+            if (!found) found = gang_local(local, l);
+        }
+        return found;
+    }
+
+    std::optional<GangLocal> gang_of_local_job(const std::string& local) const {
+        auto it = leases.find(local);
+        if (it == leases.end()) return std::nullopt;
+        return gang_local(local, it->second);
     }
 
     // ---- inputs -> submit ---------------------------------------------------------
@@ -650,7 +800,10 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         if (!error.empty()) p.update.set_error(error);
         if (state == tv1::FAILED) p.update.set_retryable(retryable);
         for (auto& o : outputs) *p.update.add_outputs() = std::move(o);
-        if (p.terminal) l.terminal = true;
+        if (p.terminal) {
+            l.terminal = true;
+            remove_gang_file(l);
+        }
         outbox.push_back(std::move(p));
         return outbox.back();
     }
@@ -980,6 +1133,13 @@ void RemoteExecutor::announce(const std::vector<cv1::ArtifactRef>& refs) { impl_
 std::vector<std::string> RemoteExecutor::protected_inputs() const { return impl_->protected_inputs(); }
 void RemoteExecutor::on_checkpoint(const std::string& local_job_id, const tv1::NamedArtifact& checkpoint) {
     impl_->on_checkpoint(local_job_id, checkpoint);
+}
+
+std::optional<GangLocal> RemoteExecutor::gang_by_id(const std::string& gang_id) const {
+    return impl_->gang_by_id(gang_id);
+}
+std::optional<GangLocal> RemoteExecutor::gang_of_local_job(const std::string& local_job_id) const {
+    return impl_->gang_of_local_job(local_job_id);
 }
 
 std::optional<std::string> RemoteExecutor::central_job_id(const std::string& local_job_id) const {

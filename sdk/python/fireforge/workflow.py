@@ -54,6 +54,9 @@ _RUN_IF = {
     "always": job_pb2.ALWAYS,
 }
 _RESOURCE_KEYS = ("cpu_cores", "memory_bytes", "disk_bytes", "gpu_count")
+MAX_MPI_RANKS = 4096
+# TDR adds mpirun itself (phase7.md §2); argv must be the per-rank program.
+MPI_LAUNCHERS = ("mpirun", "mpiexec", "orterun", "prterun")
 
 
 class WorkflowError(ValueError):
@@ -143,19 +146,58 @@ def _as_list(value: Any, what: str) -> list:
         raise WorkflowError(f"{what} must be a list, got {value!r}") from None
 
 
+def _is_mpi_launcher(program: str) -> bool:
+    base = os.path.basename(program)
+    return any(base == l or base.startswith(l + ".") for l in MPI_LAUNCHERS)
+
+
+def build_mpi_spec(ranks: Any, max_ranks_per_node: Any = None,
+                   mpirun_args: Iterable[str] = (), argv: Iterable[str] = (),
+                   what: str = "job") -> "job_pb2.MpiSpec | None":
+    """Validate the MPI keywords and return a ``MpiSpec`` (None if ``ranks`` is None).
+
+    ``ranks``: int 1..4096. ``max_ranks_per_node``: int >= 0 (0/None = no
+    cap). ``mpirun_args``: extra mpirun arguments. The program
+    (``argv[0]``) must not be mpirun/mpiexec/orterun/prterun: TDR adds it.
+    """
+    mpirun_args = [str(a) for a in _as_list(mpirun_args, "mpirun_args")]
+    if ranks is None:
+        if max_ranks_per_node is not None or mpirun_args:
+            raise WorkflowError(f"{what}: max_ranks_per_node / mpirun_args need ranks=")
+        return None
+    if not isinstance(ranks, int) or isinstance(ranks, bool) or not 1 <= ranks <= MAX_MPI_RANKS:
+        raise WorkflowError(f"{what}: ranks must be an int in 1..{MAX_MPI_RANKS}, got {ranks!r}")
+    if max_ranks_per_node is None:
+        max_ranks_per_node = 0
+    if (not isinstance(max_ranks_per_node, int) or isinstance(max_ranks_per_node, bool)
+            or max_ranks_per_node < 0):
+        raise WorkflowError(f"{what}: max_ranks_per_node must be an int >= 0, "
+                            f"got {max_ranks_per_node!r}")
+    argv = list(argv)
+    if argv and _is_mpi_launcher(str(argv[0])):
+        raise WorkflowError(f"{what}: argv must be the per-rank program, not "
+                            f"{os.path.basename(str(argv[0]))!r} (TDR adds mpirun)")
+    return job_pb2.MpiSpec(ranks=ranks, max_ranks_per_node=max_ranks_per_node,
+                           mpirun_args=mpirun_args)
+
+
 def build_step_spec(name: str, *, operation: str | None = None, argv: Iterable[str] | None = None,
                     params: Any = None, inputs: Iterable[Any] = (), depends_on: Iterable[str] = (),
                     resources: Any = None, run_if: Any = "all_succeeded", allow_failure: bool = False,
                     input_artifacts: Any = (), capabilities: Iterable[str] = (),
                     max_attempts: int | None = None, timeout: float | None = None,
                     checkpoint: bool = False, env: Mapping[str, str] | None = None,
+                    ranks: int | None = None, max_ranks_per_node: int | None = None,
+                    mpirun_args: Iterable[str] = (),
                     allow_self_input: bool = False) -> "job_pb2.StepSpec":
     """Build one ``StepSpec``; shared by ``Workflow.step`` and ``Context.spawn``.
 
     ``argv`` must be given (callers apply their defaults first). ``params``: a
     dict/list (JSON-encoded), a str (used as is) or None. ``input_artifacts``:
     a list of artifact ids, or a dict ``{input_name: artifact_id}``.
-    ``timeout`` is in seconds (rounded up to whole seconds).
+    ``timeout`` is in seconds (rounded up to whole seconds). ``ranks`` /
+    ``max_ranks_per_node`` / ``mpirun_args``: ``JobSpec.mpi`` (see
+    ``build_mpi_spec``); ``resources`` is then per rank.
     """
     _check_name(name)
     argv = [str(a) for a in _as_list(argv, "argv")]
@@ -164,8 +206,12 @@ def build_step_spec(name: str, *, operation: str | None = None, argv: Iterable[s
     if operation is not None and not isinstance(operation, str):
         raise WorkflowError(f"step {name!r}: operation must be a str")
 
+    mpi = build_mpi_spec(ranks, max_ranks_per_node, mpirun_args, argv, f"step {name!r}")
+
     job = job_pb2.JobSpec(operation=operation or "")
     job.command.argv.extend(argv)
+    if mpi is not None:
+        job.mpi.CopyFrom(mpi)
     if env:
         for k, v in env.items():
             job.command.env[str(k)] = str(v)
@@ -284,8 +330,12 @@ class Workflow:
              run_if: Any = "all_succeeded", allow_failure: bool = False, resources: Any = None,
              checkpoint: bool = False, max_attempts: int | None = None, timeout: float | None = None,
              input_artifacts: Any = (), capabilities: Iterable[str] = (),
-             env: Mapping[str, str] | None = None) -> str:
-        """Add a step and return its name (use it in later ``inputs``/``depends_on``)."""
+             env: Mapping[str, str] | None = None, ranks: int | None = None,
+             max_ranks_per_node: int | None = None, mpirun_args: Iterable[str] = ()) -> str:
+        """Add a step and return its name (use it in later ``inputs``/``depends_on``).
+
+        ``ranks=N`` makes the step a multi-node MPI gang job (phase7.md §2).
+        """
         _check_name(name)
         if name in self._steps:
             raise WorkflowError(f"duplicate step name {name!r}")
@@ -300,7 +350,8 @@ class Workflow:
             depends_on=depends_on, resources=resources, run_if=run_if,
             allow_failure=allow_failure, input_artifacts=input_artifacts,
             capabilities=capabilities, max_attempts=max_attempts, timeout=timeout,
-            checkpoint=checkpoint, env=env)
+            checkpoint=checkpoint, env=env, ranks=ranks,
+            max_ranks_per_node=max_ranks_per_node, mpirun_args=mpirun_args)
         return name
 
     def validate(self) -> None:

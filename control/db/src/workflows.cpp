@@ -100,10 +100,37 @@ std::string json_str(const std::string& s) {
     return out + "\"";
 }
 
+// MPI rules (phase7.md §2); "" = valid. Mirrored by the API's create_job check.
+std::string check_mpi(const tv1::JobSpec& j, const GangOptions& g) {
+    const auto& m = j.mpi();
+    if (m.ranks() == 0) {
+        if (m.max_ranks_per_node() != 0 || !m.mpirun_args().empty())
+            return "mpi.max_ranks_per_node and mpi.mpirun_args need mpi.ranks > 0";
+        return {};
+    }
+    if (m.ranks() > g.max_ranks) return std::format("mpi.ranks {} exceeds the maximum of {}", m.ranks(), g.max_ranks);
+    if (m.max_ranks_per_node() > 0) {
+        const std::uint64_t nodes = (std::uint64_t{m.ranks()} + m.max_ranks_per_node() - 1) / m.max_ranks_per_node();
+        if (nodes > g.max_nodes)
+            return std::format("mpi.ranks {} at {} per node needs {} nodes (at most {})", m.ranks(),
+                               m.max_ranks_per_node(), nodes, g.max_nodes);
+    }
+    if (!j.command().argv().empty()) {
+        const std::string& a0 = j.command().argv(0);
+        const auto slash = a0.rfind('/');
+        const std::string base = slash == std::string::npos ? a0 : a0.substr(slash + 1);
+        if (base == "mpirun" || base == "mpiexec" || base == "orterun" || base == "prterun")
+            return std::format("command.argv is the program every rank runs; it must not start with {} (TDR adds mpirun)",
+                               base);
+    }
+    return {};
+}
+
 // JobSpec template rules shared by create_workflow and spawns (§3).
-std::string check_template(const std::string& step, const tv1::JobSpec& j) {
+std::string check_template(const std::string& step, const tv1::JobSpec& j, const GangOptions& g) {
     if (j.command().argv().empty() || j.command().argv(0).empty())
         return std::format("step {}: job.command.argv must not be empty", step);
+    if (auto e = check_mpi(j, g); !e.empty()) return std::format("step {}: job.{}", step, e);
     if (!j.job_id().empty() || !j.campaign_id().empty() || !j.workflow_id().empty() || !j.step().empty() ||
         !j.resume_checkpoint().empty())
         return std::format("step {}: job template must not set job_id, campaign_id, workflow_id, step or "
@@ -117,9 +144,9 @@ std::string check_template(const std::string& step, const tv1::JobSpec& j) {
     return {};
 }
 
-std::string check_common(const std::string& step, const tv1::StepSpec& s) {
+std::string check_common(const std::string& step, const tv1::StepSpec& s, const GangOptions& g) {
     if (!tv1::RunIf_IsValid(s.run_if())) return std::format("step {}: unknown run_if", step);
-    return check_template(step, s.job());
+    return check_template(step, s.job(), g);
 }
 
 // Kahn's algorithm over `deps` restricted to `nodes`. Returns a node on a cycle, or "".
@@ -420,7 +447,7 @@ std::expected<cv1::Workflow, std::string> WorkflowStore::create_workflow(const c
     std::vector<NewStep> steps;
     std::unordered_map<std::string, std::vector<std::string>> graph;
     for (const auto& s : req.steps()) {
-        if (auto e = check_common(s.name(), s); !e.empty()) return std::unexpected(e);
+        if (auto e = check_common(s.name(), s, gang_); !e.empty()) return std::unexpected(e);
         NewStep n;
         n.name = s.name();
         n.spec = s;
@@ -507,7 +534,7 @@ std::string WorkflowStore::prepare_spawn(const std::string& wf_id, const std::st
         ns.depth = depth;
         ns.spec = s;
         ns.spec.set_name(ns.name);
-        if (auto e = check_common(ns.name, s); !e.empty()) return e;
+        if (auto e = check_common(ns.name, s, gang_); !e.empty()) return e;
         // A short name that is also a sibling refers to the sibling.
         auto resolve = [&](const std::string& d) -> std::expected<std::string, std::string> {
             if (d == s.name()) return std::unexpected(std::format("step {} depends on itself", ns.name));
@@ -689,6 +716,7 @@ std::optional<cv1::Workflow> WorkflowStore::cancel_workflow(const std::string& i
                 c_.exec("UPDATE jobs SET state = 'CANCELLED', cancel_requested = true, last_error = $2,"
                         " updated_at = " TS(3) " WHERE job_id = $1",
                         j.str(i, 0), why, now_ms);
+                c_.exec("DELETE FROM gang_holds WHERE job_id = $1", j.str(i, 0));
                 mark_terminal(r, j.str(i, 2), "CANCELLED", why);
             }
         }

@@ -30,6 +30,9 @@
 #include <boost/program_options.hpp>
 
 #include "fireforge/tdr/v1/artifact.pb.h"
+#include "fireforge/tdr/v1/gang.pb.h"
+#include "tdr/gang/gang.hpp"
+#include "tdr/launch/launch.hpp"
 #include "fireforge/tdr/v1/local.pb.h"
 #include "tdr/agent/agent.hpp"
 #include "tdr/peer/manager.hpp"
@@ -154,6 +157,8 @@ public:
                     for (const auto& in : st->spec().input_artifacts()) gc_->touch(in);
             }
             if (remote_) remote_->on_job_state(job, s);
+            if (gang_) gang_->on_job_state(job, s);
+            if (tdr::jobs::is_terminal(s)) drop_local_gang_file(job);
             if (s == v1::COMPLETED) gc_->run([](const v1::GcReport&) {});  // outputs may push the store over the cap
         });
 
@@ -347,6 +352,12 @@ private:
         ropts.poll_idle = std::max(ropts.poll_interval, std::chrono::milliseconds(
                                                              std::chrono::seconds(cfg_.control.lease_poll_idle)));
         ropts.default_job_memory_bytes = res_.default_job_memory;
+        ropts.launcher = launcher_path();
+        ropts.gang_dir = cfg_.paths.state_dir / "state" / "gangs";
+        ropts.mpirun = cfg_.mpi.mpirun;
+        ropts.mpi_if_include = cfg_.mpi.if_include;
+        ropts.mpi_mca = cfg_.mpi.mca;
+        ropts.launch_timeout_s = cfg_.mpi.launch_timeout;
         tdr::remote::RemoteHooks rhooks;
         rhooks.connected = [this] { return agent_ && agent_->state() == tdr::agent::ControlState::kConnected; };
         rhooks.list_local_artifacts = [this] { return local_artifacts(); };
@@ -382,7 +393,9 @@ private:
             peers_->set_frame_handler([this](const std::string& from, Frame f) { on_peer_frame(from, std::move(f)); });
             peers_->set_state_listener([this](const std::string& id, tdr::peer::PeerState st) {
                 tdr::log_info("peer {} {}", peer_label(id), tdr::peer::to_string(st));
+                if (gang_ && st != tdr::peer::PeerState::kConnected) gang_->on_peer_lost(id);
             });
+            start_gangs();
             peer_self_id_ = agent_->node_id();
             start_transfer();
             peers_->start();
@@ -431,6 +444,120 @@ private:
         if (remote_) remote_->set_fetcher(service_.get());
     }
 
+    // ---- gangs (phase7.md §5) -------------------------------------------------------
+    std::filesystem::path launcher_path() const {
+        if (!cfg_.mpi.launcher.empty()) return cfg_.mpi.launcher;
+        std::error_code ec;
+        auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (ec) return "tdr-launch";
+        // Installed side by side, or the build tree (runtime/daemon/tdrd, runtime/launch/tdr-launch).
+        for (auto p : {self.parent_path() / "tdr-launch", self.parent_path().parent_path() / "launch" / "tdr-launch"})
+            if (std::filesystem::exists(p, ec)) return p;
+        return "tdr-launch";  // PATH
+    }
+
+    void start_gangs() {
+        if (!remote_ || gang_) return;
+        tdr::gang::GangHooks h;
+        h.send_peer = [this](const std::string& node, Frame f) { return peers_ && peers_->send(node, std::move(f)); };
+        h.gang_by_id = [this](const std::string& id) { return remote_->gang_by_id(id); };
+        h.gang_of_local_job = [this](const std::string& job) { return remote_->gang_of_local_job(job); };
+        h.verify_attempt = [this](const std::string& a, const std::string& t) { return manager_->verify_attempt(a, t); };
+        h.job_state = [this](const std::string& job) -> std::optional<v1::JobState> {
+            if (auto st = manager_->status(job)) return st->state();
+            return std::nullopt;
+        };
+        h.exec_member = [this](const std::string& job, const v1::WorkerExec& exec) {
+            auto st = manager_->status(job);
+            if (!st) return false;
+            auto it = conn_by_attempt_.find(st->current_attempt_id());
+            if (it == conn_by_attempt_.end()) return false;
+            auto c = it->second.lock();
+            if (!c || !c->is_open()) return false;
+            c->send(make_frame(v1::WORKER_EXEC, exec, next_message_id()));
+            return true;
+        };
+        h.cancel_job = [this](const std::string& job, const std::string& reason) {
+            tdr::log_info("gang: cancelling {}: {}", job, reason);
+            (void)manager_->cancel(job);
+        };
+        tdr::gang::GangOptions go;
+        go.launch_timeout = std::chrono::seconds(std::max(1u, cfg_.mpi.launch_timeout));
+        gang_ = std::make_unique<tdr::gang::GangService>(io_, go, std::move(h));
+    }
+
+    void on_gang_launch(const std::shared_ptr<Connection>& c, const Frame& f) {
+        v1::GangLaunchRequest req;
+        if (!f.parse(req)) return reply_error(c, f, v1::BAD_REQUEST, "bad GangLaunchRequest");
+        if (!gang_) return reply_error(c, f, v1::UNAVAILABLE, "gang launch needs the peer layer (control plane)");
+        auto freq = std::make_shared<Frame>(f);
+        std::weak_ptr<Connection> wc = c;
+        gang_->on_agent_launch(
+            c->id(), req,
+            [wc, freq](std::expected<void, std::string> ok) {
+                auto conn = wc.lock();
+                if (!conn || !conn->is_open()) return;
+                if (!ok) return reply_error(conn, *freq, v1::BAD_REQUEST, ok.error());
+                reply(conn, *freq, v1::WORKER_ACK, v1::Ack{});
+            },
+            [wc](const v1::GangExitNotice& n) {
+                auto conn = wc.lock();
+                if (conn && conn->is_open()) conn->send(make_frame(v1::WORKER_GANG_EXIT, n, next_message_id()));
+            });
+    }
+
+    // Local `tdrctl submit --ranks N`: a gang of one on this node (phase7.md §5).
+    std::expected<void, std::string> wrap_local_mpi(v1::JobSpec& spec) {
+        const auto& m = spec.mpi();
+        if (m.ranks() == 0) return {};
+        if (spec.command().argv_size() == 0) return std::unexpected("mpi job needs a command");
+        tdr::launch::GangFile g;
+        g.gang_id = tdr::new_id("local");
+        g.self_node_id = agent_ && !agent_->node_id().empty() ? agent_->node_id() : "local";
+        g.members.push_back({g.self_node_id, node_name(), m.ranks()});
+        g.ranks = m.ranks();
+        g.mpirun = cfg_.mpi.mpirun;
+        g.if_include = cfg_.mpi.if_include;
+        g.mca = cfg_.mpi.mca;
+        g.launch_timeout = cfg_.mpi.launch_timeout;
+        g.mpirun_args.assign(m.mpirun_args().begin(), m.mpirun_args().end());
+        const auto dir = cfg_.paths.state_dir / "state" / "gangs";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const auto file = dir / (g.gang_id + ".json");
+        {
+            std::ofstream out(file);
+            out << tdr::launch::to_json(g);
+            if (!out) return std::unexpected("cannot write " + file.string());
+        }
+        v1::Command cmd = spec.command();
+        auto* argv = spec.mutable_command()->mutable_argv();
+        argv->Clear();
+        argv->Add(launcher_path().string());
+        argv->Add("head");
+        argv->Add("--gang");
+        argv->Add(file.string());
+        argv->Add("--");
+        for (const auto& a : cmd.argv()) argv->Add(std::string(a));
+        auto* r = spec.mutable_resources();
+        const std::uint32_t cores = std::max(1u, r->cpu_cores());
+        const std::uint64_t mem = r->memory_bytes() ? r->memory_bytes() : res_.default_job_memory;
+        r->set_cpu_cores(cores * m.ranks());
+        r->set_memory_bytes(mem * m.ranks());
+        r->set_gpu_count(r->gpu_count() * m.ranks());
+        spec.clear_mpi();
+        pending_local_gang_file_ = file;
+        return {};
+    }
+
+    void drop_local_gang_file(const std::string& job) {
+        auto it = local_gang_files_.find(job);
+        if (it == local_gang_files_.end()) return;
+        std::error_code ec;
+        std::filesystem::remove(it->second, ec);
+        local_gang_files_.erase(it);
+    }
+
     // ---- checkpoint replication (phase6.md §6) ------------------------------------
     // Ask the closest connected peers to fetch a new checkpoint from us.
     void replicate(const std::string& id) {
@@ -451,6 +578,15 @@ private:
     }
 
     void on_peer_frame(const std::string& from, Frame f) {
+        switch (f.type()) {
+        case v1::GANG_LAUNCH:
+        case v1::GANG_STARTED:
+        case v1::GANG_EXIT:
+        case v1::GANG_KILL:
+            if (gang_) gang_->on_peer_frame(from, std::move(f));
+            return;
+        default: break;
+        }
         if (f.type() != v1::ARTIFACT_REPLICATE) return;
         v1::ArtifactReplicate msg;
         if (!f.parse(msg) || !tdr::artifacts::parse_artifact_id(msg.artifact_id()) || !service_) return;
@@ -843,6 +979,7 @@ private:
             manager_->on_worker_progress(p);
             return;
         }
+        case v1::WORKER_GANG_LAUNCH: return on_gang_launch(c, f);
         case v1::WORKER_CHECKPOINT: {
             v1::WorkerCheckpoint cp;
             if (!f.parse(cp)) return reply_error(c, f, v1::BAD_REQUEST, "bad WorkerCheckpoint");
@@ -869,6 +1006,7 @@ private:
     }
 
     void on_worker_close(const std::shared_ptr<Connection>& c) {
+        if (gang_) gang_->on_agent_closed(c->id());
         auto it = attempt_by_conn_.find(c->id());
         if (it == attempt_by_conn_.end()) return;
         auto ci = conn_by_attempt_.find(it->second);
@@ -894,7 +1032,15 @@ private:
         case v1::CTL_SUBMIT: {
             v1::SubmitJobRequest req;
             if (!f.parse(req)) return reply_error(c, f, v1::BAD_REQUEST, "bad SubmitJobRequest");
+            pending_local_gang_file_.clear();
+            if (auto w = wrap_local_mpi(*req.mutable_spec()); !w) return reply_error(c, f, v1::BAD_REQUEST, w.error());
             auto id = manager_->submit(req.spec());
+            if (!pending_local_gang_file_.empty()) {
+                std::error_code ec;
+                if (!id) std::filesystem::remove(pending_local_gang_file_, ec);
+                else local_gang_files_[*id] = pending_local_gang_file_;
+                pending_local_gang_file_.clear();
+            }
             if (!id) return reply_error(c, f, v1::BAD_REQUEST, id.error());
             v1::SubmitJobReply rep;
             rep.set_job_id(*id);
@@ -998,7 +1144,10 @@ private:
     std::unique_ptr<tdr::transfer::StoreGc> gc_;
     std::unique_ptr<tdr::transfer::ArtifactService> service_;
     std::string peer_self_id_;  // node id the PeerManager was created with
-    std::unordered_map<std::string, std::string> replica_hints_;  // artifact -> peer asking us to replicate
+    std::unordered_map<std::string, std::string> replica_hints_;
+    std::unique_ptr<tdr::gang::GangService> gang_;
+    std::filesystem::path pending_local_gang_file_;
+    std::unordered_map<std::string, std::filesystem::path> local_gang_files_;  // local MPI job -> gang file  // artifact -> peer asking us to replicate
     bool stopping_ = false;
     std::unordered_map<std::uint64_t, std::string> attempt_by_conn_;
     std::unordered_map<std::string, std::weak_ptr<Connection>> conn_by_attempt_;

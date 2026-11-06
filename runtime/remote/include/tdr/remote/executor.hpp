@@ -42,6 +42,21 @@ struct RemoteOptions {
     std::chrono::milliseconds retry_max{30000};
     std::uint64_t default_job_memory_bytes = 1ull << 30;  // same as ManagerOptions
     std::size_t announce_page = 1000;
+    // Phase 7 (phase7.md §5): gang leases.
+    fs::path launcher;                              // tdr-launch executable
+    fs::path gang_dir;                              // <state>/state/gangs: HEAD gang files
+    std::string mpirun = "mpirun";                  // copied into gang files
+    std::string mpi_if_include;
+    std::string mpi_mca;                            // "k=v,k=v"
+    std::uint32_t launch_timeout_s = 120;
+};
+
+// A gang lease held by this node (phase7.md §5).
+struct GangLocal {
+    std::string gang_id;          // control-plane attempt id
+    std::string central_job_id;
+    std::string local_job_id;
+    cv1::GangInfo info;           // role/member_index are this node's
 };
 
 struct RemoteHooks {
@@ -105,6 +120,16 @@ public:
     // Leases with spec.resume_checkpoint fetch it like an input before submit.
     // COMPLETED updates carry named outputs (JobStatus.outputs) and JobStatus.spawn.
     void on_checkpoint(const std::string& local_job_id, const tv1::NamedArtifact& checkpoint);
+
+    // Phase 7: gang leases. A lease with `gang` runs as a local job:
+    //   HEAD:   argv [launcher, "head", "--gang", <gang_dir>/<attempt>.json, "--", spec argv...]
+    //           (the gang file: JSON with members, ranks, mpirun, if_include, mca,
+    //            launch_timeout, mpirun_args; written before submit)
+    //   MEMBER: argv [launcher, "member"], env FIREFORGE_GANG_ID / FIREFORGE_GANG_HEAD.
+    // Resources: ranks on this node x spec.resources (cpu, memory, gpus), disk as is.
+    // Inputs are fetched on every member. Gang info survives restart (state file v4).
+    std::optional<GangLocal> gang_by_id(const std::string& gang_id) const;
+    std::optional<GangLocal> gang_of_local_job(const std::string& local_job_id) const;
 
     // Central job id of a local leased job, if it is one.
     std::optional<std::string> central_job_id(const std::string& local_job_id) const;

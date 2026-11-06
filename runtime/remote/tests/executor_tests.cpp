@@ -14,6 +14,7 @@
 #include "tdr/artifacts/store.hpp"
 #include "tdr/common/common.hpp"
 #include "tdr/journal/journal.hpp"
+#include "tdr/launch/launch.hpp"
 #include "tdr/remote/executor.hpp"
 #include "tdr/supervisor/supervisor.hpp"
 
@@ -420,7 +421,7 @@ BOOST_FIXTURE_TEST_CASE(no_lease_when_not_registered_disconnected_or_disabled, F
     BOOST_TEST(client.announces.requests.size() >= 1u);  // artifact sync still runs
 }
 
-BOOST_FIXTURE_TEST_CASE(no_lease_while_local_queue_non_empty_or_no_slot, Fixture) {
+BOOST_FIXTURE_TEST_CASE(busy_node_polls_but_offers_nothing, Fixture) {
     capacity = {4, 512 * kMiB, 3};
     make();
     // A takes most of the memory; B (256 MiB) has to wait in the local queue.
@@ -439,14 +440,23 @@ BOOST_FIXTURE_TEST_CASE(no_lease_while_local_queue_non_empty_or_no_slot, Fixture
     BOOST_REQUIRE(idb.has_value());
     BOOST_REQUIRE(mgr->usage().queued == 1u);
 
+    // Busy nodes keep polling (gang eligibility, phase7.md §3) but offer nothing.
+    auto offers_nothing = [&] {
+        for (const auto& q : client.leases.requests)
+            if (q.max_jobs() != 0u || q.free().cpu_cores() != 0u || q.free().memory_bytes() != 0u) return false;
+        return true;
+    };
     exec->on_registered("ff-node-1");
     run_for(200ms);
-    BOOST_TEST(client.leases.requests.empty());
+    BOOST_TEST(offers_nothing());
 
     // A ends -> B runs and ends -> capacity freed -> prompt poll.
     BOOST_REQUIRE(mgr->cancel(*ida).has_value());
-    BOOST_REQUIRE(run_until([&] { return !client.leases.requests.empty(); }));
-    BOOST_TEST(client.leases.requests[0].max_jobs() >= 2u);
+    BOOST_REQUIRE(run_until([&] {
+        for (const auto& q : client.leases.requests)
+            if (q.max_jobs() >= 2u) return true;
+        return false;
+    }));
     BOOST_REQUIRE(run_until([&] { return mgr->status(*idb)->state() == tv1::COMPLETED; }));
     BOOST_TEST(client.updates.requests.empty());  // local jobs are never reported
 
@@ -462,7 +472,7 @@ BOOST_FIXTURE_TEST_CASE(no_lease_while_local_queue_non_empty_or_no_slot, Fixture
     make_executor();
     exec->on_registered("ff-node-1");
     run_for(200ms);
-    BOOST_TEST(client.leases.requests.empty());
+    BOOST_TEST(offers_nothing());
 }
 
 BOOST_FIXTURE_TEST_CASE(lease_runs_and_reports_in_order_with_outputs, Fixture) {
@@ -716,7 +726,7 @@ BOOST_FIXTURE_TEST_CASE(corrupt_state_file_is_moved_aside, Fixture) {
     make();
     BOOST_TEST(exec->active_leases().empty());
     BOOST_TEST(fs::exists(ropts.state_file.string() + ".corrupt"));
-    BOOST_TEST(state_file_text().find("\"version\":3") != std::string::npos);  // rewritten empty
+    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);  // rewritten empty
 }
 
 BOOST_FIXTURE_TEST_CASE(full_artifact_sync_pages, Fixture) {
@@ -911,14 +921,15 @@ BOOST_FIXTURE_TEST_CASE(capacity_is_held_while_fetching, Fixture) {
     BOOST_TEST(!mgr->status("job-h.a1").has_value());
     BOOST_TEST(update_states("job-h").empty());
 
-    // A second fetching lease takes the last slot: no more lease requests.
+    // A second fetching lease takes the last slot: later requests offer nothing.
     auto l2 = make_lease("job-h2", {"/bin/true"});
     l2.mutable_spec()->add_input_artifacts(id);
     lease_once({l2});
     BOOST_REQUIRE(run_until([&] { return fetcher->hung.size() == 2u; }));
     const auto n = client.leases.requests.size();
     run_for(200ms);
-    BOOST_TEST(client.leases.requests.size() == n);
+    for (std::size_t i = n; i < client.leases.requests.size(); ++i)
+        BOOST_TEST(client.leases.requests[i].max_jobs() == 0u);
 
     // Fetches complete: the jobs run and capacity is released.
     auto hung = std::move(fetcher->hung);
@@ -1018,7 +1029,7 @@ BOOST_FIXTURE_TEST_CASE(version1_state_file_is_read, Fixture) {
     exec->on_registered("ff-node-1");
     BOOST_REQUIRE(run_until([&] { return has_terminal_update("old"); }));
     BOOST_TEST(last_update("old")->error() == "local job lost");
-    BOOST_TEST(state_file_text().find("\"version\":3") != std::string::npos);
+    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);
 }
 
 BOOST_FIXTURE_TEST_CASE(announce_reaches_client, Fixture) {
@@ -1114,7 +1125,7 @@ BOOST_FIXTURE_TEST_CASE(named_outputs_and_spawn_survive_executor_restart, Fixtur
     BOOST_REQUIRE(run_until([&] { return mgr->status("job-p.a1")->state() == tv1::COMPLETED; }));
     BOOST_REQUIRE(run_until([&] { return exec->stats().pending_updates == 1u; }));
     BOOST_TEST(state_file_text().find("cand-2") != std::string::npos);
-    BOOST_TEST(state_file_text().find("\"version\":3") != std::string::npos);
+    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);
     // job-q completes while no executor runs: start() queues it from the
     // JobManager's status (journal).
     exec.reset();
@@ -1286,4 +1297,242 @@ BOOST_FIXTURE_TEST_CASE(version2_state_file_is_read, Fixture) {
     BOOST_TEST(last_update("v2")->spawn_size() == 0);
 }
 
+// ---- Phase 7 gangs ----------------------------------------------------------------
+
+namespace {
+
+// A gang lease for `job_id` as seen by member `self` of nodes {head 2 ranks, n2 1 rank}.
+cv1::Lease make_gang_lease(const std::string& job_id, std::uint32_t self, std::vector<std::string> argv) {
+    auto l = make_lease(job_id, std::move(argv));
+    l.mutable_spec()->mutable_resources()->set_cpu_cores(0);       // -> 1 per rank
+    l.mutable_spec()->mutable_resources()->set_memory_bytes(32 * kMiB);
+    l.mutable_spec()->mutable_resources()->set_gpu_count(1);
+    l.mutable_spec()->mutable_resources()->set_disk_bytes(1000);
+    l.mutable_spec()->set_operation("mpi.task");
+    (*l.mutable_spec()->mutable_command()->mutable_env())["USER_VAR"] = "x";
+    l.mutable_spec()->mutable_mpi()->set_ranks(3);
+    l.mutable_spec()->mutable_mpi()->add_mpirun_args("--bind-to");
+    l.mutable_spec()->mutable_mpi()->add_mpirun_args("core");
+    auto* g = l.mutable_gang();
+    g->set_role(self == 0 ? cv1::GANG_HEAD : cv1::GANG_MEMBER);
+    g->set_member_index(self);
+    g->set_ranks(3);
+    g->set_head_node_id("ff-node-1");
+    // Deliberately out of member_index order.
+    auto* m1 = g->add_members();
+    m1->set_node_id("ff-node-2");
+    m1->set_name("node-b");
+    m1->set_member_index(1);
+    m1->set_rank_offset(2);
+    m1->set_ranks(1);
+    m1->set_role(cv1::GANG_MEMBER);
+    auto* m0 = g->add_members();
+    m0->set_node_id("ff-node-1");
+    m0->set_name("node-a");
+    m0->set_member_index(0);
+    m0->set_rank_offset(0);
+    m0->set_ranks(2);
+    m0->set_role(cv1::GANG_HEAD);
+    return l;
+}
+
+std::vector<std::string> argv_of(const tv1::JobSpec& s) { return {s.command().argv().begin(), s.command().argv().end()}; }
+
+}  // namespace
+
+struct GangFixture : Fixture {
+    fs::path launcher;
+    GangFixture() {
+        launcher = tmp.path / "tdr-launch";
+        std::ofstream(launcher) << "#!/bin/sh\nexec sleep 30\n";
+        fs::permissions(launcher, fs::perms::owner_all);
+        ropts.launcher = launcher;
+        ropts.gang_dir = tmp.path / "state" / "gangs";
+        ropts.mpirun = "/opt/mpi/bin/mpirun";
+        ropts.mpi_if_include = "lo";
+        ropts.mpi_mca = "a=1,b=2";
+        ropts.launch_timeout_s = 7;
+    }
+};
+
+BOOST_FIXTURE_TEST_CASE(gang_head_lease_runs_launcher_head_with_gang_file, GangFixture) {
+    make();
+    auto l = make_gang_lease("job-g", 0, {"/usr/bin/prog", "arg1"});
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] {
+        auto st = mgr->status("job-g.a1");
+        return st && st->state() == tv1::RUNNING;
+    }));
+    const auto st = *mgr->status("job-g.a1");
+    const fs::path file = ropts.gang_dir / (l.attempt_id() + ".json");
+    const std::vector<std::string> want = {launcher.string(), "head", "--gang", file.string(), "--",
+                                           "/usr/bin/prog", "arg1"};
+    BOOST_TEST(argv_of(st.spec()) == want, boost::test_tools::per_element());
+    BOOST_TEST(st.spec().command().env().at("USER_VAR") == "x");
+    BOOST_TEST(!st.spec().command().env().contains("FIREFORGE_GANG_ID"));
+    BOOST_TEST(st.spec().command().env().at("HWLOC_COMPONENTS") == "-gl");
+    BOOST_TEST(st.spec().resources().cpu_cores() == 2u);
+    BOOST_TEST(st.spec().resources().memory_bytes() == 64 * kMiB);
+    BOOST_TEST(st.spec().resources().gpu_count() == 2u);
+    BOOST_TEST(st.spec().resources().disk_bytes() == 1000u);
+    BOOST_TEST(st.spec().mpi().ranks() == 0u);  // cleared: already wrapped
+    BOOST_TEST(st.spec().policy().max_attempts() == 1u);
+
+    // Gang file content.
+    BOOST_REQUIRE(fs::exists(file));
+    std::ifstream in(file);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    auto g = tdr::launch::parse_gang_file(ss.str());
+    BOOST_REQUIRE_MESSAGE(g.has_value(), g.error());
+    BOOST_TEST(g->gang_id == l.attempt_id());
+    BOOST_TEST(g->self_node_id == "ff-node-1");
+    BOOST_REQUIRE(g->members.size() == 2u);
+    BOOST_TEST(g->members[0].node_id == "ff-node-1");
+    BOOST_TEST(g->members[0].name == "node-a");
+    BOOST_TEST(g->members[0].ranks == 2u);
+    BOOST_TEST(g->members[1].node_id == "ff-node-2");
+    BOOST_TEST(g->members[1].ranks == 1u);
+    BOOST_TEST(g->ranks == 3u);
+    BOOST_TEST(g->mpirun == "/opt/mpi/bin/mpirun");
+    BOOST_TEST(g->if_include == "lo");
+    BOOST_TEST(g->mca == "a=1,b=2");
+    BOOST_TEST(g->launch_timeout == 7u);
+    const std::vector<std::string> margs = {"--bind-to", "core"};
+    BOOST_TEST(g->mpirun_args == margs, boost::test_tools::per_element());
+
+    // Lookups.
+    auto byid = exec->gang_by_id(l.attempt_id());
+    BOOST_REQUIRE(byid.has_value());
+    BOOST_TEST(byid->local_job_id == "job-g.a1");
+    BOOST_TEST(byid->central_job_id == "job-g");
+    BOOST_TEST(byid->info.role() == cv1::GANG_HEAD);
+    BOOST_TEST(exec->gang_of_local_job("job-g.a1").has_value());
+    BOOST_TEST(!exec->gang_by_id("att-other").has_value());
+    BOOST_TEST(!exec->gang_of_local_job("nope").has_value());
+
+    // Reporting as for any lease; the gang file goes away with the lease.
+    BOOST_REQUIRE(run_until([&] { return !update_states("job-g").empty(); }));
+    BOOST_TEST(update_states("job-g")[0] == tv1::RUNNING);
+    BOOST_REQUIRE(mgr->cancel("job-g.a1").has_value());
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-g"); }));
+    BOOST_TEST(last_update("job-g")->state() == tv1::CANCELLED);
+    BOOST_TEST(!fs::exists(file));
+    BOOST_REQUIRE(run_until([&] { return exec->stats().pending_updates == 0; }));
+    BOOST_TEST(!exec->gang_by_id(l.attempt_id()).has_value());
+}
+
+BOOST_FIXTURE_TEST_CASE(gang_member_lease_runs_launcher_member, GangFixture) {
+    make();
+    auto l = make_gang_lease("job-m", 1, {"/usr/bin/prog"});
+    lease_once({l});
+    exec->on_registered("ff-node-2");
+    BOOST_REQUIRE(run_until([&] {
+        auto st = mgr->status("job-m.a1");
+        return st && st->state() == tv1::RUNNING;
+    }));
+    const auto st = *mgr->status("job-m.a1");
+    const std::vector<std::string> want = {launcher.string(), "member"};
+    BOOST_TEST(argv_of(st.spec()) == want, boost::test_tools::per_element());
+    const auto& env = st.spec().command().env();
+    BOOST_TEST(env.at("FIREFORGE_GANG_ID") == l.attempt_id());
+    BOOST_TEST(env.at("FIREFORGE_GANG_HEAD") == "ff-node-1");
+    BOOST_TEST(env.at("USER_VAR") == "x");
+    BOOST_TEST(env.at("HWLOC_COMPONENTS") == "-gl");
+    BOOST_TEST(st.spec().operation() == "mpi.task");
+    BOOST_TEST(st.spec().resources().cpu_cores() == 1u);
+    BOOST_TEST(st.spec().resources().memory_bytes() == 32 * kMiB);
+    BOOST_TEST(st.spec().resources().gpu_count() == 1u);
+    BOOST_TEST(st.spec().resources().disk_bytes() == 1000u);
+    BOOST_TEST(!fs::exists(ropts.gang_dir / (l.attempt_id() + ".json")));  // HEAD only
+    auto g = exec->gang_of_local_job("job-m.a1");
+    BOOST_REQUIRE(g.has_value());
+    BOOST_TEST(g->gang_id == l.attempt_id());
+    BOOST_TEST(g->info.role() == cv1::GANG_MEMBER);
+    BOOST_TEST(g->info.member_index() == 1u);
+}
+
+BOOST_FIXTURE_TEST_CASE(gang_member_default_memory_scales_per_rank, GangFixture) {
+    make();
+    auto l = make_gang_lease("job-d", 0, {"/usr/bin/prog"});
+    l.mutable_spec()->mutable_resources()->set_memory_bytes(0);
+    l.mutable_spec()->mutable_resources()->set_cpu_cores(1);
+    (*l.mutable_spec()->mutable_command()->mutable_env())["HWLOC_COMPONENTS"] = "user";
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return mgr->status("job-d.a1").has_value(); }));
+    const auto st = *mgr->status("job-d.a1");
+    BOOST_TEST(st.spec().command().env().at("HWLOC_COMPONENTS") == "user");  // spec wins
+    BOOST_TEST(st.spec().resources().memory_bytes() == 2 * ropts.default_job_memory_bytes);
+    BOOST_TEST(st.spec().resources().cpu_cores() == 2u);
+}
+
+BOOST_FIXTURE_TEST_CASE(gang_lease_without_launcher_fails_retryable, GangFixture) {
+    ropts.launcher.clear();
+    make();
+    lease_once({make_gang_lease("job-n", 1, {"/usr/bin/prog"})});
+    exec->on_registered("ff-node-2");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-n"); }));
+    BOOST_TEST(last_update("job-n")->state() == tv1::FAILED);
+    BOOST_TEST(last_update("job-n")->retryable());
+    BOOST_TEST(!mgr->status("job-n.a1").has_value());
+}
+
+BOOST_FIXTURE_TEST_CASE(gang_lease_inputs_fetched_on_member, GangFixture) {
+    make_with_fetcher();
+    const std::string in = fetcher->add("input bytes");
+    auto l = make_gang_lease("job-i", 1, {"/usr/bin/prog"});
+    l.mutable_spec()->add_input_artifacts(in);
+    lease_once({l});
+    exec->on_registered("ff-node-2");
+    BOOST_REQUIRE(run_until([&] {
+        auto st = mgr->status("job-i.a1");
+        return st && st->state() == tv1::RUNNING;
+    }));
+    BOOST_TEST(fetcher->calls.size() == 1u);
+    BOOST_TEST(store->contains(in));
+}
+
+BOOST_FIXTURE_TEST_CASE(gang_info_survives_executor_restart, GangFixture) {
+    make();
+    auto l = make_gang_lease("job-r", 0, {"/usr/bin/prog"});
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return !update_states("job-r").empty() && exec->stats().pending_updates == 0; }));
+    const fs::path file = ropts.gang_dir / (l.attempt_id() + ".json");
+    BOOST_TEST(fs::exists(file));
+    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);
+    exec.reset();
+    make_executor();
+    auto g = exec->gang_by_id(l.attempt_id());
+    BOOST_REQUIRE(g.has_value());
+    BOOST_TEST(g->local_job_id == "job-r.a1");
+    BOOST_TEST(g->info.role() == cv1::GANG_HEAD);
+    BOOST_TEST(g->info.members_size() == 2);
+    BOOST_TEST(g->info.head_node_id() == "ff-node-1");
+    BOOST_TEST(fs::exists(file));
+    // The restored lease still removes its gang file when it ends.
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(mgr->cancel("job-r.a1").has_value());
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-r"); }));
+    BOOST_TEST(!fs::exists(file));
+}
+
+BOOST_FIXTURE_TEST_CASE(version3_state_file_is_read, Fixture) {
+    fs::create_directories(ropts.state_file.parent_path());
+    std::ofstream(ropts.state_file) << R"({"version":3,"leases":[{"local_job_id":"v3.a1","job_id":"v3",
+        "attempt_id":"att-v3","fencing_token":1,"attempt_number":1,"terminal":true,"submitted":true}],
+        "outbox":[{"job_id":"v3","local_job_id":"v3.a1","terminal":true,
+        "update":{"attempt_id":"att-v3","fencing_token":"1","state":"COMPLETED"}}]})";
+    make();
+    BOOST_TEST(exec->stats().pending_updates == 1u);
+    BOOST_TEST(!exec->gang_of_local_job("v3.a1").has_value());
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("v3"); }));
+    BOOST_TEST(last_update("v3")->state() == tv1::COMPLETED);
+    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
+

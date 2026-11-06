@@ -44,6 +44,12 @@ enum MessageType {
   CHECKPOINT_CREATE = 0x0401;
   CHECKPOINT_RESTORE = 0x0402;
 
+  // ---- Peer: gangs (Phase 7, payloads in gang.proto) ----------------------
+  GANG_LAUNCH = 0x0501;      // GangLaunch    head -> member
+  GANG_STARTED = 0x0502;     // GangStarted   member -> head (reply)
+  GANG_EXIT = 0x0503;        // GangExit      member -> head
+  GANG_KILL = 0x0504;        // GangKill      head -> member
+
   // ---- Local: daemon <-> worker child process (Phase 1) -------------------
   WORKER_HELLO = 0x1001;     // worker -> daemon   WorkerHello
   WORKER_TASK = 0x1002;      // daemon -> worker   WorkerTask   (reply to HELLO)
@@ -52,6 +58,9 @@ enum MessageType {
   WORKER_CANCEL = 0x1005;    // daemon -> worker   WorkerCancel (unsolicited)
   WORKER_ACK = 0x1006;       // daemon -> worker   Ack          (reply to RESULT, CHECKPOINT)
   WORKER_CHECKPOINT = 0x1007;  // worker -> daemon WorkerCheckpoint (Phase 6)
+  WORKER_EXEC = 0x1008;        // daemon -> tdr-launch member   WorkerExec (Phase 7)
+  WORKER_GANG_LAUNCH = 0x1009; // tdr-launch agent -> daemon    GangLaunchRequest (Phase 7)
+  WORKER_GANG_EXIT = 0x100A;   // daemon -> tdr-launch agent    GangExitNotice (Phase 7)
 
   // ---- Local: tdrctl <-> daemon (Phase 1) ---------------------------------
   CTL_SUBMIT = 0x1101;             // SubmitJobRequest  -> SubmitJobReply

@@ -24,6 +24,8 @@ public:
     WorkflowStore(pg::Conn& c, JobStore& jobs) : c_(c), jobs_(jobs) {}
 
     void set_limits(const WorkflowLimits& l) { limits_ = l; }
+    // MPI step validation (phase7.md §2: max_ranks, max_nodes).
+    void set_gang_options(const GangOptions& g) { gang_ = g; }
 
     std::expected<cv1::Workflow, std::string> create_workflow(const cv1::CreateWorkflowRequest& req,
                                                               const std::string& submitted_by, std::int64_t now_ms);
@@ -80,6 +82,7 @@ private:
     pg::Conn& c_;
     JobStore& jobs_;
     WorkflowLimits limits_;
+    GangOptions gang_;
 };
 
 }  // namespace tdr::cpdb

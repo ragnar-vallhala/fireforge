@@ -54,6 +54,15 @@ struct Config {
         std::uint32_t checkpoint_replicas = 1;  // Phase 6: peers asked to copy each new checkpoint
     } artifacts;
 
+    // Phase 7 multi-node MPI (docs/design/phase7.md §7).
+    struct Mpi {
+        std::string mpirun = "mpirun";
+        std::filesystem::path launcher;      // empty = tdr-launch next to the tdrd binary
+        std::string if_include;              // interface/CIDR for MPI TCP traffic ("" = Open MPI default)
+        std::string mca;                     // "k=v,k=v" extra MCA params
+        std::uint32_t launch_timeout = 120;  // seconds a member waits for its launch / head waits for a member
+    } mpi;
+
     struct Resources {
         std::uint32_t max_cpu_cores = 0;     // 0 = all online CPUs
         std::uint64_t max_memory_mb = 0;     // 0 = 80% of physical RAM

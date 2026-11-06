@@ -539,7 +539,7 @@ Potential Linux mechanisms:
 - `rlimit`.
 - Restricted users and filesystem permissions.
 
-MPI support should begin with single-node jobs. Multi-node MPI will be built into TDR as Phase 7, after the workflow engine (Phase 6), once distributed resource allocation and coordinated process launch are properly implemented, rather than delegated to Slurm.
+MPI runs under TDR itself, not Slurm. A job asks for a total rank count; the control plane packs the ranks onto connected nodes, reserves and drains their capacity, and launches the whole gang at once. `mpirun` starts on the head node and reaches the other members through the TDR launch agent, so every rank runs in its own node's job sandbox. Losing any member retries the whole gang. Single-node MPI (`tdrctl submit --ranks N`) uses the same path ([Phase 7](docs/design/phase7.md)).
 
 # 12. Python Scientific SDK
 
@@ -863,7 +863,7 @@ Security requirements:
 | 8 | Scientific integration | Complete thermoelectric workflow |
 | 9 | Discovery intelligence | Automated candidate discovery |
 
-Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md), [Phase 4](docs/design/phase4.md), [Phase 5](docs/design/phase5.md), [Phase 6](docs/design/phase6.md).
+Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md), [Phase 4](docs/design/phase4.md), [Phase 5](docs/design/phase5.md), [Phase 6](docs/design/phase6.md), [Phase 7](docs/design/phase7.md).
 
 ## First Demonstration
 
@@ -974,3 +974,4 @@ The platform begins by integrating established scientific solvers and validating
 | 0.2 | 2026-11-05 | Architectural decisions recorded (§21); roadmap gains a multi-node execution phase (§20). |
 | 0.3 | 2026-11-06 | Artifact retention decided (§21 #13); Phase 4 and 5 designs linked. |
 | 0.4 | 2026-11-06 | Push/pull policy resolved as reserve-and-rank (§14, §21 #3); Phase 6 design linked. |
+| 0.5 | 2026-11-06 | Multi-node MPI described (§11): gang placement with reserve-and-drain, launch agent; Phase 7 design linked. |

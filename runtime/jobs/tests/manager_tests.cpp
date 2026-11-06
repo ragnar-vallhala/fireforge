@@ -621,6 +621,30 @@ BOOST_FIXTURE_TEST_CASE(worker_hello_rejections, Fixture) {
     BOOST_TEST(!mgr->on_worker_result(ok_result("att-unknown")).has_value());
 }
 
+BOOST_FIXTURE_TEST_CASE(verify_attempt_checks_token_and_running, Fixture) {
+    auto id = submit(spec());
+    const auto att = launch(0).attempt_id;
+    const auto token = launch(0).env.at("FIREFORGE_ATTEMPT_TOKEN");
+    BOOST_TEST(!mgr->verify_attempt(att, std::string(64, '0')).has_value());
+    BOOST_TEST(!mgr->verify_attempt(att, "").has_value());
+    BOOST_TEST(!mgr->verify_attempt("att-unknown", token).has_value());
+    auto r = mgr->verify_attempt(att, token);
+    BOOST_REQUIRE(r.has_value());
+    BOOST_TEST(*r == id);
+    // No binding: verifying again, and a worker hello afterwards, still work.
+    BOOST_TEST(mgr->verify_attempt(att, token).has_value());
+    v1::WorkerHello h;
+    h.set_attempt_id(att);
+    h.set_token(token);
+    BOOST_TEST(mgr->on_worker_hello(h).has_value());
+    BOOST_TEST(mgr->verify_attempt(att, token).has_value());
+    BOOST_TEST(state(id) == v1::RUNNING);
+
+    sup.exit_code(0, 0);
+    pump();
+    BOOST_TEST(!mgr->verify_attempt(att, token).has_value());  // finished attempt
+}
+
 BOOST_FIXTURE_TEST_CASE(progress_stored, Fixture) {
     auto id = submit(spec());
     v1::WorkerProgress p;

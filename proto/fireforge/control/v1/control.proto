@@ -189,6 +189,31 @@ message ArtifactRef {
   string name = 6;                 // Phase 6: output name within producer_job ("" in announcements)
 }
 
+// ---- gangs (phase7.md §3, §4) ----
+enum GangRole {
+  GANG_ROLE_UNSPECIFIED = 0;
+  GANG_HEAD = 1;     // runs mpirun; rank 0 lives here; its terminal report decides the job
+  GANG_MEMBER = 2;   // runs the MPI daemon started through the head's launch agent
+}
+
+message GangMember {
+  string node_id = 1;
+  string name = 2;
+  uint32 member_index = 3;   // 0 = head
+  uint32 rank_offset = 4;
+  uint32 ranks = 5;
+  GangRole role = 6;
+  string state = 7;          // "HELD" | "READY" | "LEASED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED" | "ABANDONED"
+}
+
+message GangInfo {
+  GangRole role = 1;           // of the lease holder
+  uint32 member_index = 2;     // of the lease holder
+  repeated GangMember members = 3;  // all members, by member_index
+  uint32 ranks = 4;            // total
+  string head_node_id = 5;
+}
+
 message JobAttempt {
   string attempt_id = 1;           // "att-<16 hex>"
   uint32 number = 2;               // 1-based
@@ -199,6 +224,7 @@ message JobAttempt {
   int64 leased_unix_ms = 7;
   int64 expires_unix_ms = 8;
   int64 ended_unix_ms = 9;
+  repeated GangMember members = 10;  // gang attempts (Phase 7)
 }
 
 message Job {
@@ -223,6 +249,9 @@ message Job {
   ArtifactRef checkpoint = 18;     // latest checkpoint (name set)
   string reserved_node = 19;       // ranked placement reservation (phase6.md §7)
   int64 reserved_until_unix_ms = 20;
+  // ---- Phase 7 ----
+  repeated GangMember gang = 21;   // current attempt's members, or the hold while draining
+  string pending_reason = 22;      // why a QUEUED job isn't running yet (gangs)
 }
 
 // ---- workflows (phase6.md §3, §8) ----
@@ -292,6 +321,7 @@ message Lease {
   uint32 attempt_number = 4;
   fireforge.tdr.v1.JobSpec spec = 5;
   int64 expires_unix_ms = 6;
+  GangInfo gang = 7;               // set for gang (MPI) leases (Phase 7)
 }
 
 message LeaseReply {

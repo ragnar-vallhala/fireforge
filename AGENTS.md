@@ -7,6 +7,7 @@ Phase 3 (peer networking, `docs/design/phase3.md`) is done.
 Phase 4 (distributed execution: central queue + leases, `docs/design/phase4.md`) is done.
 Phase 5 (artifact infrastructure: peer transfer, placement, retention, `docs/design/phase5.md`) is done.
 Phase 6 (workflow engine: DAGs, fan-out, checkpoints, ranked placement, `docs/design/phase6.md`) is done.
+Phase 7 (multi-node MPI: gang placement, reserve-and-drain, launch agent, `docs/design/phase7.md`) is done.
 
 ## Memory cap — mandatory
 
@@ -39,6 +40,8 @@ runtime/tls, http, agent  mTLS/PKI, HTTPS server+client, tdrd control-plane agen
 runtime/peer              peer links: TLS transport + PeerManager (Phase 3)
 runtime/remote            RemoteExecutor: control-plane leases run as local jobs (Phase 4)
 runtime/transfer          ArtifactService (peer artifact transfer) + StoreGc (Phase 5)
+runtime/gang              GangService: cross-node MPI launch relay between peers (Phase 7)
+runtime/launch            tdr-launch (head/agent/member/rank) + gang file and mpirun argv builders (Phase 7)
 runtime/daemon, ctl       tdrd and tdrctl executables
 control/db, api, server   tdrcp: Postgres repository, API handlers, executable
 sdk/python/fireforge/     Python worker SDK (tests in sdk/python/tests)

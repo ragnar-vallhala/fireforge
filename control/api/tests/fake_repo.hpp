@@ -560,6 +560,14 @@ public:
         ++limits_set;
     }
 
+    // Phase 7: stored only (gang placement is the repository's).
+    cpdb::GangOptions gang_options;
+    int gang_options_set = 0;
+    void set_gang_options(const cpdb::GangOptions& g) override {
+        gang_options = g;
+        ++gang_options_set;
+    }
+
     std::vector<cpdb::Reservation> place_jobs(const cpdb::PlacementOptions& o, std::int64_t) override {
         maybe_fail();
         last_placement = o;

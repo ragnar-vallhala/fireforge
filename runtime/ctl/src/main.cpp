@@ -36,7 +36,8 @@ constexpr const char* kUsage = R"(usage: tdrctl [--socket PATH] <command> [args]
 commands:
   submit [--cpus N] [--memory-mb N] [--timeout S] [--attempts N]
          [--operation OP] [--params JSON] [--input ARTIFACT]...
-         [--env KEY=VALUE]... [--campaign ID] [--material ID] -- argv...
+         [--env KEY=VALUE]... [--campaign ID] [--material ID]
+         [--ranks N [--mpirun-arg A]...] -- argv...      (--ranks: MPI on this node; per-rank --cpus/--memory-mb)
   status JOB_ID [--json]
   list [--state STATE] [--limit N] [--json]
   cancel JOB_ID
@@ -150,6 +151,10 @@ int cmd_submit(Client& cl, std::vector<std::string> a) {
         else if (f == "--attempts") spec->mutable_policy()->set_max_attempts(static_cast<std::uint32_t>(to_u64(f, val(f))));
         else if (f == "--operation") spec->set_operation(val(f));
         else if (f == "--params") spec->set_parameters_json(val(f));
+        else if (f == "--ranks") spec->mutable_mpi()->set_ranks(static_cast<std::uint32_t>(to_u64(f, val(f))));
+        else if (f == "--max-ranks-per-node")
+            spec->mutable_mpi()->set_max_ranks_per_node(static_cast<std::uint32_t>(to_u64(f, val(f))));
+        else if (f == "--mpirun-arg") spec->mutable_mpi()->add_mpirun_args(val(f));
         else if (f == "--input") spec->add_input_artifacts(val(f));
         else if (f == "--campaign") spec->set_campaign_id(val(f));
         else if (f == "--material") spec->set_material_id(val(f));
