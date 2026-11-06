@@ -23,6 +23,19 @@
 // - Callbacks (state listener, frame handler) are called synchronously and
 //   must not call update_directory() or stop() re-entrantly; the directory
 //   refresh callback is posted and may do anything.
+//
+// Data links (docs/design/phase5.md §2) live in their own table (data_links),
+// never in `links`/peers: no hello, ping, dedup or snapshot. An inbound link
+// moves there when its first frame is ARTIFACT_REQUEST and the acceptor takes
+// it; outbound ones when dial_data connects. Their frames (sender_id-checked)
+// and their single close go to the caller's DataLinkHandlers; handlers may
+// call anything on the manager except stop()/update_directory() re-entrantly.
+// - The CN of an inbound data link must belong to a node listed in the current
+//   directory (a peer known only from an unknown inbound hello doesn't count).
+// - stop() closes data links (on_close follows through the transport) and
+//   fails pending dial_data calls ("peer manager stopped", posted). After the
+//   manager is destroyed nothing is called any more: pending dial_data
+//   callbacks and data-link on_close are dropped.
 #include <algorithm>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -154,6 +167,28 @@ struct PeerManager::Impl : std::enable_shared_from_this<Impl> {
     std::function<void(const std::string&, protocol::Frame)> frame_handler;
     std::function<void(const std::string&, PeerState)> state_listener;
     std::function<void()> refresh;
+
+    struct DataLink {
+        std::shared_ptr<IFrameLink> link;
+        std::string node_id;
+        NodeId sender{};
+        DataLinkHandlers handlers;
+        bool closing = false;  // closed by us; later frames are dropped
+    };
+    struct DataDial {
+        std::uint64_t id = 0;
+        std::string node_id, name;
+        std::vector<cv1::NodeAddress> addrs;
+        std::size_t idx = 0;
+        DataLinkHandlers handlers;
+        std::function<void(DataDialResult)> cb;
+        std::string last_error;
+        bool done = false;
+    };
+    std::unordered_map<std::uint64_t, DataLink> data_links;  // by link id
+    std::map<std::uint64_t, std::shared_ptr<DataDial>> data_dials;
+    std::uint64_t next_data_dial = 1;
+    DataAcceptor data_acceptor;
 
     // ---- lookup -------------------------------------------------------------
 
@@ -467,7 +502,11 @@ struct PeerManager::Impl : std::enable_shared_from_this<Impl> {
         close_link(l, msg);
     }
 
-    void inbound_pre_hello(Link& l, const protocol::Frame& f) {
+    void inbound_pre_hello(Link& l, protocol::Frame f) {
+        if (f.type() == v1::ARTIFACT_REQUEST && f.header.correlation_id == 0) {
+            inbound_data(l, std::move(f));
+            return;
+        }
         if (f.type() != v1::NODE_HELLO || f.header.correlation_id != 0) {
             log_warn("peer link {} from {}: message type {:#x} before hello", l.id, l.address, f.header.message_type);
             close_link(l, "protocol error before hello");
@@ -595,13 +634,17 @@ struct PeerManager::Impl : std::enable_shared_from_this<Impl> {
     }
 
     void on_frame(const std::shared_ptr<IFrameLink>& link, protocol::Frame f) {
+        if (auto it = data_links.find(link->id()); it != data_links.end()) {
+            on_data_frame(it->second, std::move(f));
+            return;
+        }
         Link* l = find_link(link->id());
         if (!l || l->detached) return;
         if (!l->hello_done) {
             if (l->outbound)
                 outbound_pre_hello(*l, f);
             else
-                inbound_pre_hello(*l, f);
+                inbound_pre_hello(*l, std::move(f));
             return;
         }
         Peer* p = find_peer(l->peer_node_id);
@@ -669,6 +712,13 @@ struct PeerManager::Impl : std::enable_shared_from_this<Impl> {
     }
 
     void on_close(const std::shared_ptr<IFrameLink>& link, const std::string& reason) {
+        if (auto dit = data_links.find(link->id()); dit != data_links.end()) {
+            auto fn = std::move(dit->second.handlers.on_close);
+            auto l = dit->second.link;
+            data_links.erase(dit);
+            if (fn) fn(l, reason);
+            return;
+        }
         auto it = links.find(link->id());
         if (it == links.end()) return;
         auto holder = std::move(it->second);
@@ -749,6 +799,14 @@ struct PeerManager::Impl : std::enable_shared_from_this<Impl> {
                 close_link(*l, "shutdown");
             }
         }
+        for (auto& [_, d] : data_links) {
+            if (d.closing) continue;
+            d.closing = true;
+            d.link->close();
+        }
+        auto dials = std::move(data_dials);
+        data_dials.clear();
+        for (auto& [_, d] : dials) finish_data_dial(d, std::unexpected(std::string("peer manager stopped")), true);
         std::vector<std::string> pids;
         for (auto& [id, _] : peers) pids.push_back(id);
         for (const auto& id : pids)
@@ -781,6 +839,153 @@ struct PeerManager::Impl : std::enable_shared_from_this<Impl> {
         return out;
     }
 
+    // ---- data links ------------------------------------------------------------
+
+    void inbound_data(Link& l, protocol::Frame f) {
+        const std::string cert = l.link->identity().name;
+        Peer* p = find_peer_by_name(cert);
+        if (!p || !p->in_directory || cert == opt.self_name) {
+            log_warn("data link {} from {} ({}): not a directory node, closing", l.id, l.address, cert);
+            close_link(l, "data link from unknown node");
+            return;
+        }
+        NodeId sender = node_id_from_string(p->node_id);
+        if (f.header.sender_id != sender) {
+            log_warn("data link {} from {} ({}): bad sender_id, closing", l.id, l.address, cert);
+            close_link(l, "bad sender_id");
+            return;
+        }
+        if (!data_acceptor) {
+            log_warn("data link {} from {} ({}): no data acceptor, closing", l.id, l.address, cert);
+            close_link(l, "no data acceptor");
+            return;
+        }
+        std::string node_id = p->node_id;
+        auto link = l.link;
+        auto id = l.id;
+        links.erase(id);  // `l` is gone; its hello timer is cancelled
+        auto fn = data_acceptor;
+        auto handlers = fn(node_id, link, std::move(f));
+        if (!handlers) {
+            log_debug("data link {} from {}: refused by acceptor", id, cert);
+            link->close();  // on_close: no longer tracked, ignored
+            return;
+        }
+        log_debug("data link {} from {} adopted", id, cert);
+        data_links.emplace(id, DataLink{link, node_id, sender, std::move(*handlers)});
+        if (stopped) {
+            auto& d = data_links.at(id);
+            d.closing = true;
+            link->close();
+        }
+    }
+
+    void on_data_frame(DataLink& d, protocol::Frame f) {
+        if (d.closing) return;
+        if (f.header.sender_id != d.sender) {
+            log_warn("data link {} ({}): frame type {:#x} with bad sender_id, closing", d.link->id(), d.node_id,
+                     f.header.message_type);
+            d.closing = true;
+            d.link->close();
+            return;
+        }
+        auto fn = d.handlers.on_frame;  // may mutate data_links
+        auto link = d.link;
+        if (fn) fn(link, std::move(f));
+    }
+
+    void finish_data_dial(const std::shared_ptr<DataDial>& d, DataDialResult r, bool post) {
+        if (d->done) return;
+        d->done = true;
+        data_dials.erase(d->id);
+        auto cb = std::move(d->cb);
+        if (!cb) return;
+        if (post)
+            asio::post(io, [cb = std::move(cb), r = std::move(r)]() mutable { cb(std::move(r)); });
+        else
+            cb(std::move(r));
+    }
+
+    void dial_data(const std::string& node_id, DataLinkHandlers handlers, std::function<void(DataDialResult)> cb) {
+        std::string err;
+        Peer* p = find_peer(node_id);
+        if (stopped)
+            err = "peer manager stopped";
+        else if (node_id == opt.self_node_id)
+            err = "cannot dial self";
+        else if (!p)
+            err = "unknown node " + node_id;
+        if (!err.empty()) {
+            asio::post(io, [cb = std::move(cb), err] { if (cb) cb(std::unexpected(err)); });
+            return;
+        }
+        auto d = std::make_shared<DataDial>();
+        d->id = next_data_dial++;
+        d->node_id = node_id;
+        d->name = p->name;
+        d->addrs = dial_order(p->info);
+        d->handlers = std::move(handlers);
+        d->cb = std::move(cb);
+        data_dials.emplace(d->id, d);
+        data_try_next(d, true);
+    }
+
+    void data_try_next(const std::shared_ptr<DataDial>& d, bool first) {
+        while (true) {
+            if (d->done) return;
+            if (stopped) return finish_data_dial(d, std::unexpected(std::string("peer manager stopped")), first);
+            if (d->idx >= d->addrs.size())
+                return finish_data_dial(
+                    d, std::unexpected(d->last_error.empty() ? std::string("no addresses") : d->last_error), first);
+            cv1::NodeAddress a = d->addrs[d->idx++];
+            std::string label = std::format("{} {}", a.type(), host_port(a.address(), a.port()));
+            if (a.address().empty() || a.port() == 0 || a.port() > 65535) {
+                d->last_error = label + ": invalid address";
+                continue;
+            }
+            transport.dial(a.address(), static_cast<std::uint16_t>(a.port()), d->name,
+                           [w = weak_from_this(), d, label](DialResult r) {
+                               auto self = w.lock();
+                               if (!self || d->done) {
+                                   if (r) (*r)->close();
+                                   return;
+                               }
+                               if (!r) {
+                                   d->last_error = std::format("{}: {}", label, r.error());
+                                   log_debug("data dial {}: {}", d->name, d->last_error);
+                                   self->data_try_next(d, false);
+                                   return;
+                               }
+                               self->data_connected(d, *r);
+                           });
+            return;
+        }
+    }
+
+    void data_connected(const std::shared_ptr<DataDial>& d, const std::shared_ptr<IFrameLink>& link) {
+        if (stopped) {
+            link->close();
+            return finish_data_dial(d, std::unexpected(std::string("peer manager stopped")), false);
+        }
+        if (data_links.contains(link->id()) || links.contains(link->id())) {
+            log_warn("data dial {}: transport reused link id {}", d->name, link->id());
+            link->close();
+            return finish_data_dial(d, std::unexpected(std::string("duplicate link id")), false);
+        }
+        data_links.emplace(link->id(), DataLink{link, d->node_id, node_id_from_string(d->node_id),
+                                                std::move(d->handlers)});
+        log_debug("data link {} to {} ({})", link->id(), d->name, link->remote());
+        finish_data_dial(d, link, false);
+    }
+
+    void send_data(const std::shared_ptr<IFrameLink>& link, protocol::Frame f) {
+        if (!link) return;
+        if (f.header.message_id == 0) f.header.message_id = protocol::next_message_id();
+        f.header.sender_id = self_sender;
+        f.header.payload_length = static_cast<std::uint32_t>(f.payload.size());
+        link->send(f);
+    }
+
     bool send(const std::string& node_id, protocol::Frame f) {
         if (stopped) return false;
         Peer* p = find_peer(node_id);
@@ -805,6 +1010,8 @@ PeerManager::~PeerManager() {
     impl_->state_listener = nullptr;
     impl_->frame_handler = nullptr;
     impl_->refresh = nullptr;
+    impl_->data_acceptor = nullptr;
+    for (auto& [_, d] : impl_->data_dials) d->cb = nullptr;  // nothing is called after destruction
     impl_->stop();
 }
 
@@ -845,5 +1052,18 @@ void PeerManager::set_state_listener(std::function<void(const std::string& node_
 }
 
 void PeerManager::set_directory_refresh(std::function<void()> fn) { impl_->refresh = std::move(fn); }
+
+void PeerManager::set_data_acceptor(DataAcceptor fn) { impl_->data_acceptor = std::move(fn); }
+
+void PeerManager::dial_data(const std::string& node_id, DataLinkHandlers handlers,
+                            std::function<void(DataDialResult)> cb) {
+    impl_->dial_data(node_id, std::move(handlers), std::move(cb));
+}
+
+void PeerManager::send_data(const std::shared_ptr<IFrameLink>& link, protocol::Frame frame) {
+    impl_->send_data(link, std::move(frame));
+}
+
+const std::string& PeerManager::self_node_id() const { return impl_->opt.self_node_id; }
 
 }  // namespace tdr::peer

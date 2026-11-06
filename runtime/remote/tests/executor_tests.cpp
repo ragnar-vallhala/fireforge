@@ -7,6 +7,7 @@
 #include <chrono>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -107,6 +108,13 @@ public:
     void cancel_job(const std::string&, const std::string&, std::function<void(Result<cv1::Job>)>) override {
         BOOST_FAIL("unexpected cancel_job");
     }
+    void get_artifact(const std::string&, std::function<void(Result<cv1::ArtifactInfo>)>) override {
+        BOOST_FAIL("unexpected get_artifact");
+    }
+    void release_artifact(const std::string&, const cv1::ReleaseRequest&,
+                          std::function<void(Result<cv1::ReleaseReply>)>) override {
+        BOOST_FAIL("unexpected release_artifact");
+    }
 
 private:
     template <class Req, class T>
@@ -118,6 +126,69 @@ private:
         }
     }
     asio::io_context& io_;
+};
+
+// IArtifactFetcher fake over the fixture's real store. Per id: ingest the
+// registered content (success), fail with a reason, or hang (callback kept).
+// Present artifacts are answered at once (still via post).
+class FakeFetcher final : public tdr::transfer::IArtifactFetcher {
+public:
+    enum class Mode { kIngest, kFail, kHang };
+    FakeFetcher(asio::io_context& io, tdr::artifacts::IArtifactStore& store, fs::path tmp)
+        : io_(io), store_(store), tmp_(std::move(tmp)) {}
+
+    Mode mode = Mode::kIngest;
+    std::string fail_reason = "no holder";
+    std::map<std::string, std::string> content;  // id -> bytes
+    std::vector<std::string> calls;
+    std::vector<std::pair<std::string, std::function<void(std::expected<tdr::artifacts::ArtifactMeta, std::string>)>>>
+        hung;
+
+    // Registers `data` and returns its artifact id (not stored yet).
+    std::string add(const std::string& data) {
+        const fs::path f = tmp_ / tdr::new_id("content");
+        std::ofstream(f, std::ios::binary) << data;
+        auto hex = tdr::artifacts::sha256_file(f);
+        fs::remove(f);
+        BOOST_REQUIRE(hex.has_value());
+        const std::string id = tdr::artifacts::make_artifact_id(*hex);
+        content[id] = data;
+        return id;
+    }
+
+    void fetch(const std::string& id,
+               std::function<void(std::expected<tdr::artifacts::ArtifactMeta, std::string>)> cb) override {
+        calls.push_back(id);
+        using R = std::expected<tdr::artifacts::ArtifactMeta, std::string>;
+        if (store_.contains(id)) {
+            tdr::artifacts::ArtifactMeta m;
+            m.id = id;
+            m.local_path = *store_.path_of(id);
+            return post(std::move(cb), R(m));
+        }
+        switch (mode) {
+            case Mode::kHang: hung.emplace_back(id, std::move(cb)); return;
+            case Mode::kFail: return post(std::move(cb), R(std::unexpected(fail_reason)));
+            case Mode::kIngest: {
+                auto it = content.find(id);
+                if (it == content.end()) return post(std::move(cb), R(std::unexpected(std::string("unknown"))));
+                const fs::path f = tmp_ / tdr::new_id("fetched");
+                std::ofstream(f, std::ios::binary) << it->second;
+                auto m = store_.ingest(f, "application/octet-stream", "", true);
+                if (!m) return post(std::move(cb), R(std::unexpected(m.error())));
+                return post(std::move(cb), R(*m));
+            }
+        }
+    }
+
+private:
+    template <class Cb, class R>
+    void post(Cb cb, R r) {
+        asio::post(io_, [cb = std::move(cb), r = std::move(r)]() mutable { cb(std::move(r)); });
+    }
+    asio::io_context& io_;
+    tdr::artifacts::IArtifactStore& store_;
+    fs::path tmp_;
 };
 
 cv1::Lease make_lease(const std::string& job_id, std::vector<std::string> argv, std::uint32_t attempt = 1) {
@@ -155,6 +226,7 @@ struct Fixture {
     std::unique_ptr<tdr::journal::IJournal> journal;
     std::unique_ptr<tdr::artifacts::IArtifactStore> store;
     std::unique_ptr<tdr::jobs::JobManager> mgr;
+    std::unique_ptr<FakeFetcher> fetcher;  // set_fetcher() in make_executor() when present
     std::unique_ptr<RemoteExecutor> exec;
     RemoteOptions ropts;
     std::vector<cv1::ArtifactRef> local_artifacts;  // list_local_artifacts hook
@@ -235,10 +307,16 @@ struct Fixture {
         };
         exec = std::make_unique<RemoteExecutor>(io, client, *mgr, ropts, std::move(h));
         exec->start();
+        if (fetcher) exec->set_fetcher(fetcher.get());
     }
 
     void make() {
         make_manager();
+        make_executor();
+    }
+    void make_with_fetcher() {
+        make_manager();
+        fetcher = std::make_unique<FakeFetcher>(io, *store, tmp.path);
         make_executor();
     }
 
@@ -447,8 +525,9 @@ BOOST_FIXTURE_TEST_CASE(submit_rejection_is_reported, Fixture) {
     BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-v") && has_terminal_update("job-c"); }));
 
     BOOST_TEST(update_states("job-v") == (std::vector<tv1::JobState>{tv1::FAILED}), boost::test_tools::per_element());
-    BOOST_TEST(!last_update("job-v")->retryable());
-    BOOST_TEST(last_update("job-v")->error().find("not found locally") != std::string::npos);
+    // Phase 5: a missing input without a fetcher is retryable elsewhere.
+    BOOST_TEST(last_update("job-v")->retryable());
+    BOOST_TEST(last_update("job-v")->error() == "artifact transfer unavailable");
     BOOST_TEST(last_update("job-c")->state() == tv1::FAILED);
     BOOST_TEST(last_update("job-c")->retryable());
     BOOST_TEST(!mgr->status("job-v.a1").has_value());
@@ -634,7 +713,7 @@ BOOST_FIXTURE_TEST_CASE(corrupt_state_file_is_moved_aside, Fixture) {
     make();
     BOOST_TEST(exec->active_leases().empty());
     BOOST_TEST(fs::exists(ropts.state_file.string() + ".corrupt"));
-    BOOST_TEST(state_file_text().find("\"version\":1") != std::string::npos);  // rewritten empty
+    BOOST_TEST(state_file_text().find("\"version\":2") != std::string::npos);  // rewritten empty
 }
 
 BOOST_FIXTURE_TEST_CASE(full_artifact_sync_pages, Fixture) {
@@ -732,6 +811,230 @@ BOOST_FIXTURE_TEST_CASE(destroy_with_requests_in_flight_is_safe, Fixture) {
     BOOST_REQUIRE(mgr->cancel("job-z.a1").has_value());
     run_for(200ms);
     BOOST_TEST(client.updates.requests.size() == n);
+}
+
+// ---- Phase 5: inputs fetched before run (phase5.md §5) ----------------------
+
+namespace {
+std::string hex_of(const std::string& id) { return id.substr(std::string("artifact://sha256/").size()); }
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(missing_input_is_fetched_then_job_runs, Fixture) {
+    make_with_fetcher();
+    // One input already present, one fetched.
+    const std::string present = fetcher->add("local-bytes\n");
+    {
+        const fs::path f = tmp.path / "present";
+        std::ofstream(f) << "local-bytes\n";
+        BOOST_REQUIRE(store->ingest(f, "text/plain", "", true).has_value());
+    }
+    const std::string remote = fetcher->add("remote-input-data\n");
+    BOOST_REQUIRE(!store->contains(remote));
+    auto l = make_lease("job-in", {"/bin/sh", "-c",
+                                   "cat \"$FIREFORGE_INPUT_DIR/" + hex_of(remote) + "\" \"$FIREFORGE_INPUT_DIR/" +
+                                       hex_of(present) + "\" > \"$FIREFORGE_OUTPUT_DIR/out.txt\""});
+    l.mutable_spec()->add_input_artifacts(remote);
+    l.mutable_spec()->add_input_artifacts(present);
+    l.mutable_spec()->add_input_artifacts(remote);  // duplicates fetched once
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-in"); }));
+    BOOST_TEST(last_update("job-in")->state() == tv1::COMPLETED);
+    BOOST_TEST(update_states("job-in") == (std::vector<tv1::JobState>{tv1::RUNNING, tv1::COMPLETED}),
+               boost::test_tools::per_element());
+    BOOST_TEST(fetcher->calls.size() == 2u);
+    BOOST_TEST(store->contains(remote));
+    const auto st = mgr->status("job-in.a1");
+    BOOST_REQUIRE(st.has_value());
+    BOOST_REQUIRE(st->output_artifacts_size() == 1);
+    BOOST_TEST(fs::file_size(*store->path_of(st->output_artifacts(0))) ==
+               std::string("remote-input-data\nlocal-bytes\n").size());
+    BOOST_TEST(exec->protected_inputs().empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(fetch_failure_is_reported_retryable, Fixture) {
+    make_with_fetcher();
+    fetcher->mode = FakeFetcher::Mode::kFail;
+    fetcher->fail_reason = "no holder";
+    const std::string id = fetcher->add("x");
+    auto l = make_lease("job-ff", {"/bin/true"});
+    l.mutable_spec()->add_input_artifacts(id);
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-ff"); }));
+    BOOST_TEST(update_states("job-ff") == (std::vector<tv1::JobState>{tv1::FAILED}), boost::test_tools::per_element());
+    BOOST_TEST(last_update("job-ff")->retryable());
+    BOOST_TEST(last_update("job-ff")->error() == "fetch " + id + ": no holder");
+    BOOST_TEST(!mgr->status("job-ff.a1").has_value());
+    BOOST_REQUIRE(run_until([&] { return exec->active_leases().empty() && exec->stats().pending_updates == 0; }));
+    BOOST_TEST(exec->protected_inputs().empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(no_fetcher_fails_retryable, Fixture) {
+    make();
+    auto l = make_lease("job-nf", {"/bin/true"});
+    l.mutable_spec()->add_input_artifacts("artifact://sha256/" + std::string(64, 'a'));
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-nf"); }));
+    BOOST_TEST(last_update("job-nf")->state() == tv1::FAILED);
+    BOOST_TEST(last_update("job-nf")->retryable());
+    BOOST_TEST(last_update("job-nf")->error() == "artifact transfer unavailable");
+}
+
+BOOST_FIXTURE_TEST_CASE(capacity_is_held_while_fetching, Fixture) {
+    capacity = {4, 1024 * kMiB, 2};
+    make_with_fetcher();
+    fetcher->mode = FakeFetcher::Mode::kHang;
+    const std::string id = fetcher->add("slow-input");
+    auto l = make_lease("job-h", {"/bin/true"});
+    l.mutable_spec()->mutable_resources()->set_cpu_cores(2);
+    l.mutable_spec()->mutable_resources()->set_memory_bytes(256 * kMiB);
+    l.mutable_spec()->add_input_artifacts(id);
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return fetcher->hung.size() == 1u; }));
+    // Next lease request: one slot, 2 cores and 768 MiB left.
+    const auto before = client.leases.requests.size();
+    BOOST_REQUIRE(run_until([&] { return client.leases.requests.size() > before; }));
+    const auto& req = client.leases.requests.back();
+    BOOST_TEST(req.max_jobs() == 1u);
+    BOOST_TEST(req.free().cpu_cores() == 2u);
+    BOOST_TEST(req.free().memory_bytes() == 768 * kMiB);
+    // Renewed by heartbeats, protected from GC, no local job yet.
+    BOOST_REQUIRE(exec->active_leases().size() == 1u);
+    BOOST_TEST(exec->stats().active_leases == 1u);
+    BOOST_TEST(exec->protected_inputs() == std::vector<std::string>{id}, boost::test_tools::per_element());
+    BOOST_TEST(!mgr->status("job-h.a1").has_value());
+    BOOST_TEST(update_states("job-h").empty());
+
+    // A second fetching lease takes the last slot: no more lease requests.
+    auto l2 = make_lease("job-h2", {"/bin/true"});
+    l2.mutable_spec()->add_input_artifacts(id);
+    lease_once({l2});
+    BOOST_REQUIRE(run_until([&] { return fetcher->hung.size() == 2u; }));
+    const auto n = client.leases.requests.size();
+    run_for(200ms);
+    BOOST_TEST(client.leases.requests.size() == n);
+
+    // Fetches complete: the jobs run and capacity is released.
+    auto hung = std::move(fetcher->hung);
+    fetcher->hung.clear();
+    for (auto& [hid, cb] : hung) {
+        const fs::path f = tmp.path / tdr::new_id("late");
+        std::ofstream(f) << fetcher->content.at(hid);
+        auto m = store->ingest(f, "application/octet-stream", "", true);
+        BOOST_REQUIRE(m.has_value());
+        cb(*m);
+    }
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-h") && has_terminal_update("job-h2"); }));
+    BOOST_TEST(last_update("job-h")->state() == tv1::COMPLETED);
+    BOOST_TEST(last_update("job-h2")->state() == tv1::COMPLETED);
+    BOOST_TEST(exec->protected_inputs().empty());
+    const auto m = client.leases.requests.size();
+    BOOST_REQUIRE(run_until([&] { return client.leases.requests.size() > m; }));
+    BOOST_TEST(client.leases.requests.back().max_jobs() == 2u);
+}
+
+BOOST_FIXTURE_TEST_CASE(revoked_while_fetching_is_cancelled, Fixture) {
+    make_with_fetcher();
+    fetcher->mode = FakeFetcher::Mode::kHang;
+    const std::string id = fetcher->add("never");
+    auto l = make_lease("job-r", {"/bin/true"}, 2);
+    l.mutable_spec()->add_input_artifacts(id);
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return fetcher->hung.size() == 1u; }));
+    exec->on_revoked({ref_of(l)});
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-r"); }));
+    BOOST_TEST(update_states("job-r") == (std::vector<tv1::JobState>{tv1::CANCELLED}),
+               boost::test_tools::per_element());
+    BOOST_TEST(last_update("job-r")->fencing_token() == 2u);
+    BOOST_REQUIRE(run_until([&] { return exec->active_leases().empty() && exec->stats().pending_updates == 0; }));
+    BOOST_TEST(exec->protected_inputs().empty());
+    // The fetch finishing later starts nothing.
+    const fs::path f = tmp.path / "late";
+    std::ofstream(f) << "never";
+    auto m = store->ingest(f, "application/octet-stream", "", true);
+    BOOST_REQUIRE(m.has_value());
+    fetcher->hung[0].second(*m);
+    run_for(100ms);
+    BOOST_TEST(!mgr->status("job-r.a2").has_value());
+    BOOST_TEST(update_states("job-r").size() == 1u);
+}
+
+BOOST_FIXTURE_TEST_CASE(restart_while_fetching_refetches_and_runs, Fixture) {
+    make_with_fetcher();
+    fetcher->mode = FakeFetcher::Mode::kHang;
+    const std::string id = fetcher->add("resumed-input\n");
+    auto l = make_lease("job-rs", {"/bin/sh", "-c",
+                                   "cat \"$FIREFORGE_INPUT_DIR/" + hex_of(id) + "\" > \"$FIREFORGE_OUTPUT_DIR/o\""});
+    l.mutable_spec()->add_input_artifacts(id);
+    lease_once({l});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return fetcher->hung.size() == 1u; }));
+    BOOST_TEST(state_file_text().find("\"submitted\":false") != std::string::npos);
+
+    // tdrd restart: the executor goes away mid-fetch; its callback is a no-op.
+    exec->stop();
+    fetcher->hung[0].second(std::unexpected(std::string("transfer stopped")));
+    run_for(50ms);
+    exec.reset();
+    fetcher->hung.clear();
+    const auto sent = client.updates.requests.size();
+    BOOST_TEST(sent == 0u);
+
+    // Second life without a fetcher yet: waits (no "local job lost", nothing sent).
+    auto saved = std::move(fetcher);
+    make_executor();
+    exec->on_registered("ff-node-1");
+    run_for(150ms);
+    BOOST_TEST(client.updates.requests.empty());
+    BOOST_REQUIRE(exec->active_leases().size() == 1u);
+    BOOST_TEST(exec->protected_inputs() == std::vector<std::string>{id}, boost::test_tools::per_element());
+
+    // The peer layer comes up: fetch again and run.
+    fetcher = std::move(saved);
+    fetcher->mode = FakeFetcher::Mode::kIngest;
+    exec->set_fetcher(fetcher.get());
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-rs"); }));
+    BOOST_TEST(update_states("job-rs") == (std::vector<tv1::JobState>{tv1::RUNNING, tv1::COMPLETED}),
+               boost::test_tools::per_element());
+    BOOST_TEST(fetcher->calls.size() == 2u);
+    BOOST_TEST(mgr->status("job-rs.a1")->state() == tv1::COMPLETED);
+    BOOST_REQUIRE(run_until([&] { return exec->stats().pending_updates == 0; }));
+    BOOST_TEST(state_file_text().find("job-rs") == std::string::npos);
+}
+
+BOOST_FIXTURE_TEST_CASE(version1_state_file_is_read, Fixture) {
+    fs::create_directories(ropts.state_file.parent_path());
+    std::ofstream(ropts.state_file) << R"({"version":1,"leases":[{"local_job_id":"old.a1","job_id":"old",
+        "attempt_id":"att-old","fencing_token":1,"attempt_number":1,"terminal":false}],"outbox":[]})";
+    make();
+    BOOST_TEST(exec->stats().pending_updates == 1u);
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("old"); }));
+    BOOST_TEST(last_update("old")->error() == "local job lost");
+    BOOST_TEST(state_file_text().find("\"version\":2") != std::string::npos);
+}
+
+BOOST_FIXTURE_TEST_CASE(announce_reaches_client, Fixture) {
+    ropts.enabled = false;
+    make();
+    cv1::ArtifactRef r;
+    r.set_artifact_id("artifact://sha256/" + std::string(64, 'b'));
+    r.set_size(7);
+    exec->announce({r});  // queued until registered
+    run_for(50ms);
+    BOOST_TEST(client.announces.requests.empty());
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] {
+        for (const auto& a : client.announces.requests) {
+            if (a.sync_id().empty() && a.artifacts_size() == 1 && a.artifacts(0).artifact_id() == r.artifact_id())
+                return true;
+        }
+        return false;
+    }));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

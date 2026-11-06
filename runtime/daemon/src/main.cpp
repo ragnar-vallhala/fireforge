@@ -4,7 +4,8 @@
 // cgroup) -> journal -> artifact store -> JobManager -> two Unix sockets
 // -> NodeAgent (only when [control] address is set; phase2.md §7)
 // -> peer listener + PeerManager, started on the first directory (phase3.md)
-// -> RemoteExecutor: leases from the control plane run as local jobs (phase4.md).
+// -> RemoteExecutor: leases from the control plane run as local jobs (phase4.md)
+// -> StoreGc (always) + ArtifactService with the peer layer (phase5.md).
 // Everything runs on one io_context thread.
 
 #include <csignal>
@@ -15,9 +16,11 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
@@ -40,6 +43,8 @@
 #include "tdr/remote/executor.hpp"
 #include "tdr/supervisor/supervisor.hpp"
 #include "tdr/tls/tls.hpp"
+#include "tdr/transfer/gc.hpp"
+#include "tdr/transfer/transfer.hpp"
 
 #include "job_user.hpp"
 
@@ -143,8 +148,35 @@ public:
         });
         manager_->set_state_listener([this](const std::string& job, v1::JobState s) {
             tdr::log_debug("job {} -> {}", job, tdr::jobs::to_string(s));
+            if (s == v1::RUNNING) {
+                if (auto st = manager_->status(job))
+                    for (const auto& in : st->spec().input_artifacts()) gc_->touch(in);
+            }
             if (remote_) remote_->on_job_state(job, s);
+            if (s == v1::COMPLETED) gc_->run([](const v1::GcReport&) {});  // outputs may push the store over the cap
         });
+
+        tdr::transfer::GcOptions gopts;
+        gopts.max_bytes = cfg_.resources.max_disk_mb * kMiB;
+        gopts.high_pct = cfg_.artifacts.gc_high;
+        gopts.low_pct = cfg_.artifacts.gc_low;
+        if (gopts.low_pct > gopts.high_pct || gopts.high_pct > 100)
+            throw std::runtime_error("artifacts: need gc_low <= gc_high <= 100");
+        gopts.interval = std::chrono::seconds(std::max(1u, cfg_.artifacts.gc_interval));
+        gopts.min_age = std::chrono::seconds(cfg_.artifacts.gc_min_age);
+        tdr::transfer::GcHooks ghooks;
+        ghooks.is_protected = [this](const std::string& id) { return artifact_protected(id); };
+        ghooks.release = [this](const std::string& id, auto cb) {
+            if (!agent_) return cb(std::unexpected(std::string("no control plane")));
+            tdr::agent::cv1::ReleaseRequest req;
+            req.set_node_id(agent_->node_id());
+            if (req.node_id().empty()) return cb(std::unexpected(std::string("not registered")));
+            agent_->client().release_artifact(id, req, [cb](tdr::agent::Result<tdr::agent::cv1::ReleaseReply> r) {
+                if (!r) return cb(std::unexpected(error_text(r.error())));
+                cb(*r);
+            });
+        };
+        gc_ = std::make_unique<tdr::transfer::StoreGc>(io_, *store_, gopts, std::move(ghooks));
 
         worker_server_ = std::make_unique<tdr::ipc::UnixServer>(
             io_, cfg_.worker_socket(),
@@ -162,6 +194,7 @@ public:
         }
 
         manager_->recover();
+        gc_->start();
         if (!cfg_.control.address.empty()) start_agent(job_user.has_value());
 
         asio::signal_set signals(io_, SIGINT, SIGTERM);
@@ -181,8 +214,10 @@ public:
             // A second signal stops immediately.
             stopping_ = true;
             tdr::log_info("signal {}: going offline, then shutting down (running jobs are recovered on next start)", sig);
+            if (service_) service_->stop();
             if (peers_) peers_->stop();
             if (remote_) remote_->stop();
+            gc_->stop();
             signals.async_wait(on_signal);
             agent_->stop(finish);
         };
@@ -198,8 +233,11 @@ public:
         // callback reaches a destroyed manager.
         ctl_server_.reset();
         worker_server_.reset();
+        if (remote_) remote_->set_fetcher(nullptr);
+        service_.reset();
         peers_.reset();
         remote_.reset();
+        gc_.reset();
         if (transport_) transport_->stop();
         transport_.reset();
         agent_.reset();
@@ -281,7 +319,9 @@ private:
         hooks.fill_stats = [this](tdr::agent::cv1::Heartbeat& hb) { fill_heartbeat(hb); };
         hooks.on_directory = [this](const tdr::agent::cv1::NodeList& nodes) { on_directory(nodes); };
         hooks.on_registered = [this](const std::string& node_id) {
-            if (remote_ && !stopping_) remote_->on_registered(node_id);
+            // Leases may need inputs fetched from peers, so pulling starts once
+            // the transfer service is up (first directory, on_directory()).
+            if (remote_ && !stopping_ && service_) remote_->on_registered(node_id);
         };
         hooks.on_revoked = [this](const std::vector<tdr::agent::cv1::LeaseRef>& revoked) {
             if (remote_) remote_->on_revoked(revoked);
@@ -332,7 +372,9 @@ private:
                 tdr::log_info("peer {} {}", peer_label(id), tdr::peer::to_string(st));
             });
             peer_self_id_ = agent_->node_id();
+            start_transfer();
             peers_->start();
+            if (remote_) remote_->on_registered(agent_->node_id());
             transport_->start();  // handlers are installed; now accept
             tdr::log_info("peer listener on {}:{} (node {})", topts.listen_address, transport_->bound_port(),
                           agent_->node_id());
@@ -341,6 +383,156 @@ private:
                           agent_->node_id());
         }
         peers_->update_directory(nodes);
+    }
+
+    // ---- artifacts (phase5.md) -------------------------------------------------
+    void start_transfer() {
+        tdr::transfer::TransferOptions topts;
+        topts.max_serve_bytes_per_sec = static_cast<std::uint64_t>(cfg_.network.max_transfer_mbps) * 1000 * 1000 / 8;
+        tdr::transfer::TransferHooks hooks;
+        hooks.holders = [this](const std::string& id, auto cb) {
+            if (!agent_) return cb(std::unexpected(std::string("no control plane")));
+            agent_->client().get_artifact(id, [cb](tdr::agent::Result<tdr::agent::cv1::ArtifactInfo> r) {
+                if (!r) {
+                    if (r.error().http_status == 404) return cb(std::vector<std::string>{});
+                    return cb(std::unexpected(error_text(r.error())));
+                }
+                cb(std::vector<std::string>(r->node_ids().begin(), r->node_ids().end()));
+            });
+        };
+        hooks.on_stored = [this](const tdr::artifacts::ArtifactMeta& m) {
+            gc_->note_added(m.size);
+            gc_->touch(m.id);
+            if (auto ref = artifact_ref(m.id); ref && remote_) remote_->announce({*ref});
+            gc_->run([](const v1::GcReport&) {});
+        };
+        hooks.has_room = [this](std::uint64_t bytes) { return gc_->has_room(bytes); };
+        hooks.touch = [this](const std::string& id) { gc_->touch(id); };
+        service_ = std::make_unique<tdr::transfer::ArtifactService>(io_, *peers_, *store_, *journal_, topts,
+                                                                    std::move(hooks));
+        if (remote_) remote_->set_fetcher(service_.get());
+    }
+
+    // Not evictable now: inputs of non-terminal local jobs or of leases still
+    // fetching, and artifacts being transferred.
+    bool artifact_protected(const std::string& id) const {
+        if (service_ && service_->busy(id)) return true;
+        if (remote_)
+            for (const auto& in : remote_->protected_inputs())
+                if (in == id) return true;
+        for (auto st : {v1::CREATED, v1::QUEUED, v1::ASSIGNED, v1::RUNNING, v1::COMMITTING, v1::RETRY_PENDING})
+            for (const auto& j : manager_->list(st, 100000))
+                for (const auto& in : j.spec().input_artifacts())
+                    if (in == id) return true;
+        return false;
+    }
+
+    v1::LocalArtifact local_artifact(const std::string& id) const {
+        v1::LocalArtifact a;
+        if (auto ref = artifact_ref(id)) *a.mutable_ref() = std::move(*ref);
+        if (auto p = store_->path_of(id)) {
+            a.set_local_path(p->string());
+            struct stat st {};
+            if (::stat(p->c_str(), &st) == 0)
+                a.set_last_used_unix_ms(static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1000 + st.st_mtim.tv_nsec / 1000000);
+        }
+        return a;
+    }
+
+    void on_artifact_ctl(const std::shared_ptr<Connection>& c, Frame f) {
+        switch (f.type()) {
+        case v1::CTL_ARTIFACT_PUT: {
+            v1::ArtifactPutRequest req;
+            if (!f.parse(req)) return reply_error(c, f, v1::BAD_REQUEST, "bad ArtifactPutRequest");
+            if (req.path().empty() || !fs::path(req.path()).is_absolute())
+                return reply_error(c, f, v1::BAD_REQUEST, "path must be absolute");
+            std::error_code ec;
+            auto size = fs::file_size(req.path(), ec);
+            if (ec) return reply_error(c, f, v1::BAD_REQUEST, req.path() + ": " + ec.message());
+            if (!gc_->has_room(size)) return reply_error(c, f, v1::CONFLICT, "store full");
+            auto meta = store_->ingest(req.path(), req.media_type().empty() ? "application/octet-stream" : req.media_type(),
+                                       "", false);
+            if (!meta) return reply_error(c, f, v1::INTERNAL, meta.error());
+            if (!journal_->get_artifact(meta->id)) {
+                journal_->record_artifact({meta->id, meta->sha256_hex, meta->size, meta->media_type, "",
+                                           meta->local_path.string(), tdr::unix_ms()});
+                gc_->note_added(meta->size);
+            }
+            gc_->touch(meta->id);
+            if (auto ref = artifact_ref(meta->id); ref && remote_) remote_->announce({*ref});
+            return reply(c, f, v1::CTL_ARTIFACT_REPLY, local_artifact(meta->id));
+        }
+        case v1::CTL_ARTIFACT_GET: {
+            v1::ArtifactGetRequest req;
+            if (!f.parse(req)) return reply_error(c, f, v1::BAD_REQUEST, "bad ArtifactGetRequest");
+            if (!tdr::artifacts::parse_artifact_id(req.artifact_id()))
+                return reply_error(c, f, v1::BAD_REQUEST, "not an artifact id: " + req.artifact_id());
+            if (store_->contains(req.artifact_id())) {
+                gc_->touch(req.artifact_id());
+                return reply(c, f, v1::CTL_ARTIFACT_REPLY, local_artifact(req.artifact_id()));
+            }
+            if (!service_)
+                return reply_error(c, f, v1::NOT_FOUND, "not in the local store and no peer layer to fetch it");
+            auto req_frame = std::make_shared<Frame>(std::move(f));
+            service_->fetch(req.artifact_id(), [this, c, req_frame, id = req.artifact_id()](
+                                                   std::expected<tdr::artifacts::ArtifactMeta, std::string> r) {
+                if (!r) return reply_error(c, *req_frame, v1::NOT_FOUND, "fetch " + id + ": " + r.error());
+                auto a = local_artifact(id);
+                a.set_fetched(true);
+                reply(c, *req_frame, v1::CTL_ARTIFACT_REPLY, a);
+            });
+            return;
+        }
+        case v1::CTL_ARTIFACT_LIST: {
+            v1::LocalArtifactList list;
+            for (const auto& ref : local_artifacts()) {
+                auto a = local_artifact(ref.artifact_id());
+                list.set_store_bytes(list.store_bytes() + a.ref().size());
+                *list.add_artifacts() = std::move(a);
+            }
+            list.set_max_bytes(gc_->options().max_bytes);
+            return reply(c, f, v1::CTL_ARTIFACT_LIST_REPLY, list);
+        }
+        case v1::CTL_ARTIFACT_RM: {
+            v1::ArtifactRmRequest req;
+            if (!f.parse(req)) return reply_error(c, f, v1::BAD_REQUEST, "bad ArtifactRmRequest");
+            auto id = req.artifact_id();
+            auto path = store_->path_of(id);
+            if (!path) return reply_error(c, f, v1::NOT_FOUND, "not in the local store: " + id);
+            if (artifact_protected(id)) return reply_error(c, f, v1::CONFLICT, "in use by a job or transfer");
+            auto remove = [this, id] {
+                if (auto p = store_->path_of(id)) {
+                    std::error_code ec;
+                    fs::remove(*p, ec);
+                }
+            };
+            if (!agent_ || agent_->node_id().empty()) {
+                if (!req.force()) return reply_error(c, f, v1::CONFLICT, "no control plane to confirm another copy; use --force");
+                remove();
+                return reply(c, f, v1::CTL_ACK, v1::Ack{});
+            }
+            tdr::agent::cv1::ReleaseRequest rr;
+            rr.set_node_id(agent_->node_id());
+            rr.set_force(req.force());
+            auto req_frame = std::make_shared<Frame>(std::move(f));
+            agent_->client().release_artifact(id, rr, [c, req_frame, remove](tdr::agent::Result<tdr::agent::cv1::ReleaseReply> r) {
+                if (!r) return reply_error(c, *req_frame, error_code_of(r.error()), error_text(r.error()));
+                if (!r->released())
+                    return reply_error(c, *req_frame, v1::CONFLICT, "kept: " + r->reason() + " (use --force)");
+                remove();
+                reply(c, *req_frame, v1::CTL_ACK, v1::Ack{});
+            });
+            return;
+        }
+        case v1::CTL_ARTIFACT_GC: {
+            auto req_frame = std::make_shared<Frame>(std::move(f));
+            gc_->run([c, req_frame](const v1::GcReport& rep) { reply(c, *req_frame, v1::CTL_ARTIFACT_GC_REPLY, rep); },
+                     true);
+            return;
+        }
+        default:
+            return reply_error(c, f, v1::UNSUPPORTED, "unsupported artifact request");
+        }
     }
 
     std::string peer_label(const std::string& id) const {
@@ -700,6 +892,12 @@ private:
             }
             return reply(c, f, v1::CTL_NODE_STATUS_REPLY, st);
         }
+        case v1::CTL_ARTIFACT_PUT:
+        case v1::CTL_ARTIFACT_GET:
+        case v1::CTL_ARTIFACT_LIST:
+        case v1::CTL_ARTIFACT_RM:
+        case v1::CTL_ARTIFACT_GC:
+            return on_artifact_ctl(c, std::move(f));
         case v1::CTL_PEERS: {
             v1::PeerList list;
             if (agent_) {
@@ -735,6 +933,8 @@ private:
     std::unique_ptr<tdr::peer::TlsTransport> transport_;
     std::unique_ptr<tdr::peer::PeerManager> peers_;
     std::unique_ptr<tdr::remote::RemoteExecutor> remote_;
+    std::unique_ptr<tdr::transfer::StoreGc> gc_;
+    std::unique_ptr<tdr::transfer::ArtifactService> service_;
     std::string peer_self_id_;  // node id the PeerManager was created with
     bool stopping_ = false;
     std::unordered_map<std::uint64_t, std::string> attempt_by_conn_;

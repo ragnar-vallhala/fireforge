@@ -22,6 +22,8 @@ class JobCP(ControlPlane):
         super().__init__(base, pki, conninfo)
         with open(self.conf, "a") as f:
             f.write(f"[jobs]\nlease_ttl = {lease_ttl}\nmax_attempts_default = 3\n")
+            if type(self) is JobCP:  # holders only (Phase 4 locality); Phase 5 tests set their own
+                f.write("locality_wait = 3600\n")
 
     def job(self, job_id):
         return self.admin_json("job", job_id)

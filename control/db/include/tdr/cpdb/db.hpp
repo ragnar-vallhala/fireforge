@@ -124,11 +124,14 @@ public:
     // scanning at most 200). Grants greedily while the job fits the remaining
     // req.free (cpu_cores: 0 counts as 1; memory_bytes; gpu_count) and
     // req.max_jobs. Eligibility (§3): campaign absent or ACTIVE, capabilities
-    // subset of the node's, every input artifact located on the node, node
-    // ONLINE (OFFLINE/STALE/unknown -> no leases). Each grant: new attempt
+    // subset of the node's, node ONLINE (OFFLINE/STALE/unknown -> no leases), and
+    // locality (phase5.md §4): every input located on the node, OR
+    // now - queued_at >= locality_wait_ms and every input located on at least
+    // one ONLINE node. Holders are not otherwise prioritised. Each grant: new attempt
     // (number = attempts_used + 1, fencing_token = number), job LEASED,
     // current_attempt_id/node_id set, expires = now + ttl.
-    virtual std::vector<cv1::Lease> lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl_ms, std::int64_t now_ms) = 0;
+    virtual std::vector<cv1::Lease> lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl_ms,
+                                               std::int64_t locality_wait_ms, std::int64_t now_ms) = 0;
 
     // Fenced status update from node_id (§2). kStale if the job's current attempt
     // is not (attempt_id, fencing_token), the attempt belongs to another node, or
@@ -159,8 +162,21 @@ public:
     // Upserts (artifact_id, node_id) rows. sync_id/full as in ArtifactAnnouncement.
     // False if the node does not exist.
     virtual bool announce_artifacts(const cv1::ArtifactAnnouncement& a, std::int64_t now_ms) = 0;
-    // nullopt if no node holds it.
+    // nullopt if no node holds it and it is not pinned. Fills pinned.
     virtual std::optional<cv1::ArtifactInfo> get_artifact(const std::string& artifact_id) = 0;
+
+    // ---- Phase 5 (docs/design/phase5.md §4, §6) ----------------------------------
+    // One transaction, locking the artifact's location rows (FOR UPDATE). force:
+    // delete node_id's row, released. Else: pinned -> {false, "pinned"}; no row for
+    // another node that isn't OFFLINE -> {false, "last copy"}; otherwise delete node_id's row (if any)
+    // -> released. Two nodes releasing the last two copies concurrently: exactly
+    // one succeeds.
+    virtual cv1::ReleaseReply release_artifact(const std::string& artifact_id, const std::string& node_id, bool force,
+                                               std::int64_t now_ms) = 0;
+    // Pinned artifacts are never released (without force). Pinning an artifact
+    // with no locations is allowed (it pins future copies). Returns the info after.
+    virtual cv1::ArtifactInfo set_artifact_pinned(const std::string& artifact_id, bool pinned, const std::string& actor,
+                                                  std::int64_t now_ms) = 0;
 
     // ---- audit ---------------------------------------------------------------
     virtual void audit(const std::string& actor, const std::string& action, const std::string& target,

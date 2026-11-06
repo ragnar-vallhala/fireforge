@@ -67,6 +67,14 @@ std::string url_encode(std::string_view in) {
     return out;
 }
 
+// "artifact://sha256/<hex>" -> "<hex>" (anything else is passed through and
+// rejected by the server).
+std::string artifact_hex(const std::string& artifact_id) {
+    constexpr std::string_view kPrefix = "artifact://sha256/";
+    if (artifact_id.starts_with(kPrefix)) return artifact_id.substr(kPrefix.size());
+    return artifact_id;
+}
+
 Result<void> decode_void(const std::expected<http::ClientResponse, std::string>& r) {
     // Reuse the error mapping; the 2xx body (normally "{}") is ignored.
     if (!r) return std::unexpected(ClientError{0, r.error()});
@@ -138,6 +146,17 @@ public:
                         [cb = std::move(cb)](std::expected<http::ClientResponse, std::string> r) {
                             cb(decode_void(r));
                         });
+    }
+
+    void get_artifact(const std::string& artifact_id, std::function<void(Result<cv1::ArtifactInfo>)> cb) override {
+        call<cv1::ArtifactInfo>("GET", "/api/v1/artifacts/sha256/" + url_encode(artifact_hex(artifact_id)), {},
+                                std::move(cb));
+    }
+    void release_artifact(const std::string& artifact_id, const cv1::ReleaseRequest& req,
+                          std::function<void(Result<cv1::ReleaseReply>)> cb) override {
+        call<cv1::ReleaseReply>("POST",
+                                "/api/v1/artifacts/sha256/" + url_encode(artifact_hex(artifact_id)) + "/release",
+                                to_json(req), std::move(cb));
     }
 
 private:

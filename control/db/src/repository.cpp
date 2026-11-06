@@ -351,8 +351,9 @@ public:
     CancelOutcome cancel_job(const std::string& job_id, const std::string& reason, std::int64_t now_ms) override {
         return jobs_.cancel_job(job_id, reason, now_ms);
     }
-    std::vector<cv1::Lease> lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl_ms, std::int64_t now_ms) override {
-        return jobs_.lease_jobs(req, ttl_ms, now_ms);
+    std::vector<cv1::Lease> lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl_ms, std::int64_t locality_wait_ms,
+                                       std::int64_t now_ms) override {
+        return jobs_.lease_jobs(req, ttl_ms, locality_wait_ms, now_ms);
     }
     UpdateOutcome update_job(const std::string& job_id, const std::string& node_id, const cv1::JobUpdate& update,
                              std::int64_t now_ms) override {
@@ -368,6 +369,14 @@ public:
     }
     std::optional<cv1::ArtifactInfo> get_artifact(const std::string& artifact_id) override {
         return jobs_.get_artifact(artifact_id);
+    }
+    cv1::ReleaseReply release_artifact(const std::string& artifact_id, const std::string& node_id, bool force,
+                                       std::int64_t now_ms) override {
+        return jobs_.release_artifact(artifact_id, node_id, force, now_ms);
+    }
+    cv1::ArtifactInfo set_artifact_pinned(const std::string& artifact_id, bool pinned, const std::string& actor,
+                                          std::int64_t now_ms) override {
+        return jobs_.set_artifact_pinned(artifact_id, pinned, actor, now_ms);
     }
 
     void audit(const std::string& actor, const std::string& action, const std::string& target,

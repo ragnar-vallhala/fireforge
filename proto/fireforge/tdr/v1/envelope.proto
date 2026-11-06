@@ -32,11 +32,12 @@ enum MessageType {
   JOB_FAIL = 0x0208;
   JOB_CANCEL = 0x0209;
 
-  // ---- Peer: artifacts (Phase 5) ------------------------------------------
-  ARTIFACT_QUERY = 0x0301;
-  ARTIFACT_OFFER = 0x0302;
-  ARTIFACT_REQUEST = 0x0303;
-  ARTIFACT_TRANSFER = 0x0304;
+  // ---- Peer: artifacts (Phase 5, data links; payloads in artifact.proto) ---
+  ARTIFACT_QUERY = 0x0301;      // reserved
+  ARTIFACT_OFFER = 0x0302;      // ArtifactOffer      server -> fetcher
+  ARTIFACT_REQUEST = 0x0303;    // ArtifactRequest    fetcher -> server (first frame)
+  ARTIFACT_TRANSFER = 0x0304;   // ArtifactChunk      server -> fetcher
+  ARTIFACT_CHUNK_ACK = 0x0305;  // ArtifactChunkAck   fetcher -> server
 
   // ---- Peer: checkpoints --------------------------------------------------
   CHECKPOINT_CREATE = 0x0401;
@@ -63,6 +64,14 @@ enum MessageType {
   CTL_NODE_STATUS_REPLY = 0x110A;
   CTL_PEERS = 0x110B;              // PeersRequest      -> PeerList (Phase 2)
   CTL_PEERS_REPLY = 0x110C;
+  CTL_ARTIFACT_PUT = 0x110D;       // ArtifactPutRequest  -> LocalArtifact (Phase 5)
+  CTL_ARTIFACT_GET = 0x110E;       // ArtifactGetRequest  -> LocalArtifact (fetches if missing)
+  CTL_ARTIFACT_LIST = 0x110F;      // ArtifactListRequest -> LocalArtifactList
+  CTL_ARTIFACT_RM = 0x1110;        // ArtifactRmRequest   -> Ack
+  CTL_ARTIFACT_GC = 0x1111;        // ArtifactGcRequest   -> GcReport
+  CTL_ARTIFACT_REPLY = 0x1112;
+  CTL_ARTIFACT_LIST_REPLY = 0x1113;
+  CTL_ARTIFACT_GC_REPLY = 0x1114;
 
   // Any request may be answered with ERROR (payload: Error).
   ERROR = 0x7FFF;

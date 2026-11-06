@@ -264,9 +264,12 @@ public:
         return out;
     }
 
-    std::vector<cv1::Lease> lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl, std::int64_t now) override {
+    // Locality is not modelled here (the Postgres tests cover it); the wait is recorded.
+    std::vector<cv1::Lease> lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl, std::int64_t locality_wait_ms,
+                                       std::int64_t now) override {
         maybe_fail();
         last_lease_request = req;
+        last_locality_wait_ms = locality_wait_ms;
         std::vector<cv1::Lease> out;
         auto nit = nodes.find(req.node_id());
         if (nit == nodes.end() || nit->second.health() != cv1::ONLINE) return out;
@@ -422,10 +425,44 @@ public:
             }
             out->add_node_ids(key.second);
         }
+        if (!out && pins.contains(id)) {
+            out.emplace();
+            out->mutable_artifact()->set_artifact_id(id);
+        }
+        if (out) out->set_pinned(pins.contains(id));
         return out;
     }
 
+    cv1::ReleaseReply release_artifact(const std::string& id, const std::string& node_id, bool force,
+                                       std::int64_t) override {
+        maybe_fail();
+        cv1::ReleaseReply out;
+        bool other = false;
+        for (const auto& [key, ref] : locations)
+            if (key.first == id && key.second != node_id) other = true;
+        if (!force && pins.contains(id)) out.set_reason("pinned");
+        else if (!force && !other) out.set_reason("last copy");
+        else {
+            locations.erase({id, node_id});
+            out.set_released(true);
+        }
+        return out;
+    }
+
+    cv1::ArtifactInfo set_artifact_pinned(const std::string& id, bool pinned, const std::string& actor,
+                                          std::int64_t) override {
+        maybe_fail();
+        if (pinned) pins.try_emplace(id, actor);
+        else pins.erase(id);
+        if (auto info = get_artifact(id)) return *info;
+        cv1::ArtifactInfo info;
+        info.mutable_artifact()->set_artifact_id(id);
+        return info;
+    }
+
+    std::map<std::string, std::string> pins;  // artifact_id -> pinned_by
     cv1::LeaseRequest last_lease_request;
+    std::int64_t last_locality_wait_ms = -1;
     int expire_calls = 0;
 
     void audit(const std::string& actor, const std::string& action, const std::string& target,

@@ -274,6 +274,19 @@ message ArtifactAnnouncement {
 message ArtifactInfo {
   ArtifactRef artifact = 1;
   repeated string node_ids = 2;    // nodes holding a copy, by name order
+  bool pinned = 3;                 // Phase 5: never released by GC
+}
+
+// POST /artifacts/sha256/{hex}/release (phase5.md §6). Atomic: drops this
+// node's location only if another node holds a copy and it isn't pinned
+// (force: always, used by tdrctl artifact rm --force).
+message ReleaseRequest {
+  string node_id = 1;
+  bool force = 2;
+}
+message ReleaseReply {
+  bool released = 1;
+  string reason = 2;               // "last copy" | "pinned" when not released
 }
 
 // ---- audit / errors ---------------------------------------------------------

@@ -187,7 +187,8 @@ constexpr const char* kCpUsage = R"(usage: tdrctl cp [--url URL] [--ca F] [--cer
   job-submit [--cpus N] [--memory-mb N] [--timeout S] [--attempts N] [--operation OP]
              [--params JSON] [--input ARTIFACT]... [--env KEY=VALUE]... [--campaign ID]
              [--material ID] [--capability C]... -- argv...
-  artifact ID                                      which nodes hold an artifact
+  artifact ID                                      which nodes hold an artifact (+ pinned)
+  artifact-pin ID | artifact-unpin ID              pinned artifacts are never evicted (Phase 5)
 
 connection: --url/--ca/--cert/--key, else $TDR_CP_URL, $TDR_CP_CA, $TDR_CP_CERT, $TDR_CP_KEY
             (an admin certificate: tdrctl pki issue DIR --role admin NAME)
@@ -494,15 +495,19 @@ int cp(const std::vector<std::string>& all_args) {
         else std::cout << j.job_id() << "\n";
         return 0;
     }
-    if (cmd == "artifact") {
+    if (cmd == "artifact" || cmd == "artifact-pin" || cmd == "artifact-unpin") {
         auto id = need_arg("ID");
         constexpr std::string_view kPrefix = "artifact://sha256/";
         std::string hex = id.starts_with(kPrefix) ? id.substr(kPrefix.size()) : id;
-        auto info = c.get<cv1::ArtifactInfo>("GET", "/api/v1/artifacts/sha256/" + hex);
+        std::string path = "/api/v1/artifacts/sha256/" + hex;
+        auto info = cmd == "artifact" ? c.get<cv1::ArtifactInfo>("GET", path)
+                                      : c.get<cv1::ArtifactInfo>("POST", path + (cmd == "artifact-pin" ? "/pin" : "/unpin"), "{}");
         return out(info, [&] {
-            std::cout << "artifact:   " << info.artifact().artifact_id() << "\n"
+            std::cout << "artifact:   " << (info.artifact().artifact_id().empty() ? "artifact://sha256/" + hex
+                                                                                  : info.artifact().artifact_id()) << "\n"
                       << "size:       " << info.artifact().size() << " bytes\n";
             if (!info.artifact().media_type().empty()) std::cout << "media type: " << info.artifact().media_type() << "\n";
+            std::cout << "pinned:     " << (info.pinned() ? "yes" : "no") << "\n";
             for (const auto& n : info.node_ids()) std::cout << "on node:    " << n << "\n";
         });
     }

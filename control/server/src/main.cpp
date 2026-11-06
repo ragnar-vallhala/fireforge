@@ -77,7 +77,8 @@ std::expected<CpConfig, std::string> load(const fs::path& path) {
         {"health", {{"heartbeat_interval", num(c.api.heartbeat_interval_seconds)},
                     {"stale_after", num(c.api.stale_after_seconds)},
                     {"offline_after", num(c.api.offline_after_seconds)}}},
-        {"jobs", {{"lease_ttl", num(c.api.lease_ttl_seconds)}, {"max_attempts_default", num(c.api.max_attempts_default)}}},
+        {"jobs", {{"lease_ttl", num(c.api.lease_ttl_seconds)}, {"max_attempts_default", num(c.api.max_attempts_default)},
+                  {"locality_wait", num(c.api.locality_wait_seconds)}}},
         {"log", {{"level", str(c.log_level)}}},
     };
     for (const auto& [sec, keys] : ini->sections) {

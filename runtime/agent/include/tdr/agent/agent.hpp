@@ -59,6 +59,13 @@ public:
     virtual void update_job(const std::string& job_id, const cv1::JobUpdate& update,
                             std::function<void(Result<cv1::Job>)> cb) = 0;
     virtual void announce_artifacts(const cv1::ArtifactAnnouncement& a, std::function<void(Result<void>)> cb) = 0;
+
+    // ---- Phase 5 (docs/design/phase5.md) ----
+    // GET /artifacts/sha256/{hex}; artifact_id is "artifact://sha256/<hex>". 404 = no holder.
+    virtual void get_artifact(const std::string& artifact_id, std::function<void(Result<cv1::ArtifactInfo>)> cb) = 0;
+    // POST /artifacts/sha256/{hex}/release.
+    virtual void release_artifact(const std::string& artifact_id, const cv1::ReleaseRequest& req,
+                                  std::function<void(Result<cv1::ReleaseReply>)> cb) = 0;
 };
 
 // Over http::AsyncClient, proto3 JSON bodies; non-2xx -> ClientError{status, ApiError.message}.

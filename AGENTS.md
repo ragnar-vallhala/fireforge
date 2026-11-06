@@ -4,7 +4,8 @@ FireForge: distributed materials-discovery platform. Vision: `Description.md`.
 Phase 1 (TDR local job execution, `docs/design/phase1.md`) is done.
 Phase 2 (control plane, `docs/design/phase2.md`) is done.
 Phase 3 (peer networking, `docs/design/phase3.md`) is done.
-Current work: Phase 4 (distributed execution: central queue + leases), design in `docs/design/phase4.md`.
+Phase 4 (distributed execution: central queue + leases, `docs/design/phase4.md`) is done.
+Phase 5 (artifact infrastructure: peer transfer, placement, retention, `docs/design/phase5.md`) is done.
 
 ## Memory cap — mandatory
 
@@ -36,6 +37,7 @@ runtime/<module>/         C++ TDR runtime: include/tdr/<module>/, src/, tests/
 runtime/tls, http, agent  mTLS/PKI, HTTPS server+client, tdrd control-plane agent
 runtime/peer              peer links: TLS transport + PeerManager (Phase 3)
 runtime/remote            RemoteExecutor: control-plane leases run as local jobs (Phase 4)
+runtime/transfer          ArtifactService (peer artifact transfer) + StoreGc (Phase 5)
 runtime/daemon, ctl       tdrd and tdrctl executables
 control/db, api, server   tdrcp: Postgres repository, API handlers, executable
 sdk/python/fireforge/     Python worker SDK (tests in sdk/python/tests)

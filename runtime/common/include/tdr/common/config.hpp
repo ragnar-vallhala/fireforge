@@ -42,7 +42,16 @@ struct Config {
         std::string tailscale = "auto";
         std::uint32_t peer_ping_interval = 5;   // seconds (phase3.md §4)
         std::uint32_t peer_ping_timeout = 15;   // seconds without any frame -> link closed
+        std::uint32_t max_transfer_mbps = 0;    // Phase 5: total artifact serving rate, 0 = unlimited
     } network;
+
+    // Phase 5 store retention (phase5.md §6); cap is resources.max_disk_mb.
+    struct Artifacts {
+        std::uint32_t gc_high = 90;        // % of max_disk_mb that starts eviction
+        std::uint32_t gc_low = 80;         // % to evict down to
+        std::uint32_t gc_interval = 60;    // seconds between GC passes
+        std::uint32_t gc_min_age = 600;    // seconds: younger artifacts are never evicted
+    } artifacts;
 
     struct Resources {
         std::uint32_t max_cpu_cores = 0;     // 0 = all online CPUs

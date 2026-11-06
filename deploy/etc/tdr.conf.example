@@ -25,6 +25,8 @@ tailscale = auto
 # Peer links (Phase 3): ping every N seconds; close a link silent for M seconds.
 peer_ping_interval = 5
 peer_ping_timeout = 15
+# Phase 5: cap on the total rate this node serves artifacts to peers (Mbit/s), 0 = unlimited.
+max_transfer_mbps = 0
 
 [resources]
 # 0 = all online CPUs
@@ -33,7 +35,7 @@ max_cpu_cores = 0
 max_memory_mb = 0
 # 0 = same as max_cpu_cores
 max_jobs = 0
-# 0 = unlimited
+# Artifact store cap (Phase 5 GC evicts copies held elsewhere), 0 = unlimited
 max_disk_mb = 0
 # Memory reserved for a job that requests 0
 default_job_memory_mb = 1024
@@ -42,6 +44,16 @@ cgroups = auto
 # Run job processes as this unprivileged user (e.g. fireforge-job).
 # Empty = same user as tdrd (development only). See docs/design/phase1.md §11.
 job_user =
+
+[artifacts]
+# Phase 5 store GC: evict least-recently-used copies that another node also holds
+# when the store exceeds gc_high % of max_disk_mb, down to gc_low %. The last copy
+# and pinned artifacts are never evicted.
+gc_high = 90
+gc_low = 80
+gc_interval = 60
+# Artifacts used within this many seconds are never evicted.
+gc_min_age = 600
 
 [tls]
 # mTLS credentials for the control plane (issued with `tdrctl pki issue --role node`).

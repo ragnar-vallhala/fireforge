@@ -12,7 +12,7 @@ namespace {
 // Arbitrary constant: pg_advisory_xact_lock key for "fireforge schema".
 constexpr std::int64_t kMigrationLock = 0x4646'5343'4845'4d41;  // "FFSCHEMA"
 
-constexpr std::array<std::string_view, 2> kMigrations = {
+constexpr std::array<std::string_view, 3> kMigrations = {
     // 1: initial control-plane schema
     R"sql(
 CREATE TABLE nodes (
@@ -146,6 +146,20 @@ CREATE TABLE artifact_syncs (
     node_id    text PRIMARY KEY REFERENCES nodes (node_id) ON DELETE CASCADE,
     sync_id    text NOT NULL,
     started_at timestamptz NOT NULL
+);
+)sql",
+    // 3: Phase 5 placement and retention (docs/design/phase5.md §4, §6)
+    R"sql(
+-- Set whenever a job enters QUEUED (submit or requeue); locality_wait counts from it.
+ALTER TABLE jobs ADD COLUMN queued_at timestamptz;
+UPDATE jobs SET queued_at = created_at WHERE state = 'QUEUED';
+
+-- Pinned artifacts are never released (without force). No FK: an artifact may
+-- be pinned before (or after) any node holds it.
+CREATE TABLE artifact_pins (
+    artifact_id text PRIMARY KEY,
+    pinned_by   text NOT NULL DEFAULT '',
+    pinned_at   timestamptz NOT NULL
 );
 )sql",
 };

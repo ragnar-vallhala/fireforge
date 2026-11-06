@@ -143,10 +143,14 @@ struct ControlApi::Impl {
         add("POST", "/api/v1/leases", &Impl::lease);
         add("POST", "/api/v1/artifacts/announce", &Impl::announce);
         add("GET", "/api/v1/artifacts/sha256/{hex}", &Impl::get_artifact);
+        add("POST", "/api/v1/artifacts/sha256/{hex}/release", &Impl::release_artifact);
+        add("POST", "/api/v1/artifacts/sha256/{hex}/pin", &Impl::pin_artifact);
+        add("POST", "/api/v1/artifacts/sha256/{hex}/unpin", &Impl::unpin_artifact);
         add("GET", "/api/v1/audit", &Impl::audit);
     }
 
     std::int64_t ttl_ms() const { return std::int64_t{options.lease_ttl_seconds} * 1000; }
+    std::int64_t locality_wait_ms() const { return std::int64_t{options.locality_wait_seconds} * 1000; }
 
     static Response node_not_found(const std::string& id) { return error_response(404, "not_found", "unknown node " + id); }
     static Response campaign_not_found(const std::string& id) {
@@ -520,7 +524,7 @@ struct ControlApi::Impl {
         if (!node) return node.error();
         cv1::LeaseReply out;
         out.set_lease_ttl_seconds(options.lease_ttl_seconds);
-        for (auto& l : repo.lease_jobs(req, ttl_ms(), clock())) {
+        for (auto& l : repo.lease_jobs(req, ttl_ms(), locality_wait_ms(), clock())) {
             log_info("job {} attempt {} (#{}) leased to {}", l.job_id(), l.attempt_id(), l.attempt_number(),
                      node->name());
             *out.add_leases() = std::move(l);
@@ -547,15 +551,50 @@ struct ControlApi::Impl {
         return Response{200, "{}", "application/json"};
     }
 
+    // The artifact id named by {hex}, or a 400.
+    static std::expected<std::string, Response> artifact_param(Request& r) {
+        const auto& hex = r.params["hex"];
+        if (!valid_sha256_hex(hex))
+            return std::unexpected(error_response(400, "bad_request", "expected 64 lowercase hex characters"));
+        return std::string(kArtifactPrefix) + hex;
+    }
+
     Response get_artifact(Request& r) {
         if (auto e = check_role(r, kNode | kAdmin)) return *e;
-        const auto& hex = r.params["hex"];
-        if (!valid_sha256_hex(hex)) return error_response(400, "bad_request", "expected 64 lowercase hex characters");
-        const std::string id = std::string(kArtifactPrefix) + hex;
-        auto info = repo.get_artifact(id);
-        if (!info) return error_response(404, "not_found", "no node holds " + id);
+        auto id = artifact_param(r);
+        if (!id) return id.error();
+        auto info = repo.get_artifact(*id);
+        if (!info) return error_response(404, "not_found", "no node holds " + *id);
         return reply(*info);
     }
+
+    // ---- retention (phase5.md §6) ------------------------------------------------
+
+    Response release_artifact(Request& r) {
+        if (auto e = check_role(r, kNode)) return *e;
+        auto id = artifact_param(r);
+        if (!id) return id.error();
+        cv1::ReleaseRequest req;
+        if (auto e = parse_body(r, req)) return *e;
+        auto node = own_node(r, req.node_id());
+        if (!node) return node.error();
+        auto out = repo.release_artifact(*id, req.node_id(), req.force(), clock());
+        if (out.released()) log_info("node {} released {}{}", node->name(), *id, req.force() ? " (force)" : "");
+        return reply(out);
+    }
+
+    Response set_pinned(Request& r, bool pinned) {
+        if (auto e = check_role(r, kAdmin)) return *e;
+        auto id = artifact_param(r);
+        if (!id) return id.error();
+        const auto now = clock();
+        const auto actor = actor_of(*r.peer);
+        auto info = repo.set_artifact_pinned(*id, pinned, actor, now);
+        repo.audit(actor, pinned ? "artifact.pin" : "artifact.unpin", *id, "{}", now);
+        return reply(info);
+    }
+    Response pin_artifact(Request& r) { return set_pinned(r, true); }
+    Response unpin_artifact(Request& r) { return set_pinned(r, false); }
 
     // ---- audit ----------------------------------------------------------------
 

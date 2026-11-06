@@ -1,0 +1,33 @@
+// Peer artifact transfer on a data link (docs/design/phase5.md §3).
+
+syntax = "proto3";
+
+package fireforge.tdr.v1;
+
+// fetcher -> server, first frame of a data link (ARTIFACT_REQUEST).
+message ArtifactRequest {
+  string artifact_id = 1;   // "artifact://sha256/<64 hex>"
+  uint64 offset = 2;        // resume point (bytes already held)
+  uint32 window = 3;        // chunks the server may have unacknowledged (0 = 8)
+}
+
+// server -> fetcher (ARTIFACT_OFFER), before the first chunk.
+message ArtifactOffer {
+  string artifact_id = 1;
+  uint64 size = 2;          // whole artifact
+  string sha256 = 3;        // 64 hex (== id digest)
+  string media_type = 4;
+  uint64 offset = 5;        // where the stream starts (== request offset)
+}
+
+// server -> fetcher (ARTIFACT_TRANSFER).
+message ArtifactChunk {
+  uint64 offset = 1;        // of data[0] within the artifact
+  bytes data = 2;           // <= chunk size (1 MiB); empty only for an empty artifact
+  bool last = 3;
+}
+
+// fetcher -> server (ARTIFACT_CHUNK_ACK): everything before next_offset is stored.
+message ArtifactChunkAck {
+  uint64 next_offset = 1;
+}

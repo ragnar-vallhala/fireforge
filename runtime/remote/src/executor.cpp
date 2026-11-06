@@ -11,15 +11,27 @@
 // updates of a job always go out in order and a later one is never sent before
 // the earlier one is acknowledged.
 //
+// Inputs (phase5.md §5): a new lease is persisted with "submitted": false and
+// its (local) spec. With a fetcher set, every input goes through
+// IArtifactFetcher::fetch (it answers at once for inputs already present), in
+// parallel; once all are present the job is submitted to the JobManager and the
+// lease is marked submitted. Without a fetcher the job is submitted directly;
+// a missing input then fails the lease retryable ("artifact transfer
+// unavailable"). Leases not yet submitted hold their slot/cpu/memory in the
+// pull loop and their inputs are protected_inputs().
+//
 // State file (RemoteOptions::state_file, replaced atomically: tmp + fsync +
-// rename), version 1:
+// rename), version 2 (version 1 files, which lack "submitted"/"spec", are
+// read as all submitted):
 //
 //   {
-//     "version": 1,
+//     "version": 2,
 //     "leases": [                      // mapping, keyed by local job id
 //       {"local_job_id": "job-x.a2", "job_id": "job-x", "attempt_id": "att-...",
 //        "fencing_token": 2, "attempt_number": 2,
-//        "terminal": false}            // true once the outcome update is queued
+//        "terminal": false,            // true once the outcome update is queued
+//        "submitted": true,            // false: local job not submitted yet (fetching inputs)
+//        "spec": {...}}                // JobSpec as proto3 JSON, only while not submitted
 //     ],
 //     "outbox": [                      // pending status updates, oldest first
 //       {"job_id": "job-x", "local_job_id": "job-x.a2", "terminal": false,
@@ -28,7 +40,10 @@
 //   }
 //
 // A mapping entry is removed once its terminal update is acknowledged (2xx),
-// or dropped (409 / 404 / other 4xx). Missing file = empty state; an
+// or dropped (409 / 404 / other 4xx). On start(), a non-terminal lease with no
+// local job is "local job lost" if it was submitted, else its inputs are
+// fetched again (resuming .part files) and it runs: on on_registered() or
+// set_fetcher(), whichever comes first with a fetcher (or no inputs needed). Missing file = empty state; an
 // unreadable file is renamed to <file>.corrupt and the executor starts empty.
 #include "tdr/remote/executor.hpp"
 
@@ -47,6 +62,7 @@
 #include <format>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <system_error>
 
@@ -131,10 +147,13 @@ std::uint64_t uint_field(const json::object& o, std::string_view key) {
     return json::value_to<std::uint64_t>(*v);
 }
 
-bool bool_field(const json::object& o, std::string_view key) {
+bool bool_field(const json::object& o, std::string_view key, bool dflt = false) {
     const auto* v = o.if_contains(key);
-    return v && v->is_bool() && v->as_bool();
+    if (!v || !v->is_bool()) return dflt;
+    return v->as_bool();
 }
+
+constexpr std::string_view kInputMissing = "input artifact not found locally";
 
 }  // namespace
 
@@ -145,6 +164,14 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         std::uint64_t token = 0;
         std::uint32_t attempt_number = 0;
         bool terminal = false;  // outcome update queued
+        bool submitted = true;  // local job submitted (false while fetching inputs)
+        tv1::JobSpec spec;      // local spec, kept until submitted
+        // memory only
+        bool fetching = false;
+        std::size_t fetch_remaining = 0;
+        std::uint64_t fetch_gen = 0;  // discards callbacks of an abandoned fetch
+
+        bool waiting() const { return !terminal && !submitted; }
     };
     struct Pending {
         std::string job_id;
@@ -158,6 +185,8 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
     jobs::JobManager& manager;
     RemoteOptions opts;
     RemoteHooks hooks;
+    transfer::IArtifactFetcher* fetcher = nullptr;
+    std::uint64_t next_fetch_gen = 0;
 
     bool started = false, stopped = false;
     std::string node_id;  // "" until on_registered
@@ -211,17 +240,24 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
     void save() {
         if (opts.state_file.empty()) return;
         json::array ls;
-        for (const auto& [local, l] : leases) {
-            ls.push_back(json::object{{"local_job_id", local},
-                                      {"job_id", l.job_id},
-                                      {"attempt_id", l.attempt_id},
-                                      {"fencing_token", l.token},
-                                      {"attempt_number", l.attempt_number},
-                                      {"terminal", l.terminal}});
-        }
-        json::array ob;
         pbu::JsonPrintOptions po;
         po.preserve_proto_field_names = true;
+        for (const auto& [local, l] : leases) {
+            json::object o{{"local_job_id", local},
+                           {"job_id", l.job_id},
+                           {"attempt_id", l.attempt_id},
+                           {"fencing_token", l.token},
+                           {"attempt_number", l.attempt_number},
+                           {"terminal", l.terminal},
+                           {"submitted", l.submitted}};
+            if (l.waiting()) {
+                std::string sj;
+                (void)pbu::MessageToJsonString(l.spec, &sj, po);
+                o["spec"] = json::parse(sj);
+            }
+            ls.push_back(std::move(o));
+        }
+        json::array ob;
         for (const auto& p : outbox) {
             std::string u;
             (void)pbu::MessageToJsonString(p.update, &u, po);
@@ -230,7 +266,7 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
                                       {"terminal", p.terminal},
                                       {"update", json::parse(u)}});
         }
-        json::object root{{"version", 1}, {"leases", std::move(ls)}, {"outbox", std::move(ob)}};
+        json::object root{{"version", 2}, {"leases", std::move(ls)}, {"outbox", std::move(ob)}};
         write_atomic(opts.state_file, json::serialize(root) + "\n");
     }
 
@@ -246,7 +282,10 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
             std::deque<Pending> ob;
             const json::value doc = json::parse(ss.str());
             const json::object& root = doc.as_object();
-            if (uint_field(root, "version") != 1) throw std::runtime_error("unsupported version");
+            const auto version = uint_field(root, "version");
+            if (version != 1 && version != 2) throw std::runtime_error("unsupported version");
+            pbu::JsonParseOptions po;
+            po.ignore_unknown_fields = true;
             for (const auto& v : root.at("leases").as_array()) {
                 const auto& o = v.as_object();
                 Lease l;
@@ -255,10 +294,15 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
                 l.token = uint_field(o, "fencing_token");
                 l.attempt_number = static_cast<std::uint32_t>(uint_field(o, "attempt_number"));
                 l.terminal = bool_field(o, "terminal");
+                l.submitted = version == 1 || bool_field(o, "submitted", true);
+                if (l.waiting()) {
+                    const auto* sp = o.if_contains("spec");
+                    if (!sp) throw std::runtime_error("lease not submitted but has no spec");
+                    auto st = pbu::JsonStringToMessage(json::serialize(*sp), &l.spec, po);
+                    if (!st.ok()) throw std::runtime_error("bad spec: " + st.ToString());
+                }
                 ls[str_field(o, "local_job_id")] = std::move(l);
             }
-            pbu::JsonParseOptions po;
-            po.ignore_unknown_fields = true;
             for (const auto& v : root.at("outbox").as_array()) {
                 const auto& o = v.as_object();
                 Pending p;
@@ -300,10 +344,19 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
                     continue;
                 }
             } else if (auto st = manager.status(local); !st) {
-                log_warn("remote: local job {} of lease {} is gone; reporting FAILED", local, l.job_id);
-                queue_outcome(local, l, tv1::FAILED, "local job lost", /*retryable=*/true, {});
-            } else if (jobs::is_terminal(st->state())) {
-                queue_terminal_from_status(local, l, *st);
+                if (!l.submitted) {
+                    log_info("remote: lease {} was interrupted before its local job started; will fetch its "
+                             "inputs again", l.job_id);
+                } else {
+                    log_warn("remote: local job {} of lease {} is gone; reporting FAILED", local, l.job_id);
+                    queue_outcome(local, l, tv1::FAILED, "local job lost", /*retryable=*/true, {});
+                }
+            } else {
+                if (!l.submitted) {  // crashed between submit and persisting it
+                    l.submitted = true;
+                    l.spec.Clear();
+                }
+                if (jobs::is_terminal(st->state())) queue_terminal_from_status(local, l, *st);
             }
             ++it;
         }
@@ -321,6 +374,7 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
     void on_registered(const std::string& id) {
         if (!started || stopped) return;
         node_id = id;
+        resume_waiting();
         // Outbox: retry now.
         outbox_timer.cancel();
         outbox_backoff = 0ms;
@@ -369,11 +423,21 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         }
         const auto cap = manager.capacity();
         const auto use = manager.usage();
-        const std::uint32_t busy = use.running + use.queued;
-        const std::uint32_t slots = cap.jobs > busy ? cap.jobs - busy : 0;
-        const std::uint32_t cpu = cap.cpu_cores > use.allocated.cpu_cores ? cap.cpu_cores - use.allocated.cpu_cores : 0;
-        const std::uint64_t mem =
-            cap.memory_bytes > use.allocated.memory_bytes ? cap.memory_bytes - use.allocated.memory_bytes : 0;
+        // Leases not yet submitted (fetching inputs) hold what their job will take.
+        jobs::Capacity held;
+        for (const auto& [_, l] : leases) {
+            if (!l.waiting()) continue;
+            const auto r = jobs::effective_request(l.spec, opts.default_job_memory_bytes);
+            held.jobs += 1;
+            held.cpu_cores += r.cpu_cores;
+            held.memory_bytes += r.memory_bytes;
+        }
+        const std::uint64_t busy = std::uint64_t{use.running} + use.queued + held.jobs;
+        const std::uint32_t slots = cap.jobs > busy ? static_cast<std::uint32_t>(cap.jobs - busy) : 0;
+        const std::uint64_t used_cpu = std::uint64_t{use.allocated.cpu_cores} + held.cpu_cores;
+        const std::uint32_t cpu = cap.cpu_cores > used_cpu ? static_cast<std::uint32_t>(cap.cpu_cores - used_cpu) : 0;
+        const std::uint64_t used_mem = use.allocated.memory_bytes + held.memory_bytes;
+        const std::uint64_t mem = cap.memory_bytes > used_mem ? cap.memory_bytes - used_mem : 0;
         if (use.queued > 0 || slots == 0 || cpu == 0 || mem == 0) {
             // Busy: a terminal local job triggers a prompt poll; this is the fallback.
             schedule_poll(opts.poll_interval);
@@ -425,25 +489,139 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         l.attempt_id = lease.attempt_id();
         l.token = lease.fencing_token();
         l.attempt_number = lease.attempt_number();
-        leases[local] = l;
+        l.submitted = false;
+        l.spec = lease.spec();
+        l.spec.set_job_id(local);
+        l.spec.mutable_policy()->set_max_attempts(1);  // the control plane owns retries
+        leases[local] = std::move(l);
         save();  // mapping first: a crash after submit must still find it
-
-        tv1::JobSpec spec = lease.spec();
-        spec.set_job_id(local);
-        spec.mutable_policy()->set_max_attempts(1);  // the control plane owns retries
         log_info("remote: lease {} attempt {} -> local job {}", lease.job_id(), lease.attempt_number(), local);
-        auto sub = manager.submit(std::move(spec));  // may call on_job_state re-entrantly
-        if (!sub) {
-            const bool retryable = submit_error_retryable(sub.error());
-            log_warn("remote: lease {} rejected locally ({}): {}", lease.job_id(),
-                     retryable ? "retryable" : "not retryable", sub.error());
-            auto it = leases.find(local);
-            if (it != leases.end() && !it->second.terminal) {
-                queue_outcome(local, it->second, tv1::FAILED, sub.error(), retryable, {});
-                save();
-                send_next_update();
-            }
+        prepare(local);
+    }
+
+    // ---- inputs -> submit ---------------------------------------------------------
+
+    static std::vector<std::string> inputs_of(const tv1::JobSpec& spec) {
+        std::set<std::string> ids(spec.input_artifacts().begin(), spec.input_artifacts().end());
+        return {ids.begin(), ids.end()};
+    }
+
+    // Fetch the inputs of a not-yet-submitted lease (all of them through the
+    // fetcher, which answers at once for present ones), then submit.
+    void prepare(const std::string& local) {
+        auto it = leases.find(local);
+        if (it == leases.end() || !it->second.waiting() || it->second.fetching) return;
+        Lease& l = it->second;
+        const auto ids = inputs_of(l.spec);
+        if (ids.empty() || !fetcher) {
+            (void)submit_lease(local);
+            return;
         }
+        l.fetching = true;
+        l.fetch_remaining = ids.size();
+        const auto gen = l.fetch_gen = ++next_fetch_gen;
+        log_info("remote: lease {}: fetching {} input(s)", l.job_id, ids.size());
+        for (const auto& id : ids) {
+            fetcher->fetch(id, [w = weak(), local, gen, id](std::expected<artifacts::ArtifactMeta, std::string> r) {
+                auto self = w.lock();
+                if (!self || self->stopped) return;
+                self->on_fetched(local, gen, id, r ? std::string{} : r.error(), r.has_value());
+            });
+        }
+    }
+
+    void on_fetched(const std::string& local, std::uint64_t gen, const std::string& id, const std::string& error,
+                    bool ok) {
+        auto it = leases.find(local);
+        if (it == leases.end()) return;
+        Lease& l = it->second;
+        if (!l.waiting() || !l.fetching || l.fetch_gen != gen) return;
+        if (!ok) {
+            l.fetching = false;
+            l.fetch_gen = ++next_fetch_gen;  // ignore the other inputs' results
+            const std::string err = std::format("fetch {}: {}", id, error);
+            log_warn("remote: lease {} failed: {}", l.job_id, err);
+            queue_outcome(local, l, tv1::FAILED, err, /*retryable=*/true, {});
+            save();
+            send_next_update();
+            request_poll();  // its capacity is free again
+            return;
+        }
+        if (l.fetch_remaining > 0) --l.fetch_remaining;
+        if (l.fetch_remaining > 0) return;
+        l.fetching = false;
+        const bool submitted = submit_lease(local);
+        if (!submitted) request_poll();
+    }
+
+    // Submit the local job of a waiting lease. Returns true on success.
+    bool submit_lease(const std::string& local) {
+        auto it = leases.find(local);
+        if (it == leases.end() || !it->second.waiting()) return false;
+        tv1::JobSpec spec = it->second.spec;
+        const std::string central = it->second.job_id;
+        auto sub = manager.submit(std::move(spec));  // may call on_job_state re-entrantly
+        it = leases.find(local);
+        if (it == leases.end()) return sub.has_value();
+        Lease& l = it->second;
+        if (sub) {
+            l.submitted = true;
+            l.spec.Clear();
+            save();
+            return true;
+        }
+        std::string err = sub.error();
+        bool retryable = submit_error_retryable(err);
+        if (err.find(kInputMissing) != std::string::npos) {
+            retryable = true;  // another node may hold it / fetch may work later
+            if (!fetcher) err = "artifact transfer unavailable";
+        }
+        log_warn("remote: lease {} rejected locally ({}): {}", central, retryable ? "retryable" : "not retryable",
+                 sub.error());
+        if (!l.terminal) {
+            queue_outcome(local, l, tv1::FAILED, err, retryable, {});
+            save();
+            send_next_update();
+        }
+        return false;
+    }
+
+    // Leases interrupted before submit (restart) or waiting for a fetcher.
+    void resume_waiting() {
+        if (!started || stopped) return;
+        std::vector<std::string> todo;
+        for (const auto& [local, l] : leases) {
+            if (!l.waiting() || l.fetching) continue;
+            if (!fetcher && !l.spec.input_artifacts().empty()) continue;  // wait for set_fetcher()
+            todo.push_back(local);
+        }
+        bool freed = false;
+        for (const auto& local : todo) {
+            prepare(local);
+            auto it = leases.find(local);
+            if (it == leases.end() || it->second.terminal) freed = true;
+        }
+        if (freed) request_poll();
+    }
+
+    void set_fetcher(transfer::IArtifactFetcher* f) {
+        fetcher = f;
+        if (f && !stopped) resume_waiting();
+    }
+
+    void announce(const std::vector<cv1::ArtifactRef>& refs) {
+        if (stopped || refs.empty()) return;
+        for (const auto& r : refs) to_announce.push_back(r);
+        send_announce();
+    }
+
+    std::vector<std::string> protected_inputs() const {
+        std::set<std::string> ids;
+        for (const auto& [_, l] : leases) {
+            if (!l.waiting()) continue;
+            ids.insert(l.spec.input_artifacts().begin(), l.spec.input_artifacts().end());
+        }
+        return {ids.begin(), ids.end()};
     }
 
     // ---- job state -> outbox ------------------------------------------------------
@@ -681,6 +859,19 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
                 }
             }
             if (local.empty()) continue;
+            if (auto it = leases.find(local); it != leases.end() && it->second.waiting()) {
+                // No local job yet: abandon the fetch and report CANCELLED.
+                Lease& l = it->second;
+                log_info("remote: lease {} (attempt {}) revoked before its local job started", ref.job_id(),
+                         ref.attempt_id());
+                l.fetching = false;
+                l.fetch_gen = ++next_fetch_gen;
+                queue_outcome(local, l, tv1::CANCELLED, "lease revoked", false, {});
+                save();
+                send_next_update();
+                request_poll();
+                continue;
+            }
             log_info("remote: lease {} (attempt {}) revoked; cancelling local job {}", ref.job_id(),
                      ref.attempt_id(), local);
             if (auto r = manager.cancel(local); !r) log_debug("remote: cancel {}: {}", local, r.error());
@@ -717,6 +908,9 @@ void RemoteExecutor::on_job_state(const std::string& local_job_id, tv1::JobState
 }
 void RemoteExecutor::on_revoked(const std::vector<cv1::LeaseRef>& revoked) { impl_->on_revoked(revoked); }
 std::vector<cv1::LeaseRef> RemoteExecutor::active_leases() const { return impl_->active_leases(); }
+void RemoteExecutor::set_fetcher(transfer::IArtifactFetcher* fetcher) { impl_->set_fetcher(fetcher); }
+void RemoteExecutor::announce(const std::vector<cv1::ArtifactRef>& refs) { impl_->announce(refs); }
+std::vector<std::string> RemoteExecutor::protected_inputs() const { return impl_->protected_inputs(); }
 
 std::optional<std::string> RemoteExecutor::central_job_id(const std::string& local_job_id) const {
     auto it = impl_->leases.find(local_job_id);

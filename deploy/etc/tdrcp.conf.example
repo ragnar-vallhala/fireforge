@@ -28,6 +28,10 @@ offline_after = 90
 #lease_ttl = 60
 # Used when a submitted job leaves policy.max_attempts at 0.
 #max_attempts_default = 3
+# Placement (docs/design/phase5.md §4): a job with input artifacts goes to a
+# node holding all of them first; after it has been queued this many seconds,
+# any node may take it and fetch the inputs from a peer. 0 = any node at once.
+#locality_wait = 15
 
 [log]
 level = info

@@ -125,6 +125,18 @@ struct Rig {
             if (r.body.find("bad") != std::string::npos) return http::error_response(400, "bad_request", "bad id");
             return http::Response{200, "{}"};
         });
+        // ---- Phase 5 routes ----
+        router.add("GET", "/api/v1/artifacts/sha256/{hex}", [this](http::Request& r) {
+            seen.push_back("get_artifact " + r.params.at("hex"));
+            if (r.params.at("hex") != "ab12") return http::error_response(404, "not_found", "no holder");
+            return http::Response{200, R"({"artifact": {"artifact_id": "artifact://sha256/ab12", "size": "5"},
+                "node_ids": ["n1", "n2"], "pinned": true})"};
+        });
+        router.add("POST", "/api/v1/artifacts/sha256/{hex}/release", [this](http::Request& r) {
+            seen.push_back("release " + r.params.at("hex") + " " + r.body);
+            if (r.body.find("\"force\":true") != std::string::npos) return http::Response{200, R"({"released": true})"};
+            return http::Response{200, R"({"released": false, "reason": "last copy"})"};
+        });
 
         http::ServerOptions so;
         so.listen_address = "127.0.0.1";
@@ -311,6 +323,37 @@ BOOST_AUTO_TEST_CASE(phase4_calls) {
     BOOST_REQUIRE(!ann->has_value());
     BOOST_TEST(ann->error().http_status == 400);
     BOOST_TEST(ann->error().message == "bad id");
+
+    std::optional<Result<cv1::ArtifactInfo>> info;
+    rig.client->get_artifact("artifact://sha256/ab12", [&](Result<cv1::ArtifactInfo> r) { info = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return info.has_value(); }));
+    BOOST_REQUIRE(info->has_value());
+    BOOST_TEST((*info)->artifact().size() == 5u);
+    BOOST_TEST((*info)->node_ids_size() == 2);
+    BOOST_TEST((*info)->pinned());
+    BOOST_TEST(rig.seen.back() == "get_artifact ab12");
+    info.reset();
+    rig.client->get_artifact("artifact://sha256/cd34", [&](Result<cv1::ArtifactInfo> r) { info = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return info.has_value(); }));
+    BOOST_REQUIRE(!info->has_value());
+    BOOST_TEST(info->error().http_status == 404);
+    BOOST_TEST(info->error().message == "no holder");
+
+    std::optional<Result<cv1::ReleaseReply>> rel;
+    cv1::ReleaseRequest rr;
+    rr.set_node_id("n1");
+    rig.client->release_artifact("artifact://sha256/ab12", rr, [&](Result<cv1::ReleaseReply> r) { rel = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return rel.has_value(); }));
+    BOOST_REQUIRE(rel->has_value());
+    BOOST_TEST(!(*rel)->released());
+    BOOST_TEST((*rel)->reason() == "last copy");
+    BOOST_TEST(rig.seen.back() == R"(release ab12 {"node_id":"n1"})");
+    rel.reset();
+    rr.set_force(true);
+    rig.client->release_artifact("artifact://sha256/ab12", rr, [&](Result<cv1::ReleaseReply> r) { rel = std::move(r); });
+    BOOST_REQUIRE(rig.run_until([&] { return rel.has_value(); }));
+    BOOST_REQUIRE(rel->has_value());
+    BOOST_TEST((*rel)->released());
 }
 
 BOOST_AUTO_TEST_CASE(transport_error_has_status_zero) {

@@ -863,7 +863,7 @@ Security requirements:
 | 8 | Scientific integration | Complete thermoelectric workflow |
 | 9 | Discovery intelligence | Automated candidate discovery |
 
-Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md).
+Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md), [Phase 4](docs/design/phase4.md), [Phase 5](docs/design/phase5.md).
 
 ## First Demonstration
 
@@ -918,11 +918,11 @@ Decided 2026-11-05.
 | 10 | First campaign | Half-Heusler compounds | Small 3-atom cells, large combinatorial space, good high-temperature stability, rich literature for validation |
 | 11 | Control-plane implementation | C++ (`tdrcp`: Boost.Beast HTTPS + libpq), shared code with TDR | One toolchain, one protocol/TLS stack |
 | 12 | Node and peer authentication | mTLS with a private FireForge CA (TLS 1.3); node certs (`OU=node`) authenticate to the control plane and to peers | One trust root for control and peer traffic; works over LAN and Tailscale |
+| 13 | Artifact retention | Per-node disk cap (`max_disk_mb`); LRU eviction only of copies another reachable node holds, confirmed atomically by the control plane; the last copy is never auto-deleted; admins can pin | Bounded disks without risking data loss |
 
 **Still open:**
 
 - Exact hybrid push/pull policy (which jobs are pushed, and how push and pull interact).
-- Artifact retention and garbage-collection policy.
 - cgroup delegation policy.
 
 # 22. Project Principles
@@ -973,3 +973,4 @@ The platform begins by integrating established scientific solvers and validating
 |---|---|---|
 | 0.1 | — | Initial architecture specification. |
 | 0.2 | 2026-11-05 | Architectural decisions recorded (§21); roadmap gains a multi-node execution phase (§20). |
+| 0.3 | 2026-11-06 | Artifact retention decided (§21 #13); Phase 4 and 5 designs linked. |

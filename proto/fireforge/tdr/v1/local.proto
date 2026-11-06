@@ -142,6 +142,39 @@ message PeerList {
   uint32 listen_port = 4;         // bound peer port (0 = peer listener off)
 }
 
+// ---- artifacts (Phase 5, docs/design/phase5.md §7) ----
+message LocalArtifact {
+  fireforge.control.v1.ArtifactRef ref = 1;
+  string local_path = 2;           // file inside the store
+  int64 last_used_unix_ms = 3;     // store file mtime (LRU clock)
+  bool fetched = 4;                // GET: had to be fetched from a peer
+}
+message LocalArtifactList {
+  repeated LocalArtifact artifacts = 1;
+  uint64 store_bytes = 2;
+  uint64 max_bytes = 3;            // 0 = no cap
+}
+message ArtifactPutRequest {
+  string path = 1;                 // absolute path readable by tdrd
+  string media_type = 2;
+}
+message ArtifactGetRequest { string artifact_id = 1; }
+message ArtifactListRequest {}
+message ArtifactRmRequest {
+  string artifact_id = 1;
+  bool force = 2;                  // delete even the last known copy
+}
+message ArtifactGcRequest {}
+message GcReport {
+  repeated string evicted = 1;
+  uint64 freed_bytes = 2;
+  uint64 store_bytes = 3;          // after
+  uint64 max_bytes = 4;
+  uint32 kept_last_copy = 5;       // candidates refused: only copy
+  uint32 kept_pinned = 6;
+  uint32 kept_protected = 7;       // in use / too young
+}
+
 message Ack {}
 
 enum ErrorCode {
@@ -152,6 +185,7 @@ enum ErrorCode {
   UNAUTHORIZED = 4;    // bad attempt token
   INTERNAL = 5;
   UNSUPPORTED = 6;     // unknown message type
+  UNAVAILABLE = 7;     // temporarily refused (e.g. artifact server busy, Phase 5)
 }
 
 message Error {

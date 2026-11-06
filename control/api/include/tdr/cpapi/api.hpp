@@ -25,6 +25,7 @@ struct ApiOptions {
     std::uint32_t offline_after_seconds = 90;
     std::uint32_t lease_ttl_seconds = 60;      // phase4.md §3
     std::uint32_t max_attempts_default = 3;    // when a submitted spec leaves it 0
+    std::uint32_t locality_wait_seconds = 15;  // phase5.md §4 (0 = any node at once)
 };
 
 // §8.3 presets. nullopt for an unknown profile name.

@@ -17,6 +17,7 @@ namespace {
 
 constexpr std::int64_t T0 = 1'700'000'000'000;  // ms
 constexpr std::int64_t TTL = 60'000;
+constexpr std::int64_t WAIT = 15'000;  // locality_wait (phase5.md §4)
 constexpr std::uint64_t GiB = std::uint64_t{1} << 30;
 
 testing::TempCluster& cluster() {
@@ -131,7 +132,7 @@ struct Db {
     tv1::JobState state(const std::string& id) { return repo->get_job(id, false)->state(); }
 
     cv1::Lease lease_one(const std::string& node, std::int64_t now = T0) {
-        auto ls = repo->lease_jobs(lreq(node, 64, 256 * GiB, 0, 1), TTL, now);
+        auto ls = repo->lease_jobs(lreq(node, 64, 256 * GiB, 0, 1), TTL, WAIT, now);
         BOOST_REQUIRE_EQUAL(ls.size(), 1u);
         return ls[0];
     }
@@ -141,20 +142,20 @@ struct Db {
 
 BOOST_AUTO_TEST_SUITE(cpdb_jobs)
 
-BOOST_AUTO_TEST_CASE(migrates_v1_database_to_v2) {
+BOOST_AUTO_TEST_CASE(migrates_v1_database_to_latest) {
     Db db;
     auto n = db.node("alpha");
     // Roll this database back to a v1 schema that holds data.
     psql(db.conninfo,
-         "DROP TABLE artifact_syncs, artifact_locations, job_attempts, jobs;"
-         " DELETE FROM schema_migrations WHERE version = 2");
+         "DROP TABLE artifact_pins, artifact_syncs, artifact_locations, job_attempts, jobs;"
+         " DELETE FROM schema_migrations WHERE version >= 2");
     BOOST_TEST(schema_version(db.conninfo) == 1);
     auto repo = open_pg_repository(db.conninfo);
-    BOOST_TEST(schema_version(db.conninfo) == 2);
+    BOOST_TEST(schema_version(db.conninfo) == 3);
     BOOST_TEST(repo->get_node(n)->name() == "alpha");
     auto j = repo->create_job(spec(), "admin:a", T0);
     BOOST_REQUIRE(j);
-    BOOST_TEST(repo->lease_jobs(lreq(n), TTL, T0).size() == 1u);
+    BOOST_TEST(repo->lease_jobs(lreq(n), TTL, WAIT, T0).size() == 1u);
 }
 
 BOOST_AUTO_TEST_CASE(create_get_list) {
@@ -288,7 +289,7 @@ BOOST_AUTO_TEST_CASE(lease_grant_fields) {
     BOOST_TEST(got->attempts(0).expires_unix_ms() == T0 + 100 + TTL);
     BOOST_TEST(got->attempts(0).ended_unix_ms() == 0);
     // Nothing left.
-    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, WAIT, T0).empty());
 }
 
 BOOST_AUTO_TEST_CASE(lease_campaign_state_gates) {
@@ -298,12 +299,12 @@ BOOST_AUTO_TEST_CASE(lease_campaign_state_gates) {
     auto s = spec("cj");
     s.set_campaign_id(camp);
     db.job(s);
-    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, T0).empty());  // DRAFT holds
+    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, WAIT, T0).empty());  // DRAFT holds
     db.set_campaign(camp, cv1::ACTIVE);
     db.set_campaign(camp, cv1::PAUSED);
-    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, T0).empty());  // PAUSED holds
+    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, WAIT, T0).empty());  // PAUSED holds
     db.set_campaign(camp, cv1::ACTIVE);
-    auto ls = db.repo->lease_jobs(lreq(n), TTL, T0);
+    auto ls = db.repo->lease_jobs(lreq(n), TTL, WAIT, T0);
     BOOST_REQUIRE_EQUAL(ls.size(), 1u);
     BOOST_TEST(ls[0].job_id() == "cj");
 }
@@ -316,8 +317,8 @@ BOOST_AUTO_TEST_CASE(lease_capabilities_subset) {
     s.add_required_capabilities("gpu:cuda");
     s.add_required_capabilities("cgroups");
     db.job(s);
-    BOOST_TEST(db.repo->lease_jobs(lreq(plain), TTL, T0).empty());
-    BOOST_TEST(db.repo->lease_jobs(lreq(gpu), TTL, T0).size() == 1u);
+    BOOST_TEST(db.repo->lease_jobs(lreq(plain), TTL, WAIT, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq(gpu), TTL, WAIT, T0).size() == 1u);
 }
 
 BOOST_AUTO_TEST_CASE(lease_locality) {
@@ -333,30 +334,30 @@ BOOST_AUTO_TEST_CASE(lease_locality) {
     *an.add_artifacts() = aref(art('1'));
     BOOST_REQUIRE(db.repo->announce_artifacts(an, T0));
     // b has only one of two inputs.
-    BOOST_TEST(db.repo->lease_jobs(lreq(b), TTL, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq(b), TTL, WAIT, T0).empty());
     an.clear_artifacts();
     *an.add_artifacts() = aref(art('2'));
     BOOST_REQUIRE(db.repo->announce_artifacts(an, T0));
-    BOOST_TEST(db.repo->lease_jobs(lreq(a), TTL, T0).empty());  // a has none
-    BOOST_TEST(db.repo->lease_jobs(lreq(b), TTL, T0).size() == 1u);
+    BOOST_TEST(db.repo->lease_jobs(lreq(a), TTL, WAIT, T0).empty());  // a has none
+    BOOST_TEST(db.repo->lease_jobs(lreq(b), TTL, WAIT, T0).size() == 1u);
 }
 
 BOOST_AUTO_TEST_CASE(lease_requires_online_node) {
     Db db;
     auto n = db.node("n1");
     db.job(spec());
-    BOOST_TEST(db.repo->lease_jobs(lreq("ff-node-unknown"), TTL, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq("ff-node-unknown"), TTL, WAIT, T0).empty());
     BOOST_REQUIRE(db.repo->set_offline(n, "maintenance", T0));
-    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, WAIT, T0).empty());
     cv1::Heartbeat hb;
     hb.set_node_id(n);
     BOOST_REQUIRE(db.repo->record_heartbeat(hb, T0 + 1));
     // STALE also gets nothing.
     BOOST_TEST(db.repo->sweep_health(T0 + 40'000, 30'000, 90'000).size() == 1u);
     BOOST_TEST(db.repo->get_node(n)->health() == cv1::STALE);
-    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, WAIT, T0).empty());
     BOOST_REQUIRE(db.repo->record_heartbeat(hb, T0 + 40'001));
-    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, T0).size() == 1u);
+    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, WAIT, T0).size() == 1u);
 }
 
 BOOST_AUTO_TEST_CASE(lease_fit_and_greedy_skip) {
@@ -377,28 +378,28 @@ BOOST_AUTO_TEST_CASE(lease_fit_and_greedy_skip) {
     mk("fits-b", 1, 2 * GiB, 0, T0 + 6);    // takes the last cpu
     mk("fits-c", 1, 1 * GiB, 0, T0 + 7);    // no cpu left
 
-    auto ls = db.repo->lease_jobs(lreq(n, 4, 8 * GiB, 0, 10), TTL, T0 + 10);
+    auto ls = db.repo->lease_jobs(lreq(n, 4, 8 * GiB, 0, 10), TTL, WAIT, T0 + 10);
     BOOST_TEST((ids(ls) == std::set<std::string>{"zero-cpu", "fits-a", "fits-b"}));
     BOOST_REQUIRE_EQUAL(ls.size(), 3u);
     BOOST_TEST(ls[0].job_id() == "zero-cpu");  // oldest first
     BOOST_TEST(ls[1].job_id() == "fits-a");
 
     // max_jobs caps grants; gpu fits once gpus are free.
-    auto l2 = db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 1, 2), TTL, T0 + 11);
+    auto l2 = db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 1, 2), TTL, WAIT, T0 + 11);
     BOOST_TEST((ids(l2) == std::set<std::string>{"big", "mem-hog"}));
-    auto l3 = db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 1, 10), TTL, T0 + 12);
+    auto l3 = db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 1, 10), TTL, WAIT, T0 + 12);
     BOOST_TEST((ids(l3) == std::set<std::string>{"gpu", "fits-c"}));
 
     // memory fit is cumulative.
     mk("m1", 1, 3 * GiB, 0, T0 + 20);
     mk("m2", 1, 3 * GiB, 0, T0 + 21);
     mk("m3", 1, 1 * GiB, 0, T0 + 22);
-    auto l4 = db.repo->lease_jobs(lreq(n, 64, 4 * GiB, 0, 10), TTL, T0 + 23);
+    auto l4 = db.repo->lease_jobs(lreq(n, 64, 4 * GiB, 0, 10), TTL, WAIT, T0 + 23);
     BOOST_TEST((ids(l4) == std::set<std::string>{"m1", "m3"}));
     // zero capacity / zero slots -> nothing.
-    BOOST_TEST(db.repo->lease_jobs(lreq(n, 0, 256 * GiB, 0, 10), TTL, T0).empty());
-    BOOST_TEST(db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 0, 0), TTL, T0).empty());
-    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, T0).size() == 1u);  // m2
+    BOOST_TEST(db.repo->lease_jobs(lreq(n, 0, 256 * GiB, 0, 10), TTL, WAIT, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 0, 0), TTL, WAIT, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, WAIT, T0).size() == 1u);  // m2
 }
 
 BOOST_AUTO_TEST_CASE(two_connections_never_double_grant) {
@@ -408,8 +409,8 @@ BOOST_AUTO_TEST_CASE(two_connections_never_double_grant) {
     for (int i = 0; i < 10; ++i) db.job(spec("s" + std::to_string(i)), T0 + i);
     auto other = open_pg_repository(db.conninfo);
     // Sequential, separate connections.
-    auto la = db.repo->lease_jobs(lreq(a, 64, 256 * GiB, 0, 4), TTL, T0);
-    auto lb = other->lease_jobs(lreq(b, 64, 256 * GiB, 0, 100), TTL, T0);
+    auto la = db.repo->lease_jobs(lreq(a, 64, 256 * GiB, 0, 4), TTL, WAIT, T0);
+    auto lb = other->lease_jobs(lreq(b, 64, 256 * GiB, 0, 100), TTL, WAIT, T0);
     BOOST_TEST(la.size() == 4u);
     BOOST_TEST(lb.size() == 6u);
     for (const auto& id : ids(la)) BOOST_TEST(!ids(lb).contains(id));
@@ -422,11 +423,11 @@ BOOST_AUTO_TEST_CASE(two_connections_never_double_grant) {
     PGresult* locked = PQexec(hold, "SELECT job_id FROM jobs WHERE job_id = 'x0' FOR UPDATE");
     BOOST_REQUIRE(PQresultStatus(locked) == PGRES_TUPLES_OK);
     PQclear(locked);
-    auto skip = other->lease_jobs(lreq(b), TTL, T0);  // must not block on x0
+    auto skip = other->lease_jobs(lreq(b), TTL, WAIT, T0);  // must not block on x0
     BOOST_TEST((ids(skip) == std::set<std::string>{"x1", "x2"}));
     PQclear(PQexec(hold, "ROLLBACK"));
     PQfinish(hold);
-    BOOST_TEST((ids(db.repo->lease_jobs(lreq(a), TTL, T0)) == std::set<std::string>{"x0"}));
+    BOOST_TEST((ids(db.repo->lease_jobs(lreq(a), TTL, WAIT, T0)) == std::set<std::string>{"x0"}));
 }
 
 BOOST_AUTO_TEST_CASE(concurrent_lease_threads_disjoint) {
@@ -440,7 +441,7 @@ BOOST_AUTO_TEST_CASE(concurrent_lease_threads_disjoint) {
         try {
             auto repo = open_pg_repository(db.conninfo);
             for (;;) {
-                auto ls = repo->lease_jobs(lreq(node, 64, 256 * GiB, 0, 3), TTL, T0 + 1000);
+                auto ls = repo->lease_jobs(lreq(node, 64, 256 * GiB, 0, 3), TTL, WAIT, T0 + 1000);
                 if (ls.empty()) break;
                 for (auto& l : ls) got[k].push_back(l.job_id());
             }
@@ -538,7 +539,7 @@ BOOST_AUTO_TEST_CASE(retry_rules) {
     auto j2 = fail(db.lease_one(n), true);  // attempt 2 of 2
     BOOST_TEST(j2.state() == tv1::FAILED);
     BOOST_TEST(j2.attempts_used() == 2u);
-    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, T0).empty());
+    BOOST_TEST(db.repo->lease_jobs(lreq(n), TTL, WAIT, T0).empty());
 
     db.job(spec("nr"));
     auto l = db.lease_one(n);
@@ -588,7 +589,7 @@ BOOST_AUTO_TEST_CASE(renew_extends_and_revokes) {
     db.job(spec("a"), T0);
     db.job(spec("b"), T0 + 1);
     db.job(spec("c"), T0 + 2);
-    auto ls = db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 0, 3), TTL, T0);
+    auto ls = db.repo->lease_jobs(lreq(n, 64, 256 * GiB, 0, 3), TTL, WAIT, T0);
     BOOST_REQUIRE_EQUAL(ls.size(), 3u);
     BOOST_REQUIRE(db.repo->update_job("c", n, upd(ls[2], tv1::COMPLETED), T0).result == UpdateResult::kOk);
 

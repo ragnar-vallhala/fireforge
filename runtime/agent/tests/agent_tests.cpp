@@ -88,6 +88,11 @@ public:
     void announce_artifacts(const cv1::ArtifactAnnouncement&, std::function<void(Result<void>)> cb) override {
         unused(cb);
     }
+    void get_artifact(const std::string&, std::function<void(Result<cv1::ArtifactInfo>)> cb) override { unused(cb); }
+    void release_artifact(const std::string&, const cv1::ReleaseRequest&,
+                          std::function<void(Result<cv1::ReleaseReply>)> cb) override {
+        unused(cb);
+    }
     int unused_calls = 0;
 
     template <class T>

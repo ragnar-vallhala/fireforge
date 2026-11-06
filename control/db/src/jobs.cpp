@@ -28,6 +28,15 @@ using pg::transact;
 
 constexpr int kMaxLeaseScan = 200;  // phase4.md §3
 
+// SET fragment for an UPDATE whose new state is $2: entering QUEUED restarts
+// the locality wait (phase5.md §4).
+#define QUEUED_AT(n) " queued_at = CASE WHEN $2 = 'QUEUED' THEN " TS(n) " ELSE queued_at END"
+
+// pg_advisory_xact_lock(kArtifactLockClass, hashtext(artifact_id)) serializes
+// release and pin changes of one artifact (two-key space: no clash with the
+// one-key migration lock).
+constexpr std::int32_t kArtifactLockClass = 0x4646'4152;  // "FFAR"
+
 std::string state_name(tv1::JobState s) { return tv1::JobState_Name(s); }
 
 tv1::JobState parse_job_state(const std::string& s) {
@@ -114,9 +123,9 @@ std::expected<cv1::Job, std::string> JobStore::create_job(const tv1::JobSpec& in
     try {
         return transact(c_, [&] {
             c_.exec("INSERT INTO jobs (job_id, state, spec, campaign_id, cpu_cores, memory_bytes, gpu_count,"
-                    " required_capabilities, input_artifacts, max_attempts, submitted_by, created_at, updated_at)"
+                    " required_capabilities, input_artifacts, max_attempts, submitted_by, created_at, updated_at, queued_at)"
                     " VALUES ($1, 'QUEUED', $2::bytea, $3, $4::bigint, $5::numeric, $6::bigint, $7::jsonb, $8::jsonb,"
-                    " $9::int, $10, " TS(11) ", " TS(11) ")",
+                    " $9::int, $10, " TS(11) ", " TS(11) ", " TS(11) ")",
                     spec.job_id(), detail::to_bytea_hex(raw), campaign, std::max<std::uint32_t>(res.cpu_cores(), 1),
                     res.memory_bytes(), res.gpu_count(), detail::string_array_json(spec.required_capabilities()),
                     detail::string_array_json(spec.input_artifacts()),
@@ -193,16 +202,19 @@ CancelOutcome JobStore::cancel_job(const std::string& job_id, const std::string&
 
 // ---- leases -------------------------------------------------------------------
 
-std::vector<cv1::Lease> JobStore::lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl_ms, std::int64_t now_ms) {
+std::vector<cv1::Lease> JobStore::lease_jobs(const cv1::LeaseRequest& req, std::int64_t ttl_ms,
+                                             std::int64_t locality_wait_ms, std::int64_t now_ms) {
     if (req.max_jobs() == 0 || req.free().cpu_cores() == 0) return {};
     return transact(c_, [&] {
         std::vector<cv1::Lease> out;
         auto n = c_.exec("SELECT health, capabilities::text FROM nodes WHERE node_id = $1", req.node_id());
         if (n.rows() != 1 || n.str(0, 0) != "ONLINE") return out;
 
-        // Eligibility in SQL (phase4.md §3): QUEUED, campaign absent or ACTIVE,
-        // capabilities subset, every input located on this node, and each job
-        // fits the free capacity on its own. Greedy packing happens below.
+        // Eligibility in SQL (phase4.md §3, phase5.md §4): QUEUED, campaign
+        // absent or ACTIVE, capabilities subset, locality (every input on this
+        // node, or queued for at least locality_wait and every input on some
+        // ONLINE node), and each job fits the free capacity on its own. Greedy
+        // packing happens below.
         // Locked candidates that are not granted stay QUEUED; other lease
         // transactions skip them until this one commits.
         auto c = c_.exec(
@@ -212,12 +224,17 @@ std::vector<cv1::Lease> JobStore::lease_jobs(const cv1::LeaseRequest& req, std::
             "   AND (j.campaign_id IS NULL OR c.state = 'ACTIVE')"
             "   AND j.required_capabilities <@ $2::jsonb"
             "   AND j.cpu_cores <= $3::bigint AND j.memory_bytes <= $4::numeric AND j.gpu_count <= $5::bigint"
-            "   AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(j.input_artifacts) a(id)"
-            "     WHERE NOT EXISTS (SELECT 1 FROM artifact_locations l WHERE l.artifact_id = a.id AND l.node_id = $1))"
+            "   AND (NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(j.input_artifacts) a(id)"
+            "          WHERE NOT EXISTS (SELECT 1 FROM artifact_locations l"
+            "                            WHERE l.artifact_id = a.id AND l.node_id = $1))"
+            "     OR (coalesce(j.queued_at, j.created_at) <= " TS(7)
+            "         AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(j.input_artifacts) a(id)"
+            "           WHERE NOT EXISTS (SELECT 1 FROM artifact_locations l JOIN nodes h ON h.node_id = l.node_id"
+            "                             WHERE l.artifact_id = a.id AND h.health = 'ONLINE'))))"
             " ORDER BY j.created_at, j.seq LIMIT $6::int"
             " FOR UPDATE OF j SKIP LOCKED",
             req.node_id(), n.str(0, 1), req.free().cpu_cores(), req.free().memory_bytes(), req.free().gpu_count(),
-            kMaxLeaseScan);
+            kMaxLeaseScan, now_ms - std::max<std::int64_t>(locality_wait_ms, 0));
 
         std::uint64_t cpu = req.free().cpu_cores();
         std::uint64_t mem = req.free().memory_bytes();
@@ -307,8 +324,9 @@ UpdateOutcome JobStore::update_job(const std::string& job_id, const std::string&
                     cur_attempt, state, error, now_ms);
         };
         auto set_job = [&](tv1::JobState to, const std::string& error) {
-            c_.exec("UPDATE jobs SET state = $2, last_error = $3, updated_at = " TS(4) " WHERE job_id = $1", job_id,
-                    state_name(to), error, now_ms);
+            c_.exec("UPDATE jobs SET state = $2, last_error = $3, updated_at = " TS(4) "," QUEUED_AT(4)
+                    " WHERE job_id = $1",
+                    job_id, state_name(to), error, now_ms);
         };
 
         switch (u.state()) {
@@ -408,7 +426,8 @@ std::vector<ExpiredLease> JobStore::expire_leases(std::int64_t now_ms) {
             ExpiredLease e{r.str(i, 0), r.str(i, 1), r.str(i, 2), tv1::FAILED};
             if (r.str(i, 3) == "t") e.new_state = tv1::CANCELLED;
             else if (r.u64(i, 4) < r.u64(i, 5)) e.new_state = tv1::QUEUED;
-            c_.exec("UPDATE jobs SET state = $2, last_error = 'lease expired', updated_at = " TS(3) " WHERE job_id = $1",
+            c_.exec("UPDATE jobs SET state = $2, last_error = 'lease expired', updated_at = " TS(3) "," QUEUED_AT(3)
+                    " WHERE job_id = $1",
                     e.job_id, state_name(e.new_state), now_ms);
             out.push_back(std::move(e));
         }
@@ -465,27 +484,90 @@ bool JobStore::announce_artifacts(const cv1::ArtifactAnnouncement& a, std::int64
     });
 }
 
+std::optional<cv1::ArtifactInfo> JobStore::load_artifact(const std::string& artifact_id) {
+    auto r = c_.exec("SELECT l.artifact_id, l.size::text, l.media_type, l.producer_job, " MS("l.created_at")
+                     ", l.node_id FROM artifact_locations l JOIN nodes n ON n.node_id = l.node_id"
+                     " WHERE l.artifact_id = $1 ORDER BY n.name, l.node_id",
+                     artifact_id);
+    const bool pinned = c_.exec("SELECT 1 FROM artifact_pins WHERE artifact_id = $1", artifact_id).rows() == 1;
+    if (r.rows() == 0 && !pinned) return std::nullopt;
+    cv1::ArtifactInfo info;
+    info.set_pinned(pinned);
+    auto* a = info.mutable_artifact();
+    a->set_artifact_id(artifact_id);
+    if (r.rows() == 0) return info;
+    a->set_size(r.u64(0, 1));
+    a->set_media_type(r.str(0, 2));
+    a->set_created_unix_ms(r.i64(0, 4));
+    for (int i = 0; i < r.rows(); ++i) {
+        if (a->producer_job().empty()) a->set_producer_job(r.str(i, 3));
+        info.add_node_ids(r.str(i, 5));
+    }
+    return info;
+}
+
 std::optional<cv1::ArtifactInfo> JobStore::get_artifact(const std::string& artifact_id) {
-    return c_.retry([&]() -> std::optional<cv1::ArtifactInfo> {
-        auto r = c_.exec("SELECT l.artifact_id, l.size::text, l.media_type, l.producer_job, " MS("l.created_at")
-                         ", l.node_id FROM artifact_locations l JOIN nodes n ON n.node_id = l.node_id"
-                         " WHERE l.artifact_id = $1 ORDER BY n.name, l.node_id",
-                         artifact_id);
-        if (r.rows() == 0) return std::nullopt;
-        cv1::ArtifactInfo info;
-        auto* a = info.mutable_artifact();
-        a->set_artifact_id(r.str(0, 0));
-        a->set_size(r.u64(0, 1));
-        a->set_media_type(r.str(0, 2));
-        a->set_created_unix_ms(r.i64(0, 4));
-        for (int i = 0; i < r.rows(); ++i) {
-            if (a->producer_job().empty()) a->set_producer_job(r.str(i, 3));
-            info.add_node_ids(r.str(i, 5));
+    // Two reads: one (read-only) transaction for a consistent view.
+    return transact(c_, [&] { return load_artifact(artifact_id); });
+}
+
+void JobStore::lock_artifact(const std::string& artifact_id) {
+    c_.exec("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", kArtifactLockClass, artifact_id);
+}
+
+cv1::ReleaseReply JobStore::release_artifact(const std::string& artifact_id, const std::string& node_id, bool force,
+                                             std::int64_t /*now_ms*/) {
+    return transact(c_, [&] {
+        // The advisory lock serializes releases of this artifact, including a
+        // node without a row of its own (nothing to lock FOR UPDATE). Statements
+        // after it see every release committed before it was granted.
+        lock_artifact(artifact_id);
+        c_.exec("SELECT 1 FROM artifact_locations WHERE artifact_id = $1 FOR UPDATE", artifact_id);
+        cv1::ReleaseReply out;
+        auto drop = [&] {
+            c_.exec("DELETE FROM artifact_locations WHERE artifact_id = $1 AND node_id = $2", artifact_id, node_id);
+            out.set_released(true);
+        };
+        if (force) {
+            drop();
+            return out;
         }
+        if (c_.exec("SELECT 1 FROM artifact_pins WHERE artifact_id = $1", artifact_id).rows() == 1) {
+            out.set_reason("pinned");
+            return out;
+        }
+        // Another copy must be reachable soon: held by a node that isn't OFFLINE
+        // (an OFFLINE node may never come back, so its copy doesn't count).
+        if (c_.exec("SELECT 1 FROM artifact_locations l JOIN nodes h ON h.node_id = l.node_id "
+                    "WHERE l.artifact_id = $1 AND l.node_id <> $2 AND h.health <> 'OFFLINE' LIMIT 1",
+                    artifact_id, node_id)
+                .rows() == 0) {
+            out.set_reason("last copy");
+            return out;
+        }
+        drop();
+        return out;
+    });
+}
+
+cv1::ArtifactInfo JobStore::set_artifact_pinned(const std::string& artifact_id, bool pinned, const std::string& actor,
+                                                std::int64_t now_ms) {
+    return transact(c_, [&] {
+        lock_artifact(artifact_id);
+        if (pinned)
+            c_.exec("INSERT INTO artifact_pins (artifact_id, pinned_by, pinned_at) VALUES ($1, $2, " TS(3) ")"
+                    " ON CONFLICT (artifact_id) DO NOTHING",
+                    artifact_id, actor, now_ms);
+        else
+            c_.exec("DELETE FROM artifact_pins WHERE artifact_id = $1", artifact_id);
+        if (auto info = load_artifact(artifact_id)) return *info;
+        cv1::ArtifactInfo info;  // unpinned and held nowhere
+        info.mutable_artifact()->set_artifact_id(artifact_id);
         return info;
     });
 }
 
+#undef QUEUED_AT
 #undef TS
 #undef MS
 

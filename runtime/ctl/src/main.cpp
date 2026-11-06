@@ -4,6 +4,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <optional>
 #include <format>
 #include <iostream>
 #include <map>
@@ -41,6 +44,12 @@ commands:
   peers [--json]                peer directory + live peer links (path, RTT)
   wait JOB_ID [--timeout S]     exit 0 iff the job COMPLETED
 
+  artifact put FILE [--media-type T]   add a file to this node's store; prints its id
+  artifact get ID [--out PATH]         fetch from a peer if missing; copy to PATH
+  artifact ls [--json]                 this node's store (size, last used)
+  artifact rm ID [--force]             drop the local copy (--force: even the last one)
+  artifact gc                          evict now (down to gc_low % of max_disk_mb)
+
   --remote (with submit/status/list/cancel/wait): use the control-plane job
   queue through this node instead of local jobs (Phase 4). The job may run
   on any eligible node.
@@ -70,8 +79,9 @@ public:
 
     // Sends a request; returns the reply frame, or throws with the daemon's error.
     template <class Req>
-    Frame call(v1::MessageType type, const Req& req, v1::MessageType expect) {
-        Frame reply = c_.request(make_frame(type, req, next_message_id()));
+    Frame call(v1::MessageType type, const Req& req, v1::MessageType expect,
+               std::chrono::milliseconds timeout = std::chrono::seconds(30)) {
+        Frame reply = c_.request(make_frame(type, req, next_message_id()), timeout);
         if (reply.type() == v1::ERROR) {
             v1::Error e;
             reply.parse(e);
@@ -254,6 +264,105 @@ int cmd_peers(Client& cl, const std::vector<std::string>& a) {
     return 0;
 }
 
+// ---- artifacts (phase5.md §7) ----
+std::string fmt_bytes(std::uint64_t b) {
+    const double d = static_cast<double>(b);
+    if (b >= 1024ull * 1024 * 1024) return std::format("{:.1f} GiB", d / (1024.0 * 1024 * 1024));
+    if (b >= 1024ull * 1024) return std::format("{:.1f} MiB", d / (1024.0 * 1024));
+    if (b >= 1024) return std::format("{:.1f} KiB", d / 1024.0);
+    return std::format("{} B", b);
+}
+
+int cmd_artifact(Client& cl, std::vector<std::string> a) {
+    if (a.empty()) throw UsageError("artifact needs put|get|ls|rm|gc");
+    auto sub = a[0];
+    a.erase(a.begin());
+    auto flag = [&](const std::string& name) -> std::optional<std::string> {
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (a[i] == name) {
+                if (i + 1 >= a.size()) throw UsageError(name + " needs a value");
+                auto v = a[i + 1];
+                a.erase(a.begin() + i, a.begin() + i + 2);
+                return v;
+            }
+        return std::nullopt;
+    };
+    auto has = [&](const std::string& name) {
+        for (auto it = a.begin(); it != a.end(); ++it)
+            if (*it == name) { a.erase(it); return true; }
+        return false;
+    };
+    if (sub == "put") {
+        v1::ArtifactPutRequest req;
+        if (auto t = flag("--media-type")) req.set_media_type(*t);
+        if (a.size() != 1) throw UsageError("artifact put needs FILE");
+        req.set_path(std::filesystem::absolute(a[0]).string());
+        v1::LocalArtifact art;
+        cl.call(v1::CTL_ARTIFACT_PUT, req, v1::CTL_ARTIFACT_REPLY).parse(art);
+        std::cout << art.ref().artifact_id() << "\n";
+        return 0;
+    }
+    if (sub == "get") {
+        auto out = flag("--out");
+        if (a.size() != 1) throw UsageError("artifact get needs ID");
+        v1::ArtifactGetRequest req;
+        req.set_artifact_id(a[0]);
+        v1::LocalArtifact art;
+        cl.call(v1::CTL_ARTIFACT_GET, req, v1::CTL_ARTIFACT_REPLY, std::chrono::hours(24)).parse(art);
+        if (out) {
+            std::error_code ec;
+            std::filesystem::copy_file(art.local_path(), *out, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) throw std::runtime_error("copy " + art.local_path() + " -> " + *out + ": " + ec.message() +
+                                             " (the file is in the store at " + art.local_path() + ")");
+            std::filesystem::permissions(*out, std::filesystem::perms::owner_write, std::filesystem::perm_options::add, ec);
+        }
+        std::cout << (art.fetched() ? "fetched " : "present ") << art.ref().artifact_id() << " ("
+                  << fmt_bytes(art.ref().size()) << ")\n";
+        std::cout << (out ? *out : art.local_path()) << "\n";
+        return 0;
+    }
+    if (sub == "ls") {
+        bool json = has("--json");
+        v1::LocalArtifactList list;
+        cl.call(v1::CTL_ARTIFACT_LIST, v1::ArtifactListRequest{}, v1::CTL_ARTIFACT_LIST_REPLY).parse(list);
+        if (json) { std::cout << to_json(list); return 0; }
+        std::cout << "store: " << fmt_bytes(list.store_bytes()) << " in " << list.artifacts_size() << " artifacts";
+        if (list.max_bytes()) std::cout << " (cap " << fmt_bytes(list.max_bytes()) << ")";
+        std::cout << "\n";
+        for (const auto& x : list.artifacts()) {
+            std::time_t t = x.last_used_unix_ms() / 1000;
+            char buf[32] = {};
+            std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+            std::cout << std::format("{}  {:>10}  {}  {}\n", x.ref().artifact_id(), fmt_bytes(x.ref().size()), buf,
+                                     x.ref().media_type());
+        }
+        return 0;
+    }
+    if (sub == "rm") {
+        v1::ArtifactRmRequest req;
+        req.set_force(has("--force"));
+        if (a.size() != 1) throw UsageError("artifact rm needs ID");
+        req.set_artifact_id(a[0]);
+        cl.call(v1::CTL_ARTIFACT_RM, req, v1::CTL_ACK);
+        std::cout << "removed " << a[0] << "\n";
+        return 0;
+    }
+    if (sub == "gc") {
+        bool json = has("--json");
+        v1::GcReport rep;
+        cl.call(v1::CTL_ARTIFACT_GC, v1::ArtifactGcRequest{}, v1::CTL_ARTIFACT_GC_REPLY, std::chrono::minutes(10)).parse(rep);
+        if (json) { std::cout << to_json(rep); return 0; }
+        std::cout << "evicted " << rep.evicted_size() << " (" << fmt_bytes(rep.freed_bytes()) << "), store now "
+                  << fmt_bytes(rep.store_bytes());
+        if (rep.max_bytes()) std::cout << " of " << fmt_bytes(rep.max_bytes());
+        std::cout << "; kept " << rep.kept_last_copy() << " last copies, " << rep.kept_pinned() << " pinned, "
+                  << rep.kept_protected() << " in use/recent\n";
+        for (const auto& e : rep.evicted()) std::cout << "  " << e << "\n";
+        return 0;
+    }
+    throw UsageError("unknown artifact command: " + sub);
+}
+
 int cmd_wait(Client& cl, const std::vector<std::string>& a) {
     if (a.empty()) throw UsageError("wait needs JOB_ID");
     std::uint64_t timeout = 0;
@@ -307,6 +416,7 @@ int main(int argc, char** argv) {
         if (cmd == "node") return cmd_node(cl, args);
         if (cmd == "wait") return cmd_wait(cl, args);
         if (cmd == "peers") return cmd_peers(cl, args);
+        if (cmd == "artifact") return cmd_artifact(cl, args);
         throw UsageError("unknown command: " + cmd);
     } catch (const UsageError& e) {
         std::cerr << "tdrctl: " << e.what() << "\n\n" << kUsage;

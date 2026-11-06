@@ -21,6 +21,7 @@
 #include "fireforge/control/v1/control.pb.h"
 #include "tdr/agent/agent.hpp"
 #include "tdr/jobs/jobs.hpp"
+#include "tdr/transfer/fetcher.hpp"
 
 namespace tdr::remote {
 
@@ -90,6 +91,15 @@ public:
 
     // Active leases (for Heartbeat.leases): leased jobs not yet terminal locally.
     std::vector<cv1::LeaseRef> active_leases() const;
+    // Phase 5 (phase5.md §5): fetcher for inputs a lease needs but the store
+    // lacks. nullptr (the default, and until the peer layer is up) -> such
+    // leases fail retryable "artifact transfer unavailable". Not owned.
+    void set_fetcher(transfer::IArtifactFetcher* fetcher);
+    // Queue an incremental announcement (e.g. an artifact fetched or put by tdrctl).
+    void announce(const std::vector<cv1::ArtifactRef>& refs);
+    // Inputs of leases still fetching or not yet submitted locally (GC must keep them).
+    std::vector<std::string> protected_inputs() const;
+
     // Central job id of a local leased job, if it is one.
     std::optional<std::string> central_job_id(const std::string& local_job_id) const;
     RemoteStats stats() const;

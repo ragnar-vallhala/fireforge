@@ -65,10 +65,10 @@ BOOST_AUTO_TEST_SUITE(cpdb)
 
 BOOST_AUTO_TEST_CASE(migrations_idempotent) {
     Db db;
-    BOOST_TEST(schema_version(db.conninfo) == 2);
+    BOOST_TEST(schema_version(db.conninfo) == 3);
     auto again = open_pg_repository(db.conninfo);
-    BOOST_TEST(schema_version(db.conninfo) == 2);
-    BOOST_TEST(psql(db.conninfo, "SELECT count(*) FROM schema_migrations") == "2");
+    BOOST_TEST(schema_version(db.conninfo) == 3);
+    BOOST_TEST(psql(db.conninfo, "SELECT count(*) FROM schema_migrations") == "3");
     auto empty = cluster().create_database("unmigrated");
     BOOST_TEST(schema_version(empty) == 0);
 }
