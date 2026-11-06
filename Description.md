@@ -863,7 +863,7 @@ Security requirements:
 | 8 | Scientific integration | Complete thermoelectric workflow |
 | 9 | Discovery intelligence | Automated candidate discovery |
 
-Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md), [Phase 4](docs/design/phase4.md), [Phase 5](docs/design/phase5.md), [Phase 6](docs/design/phase6.md), [Phase 7](docs/design/phase7.md).
+Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md), [Phase 4](docs/design/phase4.md), [Phase 5](docs/design/phase5.md), [Phase 6](docs/design/phase6.md), [Phase 7](docs/design/phase7.md), [Phase 8](docs/design/phase8.md).
 
 ## First Demonstration
 
@@ -975,3 +975,4 @@ The platform begins by integrating established scientific solvers and validating
 | 0.3 | 2026-11-06 | Artifact retention decided (§21 #13); Phase 4 and 5 designs linked. |
 | 0.4 | 2026-11-06 | Push/pull policy resolved as reserve-and-rank (§14, §21 #3); Phase 6 design linked. |
 | 0.5 | 2026-11-06 | Multi-node MPI described (§11): gang placement with reserve-and-drain, launch agent; Phase 7 design linked. |
+| 0.6 | 2026-11-06 | Phase 8 design linked: thermoelectric workflow (QE, Phonopy/phono3py, BoltzTraP2), materials database, half-Heusler validation. |

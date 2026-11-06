@@ -39,6 +39,7 @@ struct JobRecord {
     // insert_job, an empty `outputs` means "output_artifacts, unnamed".
     std::vector<v1::NamedArtifact> outputs;
     std::vector<v1::StepSpec> spawn;  // Phase 6: WorkerResult.spawn of the committed attempt
+    std::vector<v1::CalcRecord> records;  // Phase 8: WorkerResult.records of the committed attempt
     v1::NamedArtifact checkpoint;     // Phase 6: latest checkpoint (empty artifact_id = none)
     std::int64_t created_unix_ms = 0;
     std::int64_t updated_unix_ms = 0;
@@ -112,13 +113,15 @@ public:
 
     // ---- commit (fencing) --------------------------------------------------
     // Atomically: if job.state == COMMITTING and job.current_attempt_id ==
-    // attempt_id, store the named outputs (in order) and the spawn list, set
+    // attempt_id, store the named outputs (in order), the spawn list and the
+    // calculation records (Phase 8), set
     // state COMPLETED, mark the attempt kSucceeded and return true. Otherwise
     // change nothing, return false. This is the local fencing check that stops
     // a stale attempt from publishing.
     virtual bool commit_outputs(const std::string& job_id, const std::string& attempt_id,
                                 const std::vector<v1::NamedArtifact>& outputs,
-                                const std::vector<v1::StepSpec>& spawn) = 0;
+                                const std::vector<v1::StepSpec>& spawn,
+                                const std::vector<v1::CalcRecord>& records = {}) = 0;
 
     // ---- checkpoints (Phase 6) ---------------------------------------------
     // Replaces the job's latest checkpoint; unknown job = no-op.

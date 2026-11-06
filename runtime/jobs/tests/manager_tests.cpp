@@ -1237,4 +1237,132 @@ BOOST_FIXTURE_TEST_CASE(spawn_persisted_and_survives_restart, Fixture) {
     BOOST_TEST(mgr->list(v1::COMPLETED, 10).at(0).spawn_size() == 2);
 }
 
+// ---- Phase 8: calculation records ----------------------------------------------
+
+namespace {
+v1::CalcRecord calc(const std::string& kind) {
+    v1::CalcRecord c;
+    c.set_kind(kind);
+    c.mutable_structure()->set_reduced_formula("ZrNiSn");
+    c.mutable_structure()->add_lattice(5.9);
+    c.set_properties_json(R"({"energy_ev":-1.5})");
+    return c;
+}
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(records_persisted_and_survive_restart, Fixture) {
+    auto id = submit(spec());
+    write_file(outdir(0) / "relax.json", "{}");
+    v1::WorkerResult r = ok_result(launch(0).attempt_id);
+    auto* o = r.add_outputs();
+    o->set_path("relax.json");
+    o->set_name("relaxed");
+    auto* c = r.add_records();
+    *c = calc("qe.relax");
+    c->add_output_names("relaxed");
+    c->mutable_method()->set_solver("toy");
+    auto* c2 = r.add_records();
+    c2->set_kind("te.evaluate");
+    c2->set_structure_id("st-9");
+    BOOST_REQUIRE(mgr->on_worker_result(r).has_value());
+    sup.exit_code(0, 0);
+    pump();
+    auto st = mgr->status(id);
+    BOOST_TEST(st->state() == v1::COMPLETED);
+    BOOST_REQUIRE_EQUAL(st->records_size(), 2);
+    BOOST_TEST(st->records(0).SerializeAsString() == r.records(0).SerializeAsString());
+    BOOST_TEST(st->records(1).structure_id() == "st-9");
+
+    // Failed attempt: records dropped (and not validated).
+    auto failed = submit(spec());
+    v1::WorkerResult fr;
+    fr.set_attempt_id(launch(1).attempt_id);
+    fr.set_success(false);
+    fr.add_records()->set_kind("");  // would be invalid on success
+    BOOST_REQUIRE(mgr->on_worker_result(fr).has_value());
+    sup.exit_code(1, 0);
+    pump();
+    BOOST_TEST(state(failed) == v1::FAILED);
+    BOOST_TEST(mgr->status(failed)->records_size() == 0);
+
+    make({4, 4 * kGiB, 2});
+    mgr->recover();
+    pump();
+    st = mgr->status(id);
+    BOOST_REQUIRE_EQUAL(st->records_size(), 2);
+    BOOST_TEST(st->records(0).output_names(0) == "relaxed");
+    BOOST_TEST(mgr->list(v1::COMPLETED, 10).at(0).records_size() == 2);
+}
+
+BOOST_FIXTURE_TEST_CASE(invalid_records_fail_non_retryable, Fixture) {
+    struct Case {
+        const char* what;
+        std::function<void(v1::WorkerResult&)> fill;
+        const char* error;
+        int exit_code;
+    };
+    const std::vector<Case> cases = {
+        {"65 records", [](v1::WorkerResult& r) { for (int i = 0; i < 65; ++i) *r.add_records() = calc("k"); },
+         "too many records: 65", 1},
+        {"too big", [](v1::WorkerResult& r) {
+             for (int i = 0; i < 3; ++i) {
+                 auto* c = r.add_records();
+                 *c = calc("k");
+                 c->set_note(std::string(100 * 1024, 'x'));
+             }
+         }, "bytes of record JSON", 0},
+        {"empty kind", [](v1::WorkerResult& r) { *r.add_records() = calc(""); }, "kind is empty", 1},
+        {"no structure", [](v1::WorkerResult& r) {
+             *r.add_records() = calc("ok");
+             r.add_records()->set_kind("bare");
+         }, "record 1 (bare): structure_id or structure required", 1},
+        {"measured", [](v1::WorkerResult& r) {
+             auto* c = r.add_records();
+             *c = calc("lit");
+             c->set_evidence(v1::MEASURED);
+         }, "PREDICTED", 0},
+    };
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        auto id = submit(spec(3));  // attempts left: the failure must still be final
+        v1::WorkerResult r = ok_result(launch(i).attempt_id);
+        cases[i].fill(r);
+        auto res = mgr->on_worker_result(r);
+        BOOST_REQUIRE_MESSAGE(!res.has_value(), cases[i].what);
+        BOOST_TEST(res.error().find(cases[i].error) != std::string::npos, cases[i].what << ": " << res.error());
+        BOOST_TEST(!mgr->on_worker_result(ok_result(launch(i).attempt_id)).has_value());  // no second chance
+        sup.exit_code(i, cases[i].exit_code);
+        pump();
+        BOOST_TEST(state(id) == v1::FAILED, cases[i].what);
+        BOOST_TEST(journal.jobs.at(id).attempts_used == 1u, cases[i].what);
+        BOOST_TEST(journal.jobs.at(id).last_error.find(cases[i].error) != std::string::npos, cases[i].what);
+        BOOST_TEST(mgr->status(id)->records_size() == 0);
+    }
+    // At the limits: accepted.
+    auto id = submit(spec());
+    v1::WorkerResult r = ok_result(launch(cases.size()).attempt_id);
+    for (int i = 0; i < 64; ++i) *r.add_records() = calc("k");
+    BOOST_REQUIRE(mgr->on_worker_result(r).has_value());
+    sup.exit_code(cases.size(), 0);
+    pump();
+    BOOST_TEST(state(id) == v1::COMPLETED);
+    BOOST_TEST(mgr->status(id)->records_size() == 64);
+}
+
+BOOST_FIXTURE_TEST_CASE(record_with_unknown_output_name_fails, Fixture) {
+    auto id = submit(spec(3));
+    write_file(outdir(0) / "a.txt", "a");
+    v1::WorkerResult r = ok_result(launch(0).attempt_id);
+    r.add_outputs()->set_path("a.txt");
+    auto* c = r.add_records();
+    *c = calc("qe.scf");
+    c->add_output_names("a.txt");
+    c->add_output_names("missing");
+    BOOST_REQUIRE(mgr->on_worker_result(r).has_value());
+    sup.exit_code(0, 0);
+    pump();
+    BOOST_TEST(state(id) == v1::FAILED);
+    BOOST_TEST(journal.jobs.at(id).attempts_used == 1u);
+    BOOST_TEST(journal.jobs.at(id).last_error.find("unknown output name 'missing'") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

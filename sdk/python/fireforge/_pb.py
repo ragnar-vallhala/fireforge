@@ -1,7 +1,7 @@
 """Import the generated protobuf modules with a helpful error if they are missing."""
 
 try:
-    from fireforge.tdr.v1 import envelope_pb2, local_pb2  # noqa: F401
+    from fireforge.tdr.v1 import envelope_pb2, local_pb2, record_pb2  # noqa: F401
 except ImportError as exc:  # pragma: no cover - depends on the checkout state
     raise ImportError(
         "fireforge: generated protobuf modules (fireforge/tdr/v1/*_pb2.py) are "

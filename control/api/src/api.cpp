@@ -176,6 +176,12 @@ struct ControlApi::Impl {
         add("GET", "/api/v1/workflows", &Impl::list_workflows);
         add("GET", "/api/v1/workflows/{id}", &Impl::get_workflow);
         add("POST", "/api/v1/workflows/{id}/cancel", &Impl::cancel_workflow);
+        add("GET", "/api/v1/materials", &Impl::list_materials);
+        add("GET", "/api/v1/materials/{id}", &Impl::get_material);
+        add("GET", "/api/v1/structures/{id}", &Impl::get_structure);
+        add("GET", "/api/v1/calculations", &Impl::list_calculations);
+        add("GET", "/api/v1/calculations/{id}", &Impl::get_calculation);
+        add("POST", "/api/v1/calculations:import", &Impl::import_calculations);
         add("GET", "/api/v1/audit", &Impl::audit);
         repo.set_workflow_limits(options.workflow_limits);
         repo.set_gang_options(options.gangs);
@@ -706,6 +712,77 @@ struct ControlApi::Impl {
         repo.audit(actor, "workflow.cancel", id, to_json(req), now);
         log_info("{} cancelled workflow {} (now {})", actor, id, w->state());
         return reply(*w);
+    }
+
+    // ---- materials database (phase8.md §2) ----------------------------------------
+
+    static std::string query(const Request& r, const char* key) {
+        auto it = r.query.find(key);
+        return it == r.query.end() ? std::string() : it->second;
+    }
+
+    Response list_materials(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        auto limit = parse_limit(r, 100, 1000);
+        if (!limit) return limit.error();
+        cv1::MaterialList out;
+        for (auto& m : repo.list_materials(query(r, "formula"), query(r, "element"), query(r, "campaign_id"), *limit))
+            *out.add_materials() = std::move(m);
+        return reply(out);
+    }
+
+    Response get_material(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        auto m = repo.get_material(r.params["id"]);
+        if (!m) return error_response(404, "not_found", "unknown material " + r.params["id"]);
+        return reply(*m);
+    }
+
+    Response get_structure(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        auto s = repo.get_structure(r.params["id"]);
+        if (!s) return error_response(404, "not_found", "unknown structure " + r.params["id"]);
+        return reply(*s);
+    }
+
+    Response list_calculations(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        cpdb::IRepository::CalcQuery q;
+        q.material_id = query(r, "material_id");
+        q.structure_id = query(r, "structure_id");
+        q.kind = query(r, "kind");
+        q.campaign_id = query(r, "campaign_id");
+        q.workflow_id = query(r, "workflow_id");
+        q.after = query(r, "after");
+        if (auto ev = query(r, "evidence"); !ev.empty()) {
+            tv1::Evidence e{};
+            if (!tv1::Evidence_Parse(upper(ev), &e))
+                return error_response(400, "bad_request", "evidence must be PREDICTED, LITERATURE or MEASURED");
+            q.evidence = e;
+        }
+        auto limit = parse_limit(r, 100, 1000);
+        if (!limit) return limit.error();
+        q.limit = *limit;
+        return reply(repo.list_calculations(q));
+    }
+
+    Response get_calculation(Request& r) {
+        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        auto c = repo.get_calculation(r.params["id"]);
+        if (!c) return error_response(404, "not_found", "unknown calculation " + r.params["id"]);
+        return reply(*c);
+    }
+
+    Response import_calculations(Request& r) {
+        if (auto e = check_role(r, kAdmin)) return *e;
+        cv1::ImportCalculationsRequest req;
+        if (auto e = parse_body(r, req)) return *e;
+        const auto actor = actor_of(*r.peer);
+        auto out = repo.import_calculations(req, actor, clock());  // audited by the repository (same transaction)
+        if (!out) return error_response(400, "bad_request", out.error());
+        log_info("{} imported {} calculation(s){}{}", actor, out->calc_ids_size(),
+                 req.campaign_id().empty() ? "" : " into campaign ", req.campaign_id());
+        return reply(*out);
     }
 
     // ---- audit ----------------------------------------------------------------

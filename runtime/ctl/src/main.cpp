@@ -1,6 +1,7 @@
 // tdrctl — command-line client for tdrd's control socket.
 // Usage: see docs/design/phase1.md §7 or `tdrctl --help`.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -131,6 +132,21 @@ void print_status(const v1::JobStatus& s) {
     if (!s.remote_job_id().empty()) std::cout << "remote:    leased from control-plane job " << s.remote_job_id() << "\n";
     if (!s.last_error().empty()) std::cout << "error:     " << s.last_error() << "\n";
     for (const auto& a : s.output_artifacts()) std::cout << "output:    " << a << "\n";
+    if (s.records_size() > 0) {
+        // Phase 8: "records:   3 (qe.relax, phonon.slack x2)" — kinds in first-seen order.
+        std::vector<std::pair<std::string, int>> kinds;
+        for (const auto& r : s.records()) {
+            auto it = std::find_if(kinds.begin(), kinds.end(), [&](const auto& k) { return k.first == r.kind(); });
+            if (it == kinds.end()) kinds.emplace_back(r.kind(), 1);
+            else ++it->second;
+        }
+        std::cout << "records:   " << s.records_size() << " (";
+        for (std::size_t i = 0; i < kinds.size(); ++i) {
+            std::cout << (i ? ", " : "") << kinds[i].first;
+            if (kinds[i].second > 1) std::cout << " x" << kinds[i].second;
+        }
+        std::cout << ")\n";
+    }
 }
 
 int cmd_submit(Client& cl, std::vector<std::string> a) {

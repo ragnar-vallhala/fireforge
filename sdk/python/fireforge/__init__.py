@@ -1,4 +1,5 @@
-"""FireForge Python worker SDK (local TDR worker protocol; Phase 6 workflows; Phase 7 MPI)."""
+"""FireForge Python worker SDK (local TDR worker protocol; Phase 6 workflows; Phase 7 MPI;
+Phase 8 calculation records)."""
 
 from . import mpi
 from ._version import __version__
@@ -8,6 +9,8 @@ from .worker import (
     Context,
     InputRef,
     JobResult,
+    MAX_RECORDS,
+    MAX_RECORDS_JSON_BYTES,
     OutputRef,
     StructureFile,
     Worker,
@@ -21,6 +24,8 @@ __all__ = [
     "Context",
     "InputRef",
     "JobResult",
+    "MAX_RECORDS",
+    "MAX_RECORDS_JSON_BYTES",
     "OutputRef",
     "StepInput",
     "StructureFile",

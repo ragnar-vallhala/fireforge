@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "fireforge/control/v1/control.pb.h"
+#include "fireforge/control/v1/materials.pb.h"
 #include "fireforge/tdr/v1/job.pb.h"
 
 namespace tdr::cpdb {
@@ -169,7 +170,9 @@ public:
     // the job is not LEASED/RUNNING. Transitions:
     //   RUNNING            LEASED -> RUNNING (or progress update while RUNNING)
     //   COMPLETED          -> COMPLETED; attempt SUCCEEDED; outputs stored and
-    //                         artifact_locations recorded for node_id
+    //                         artifact_locations recorded for node_id; Phase 8:
+    //                         update.records stored as calculations in the same
+    //                         transaction (see store rules below set_gang_options)
     //   FAILED             attempt FAILED; retryable && attempts_used < max_attempts
     //                         && !cancel_requested -> QUEUED (via RETRY_PENDING), else FAILED
     //   CANCELLED          attempt CANCELLED; job CANCELLED
@@ -270,6 +273,38 @@ public:
     // current, or of a cancel_requested job, is revoked.
     // Job / JobAttempt protos fill gang / members / pending_reason.
     virtual void set_gang_options(const GangOptions& options) = 0;
+
+    // ---- materials database (docs/design/phase8.md §2-§3) ---------------------------
+    //
+    // Records from update_job(COMPLETED) and import_calculations are stored as
+    // calculations. Per record: the structure is structure_id (must exist) or the
+    // inline Structure, deduplicated by fingerprint (required, "fp1:" prefix; a new
+    // fingerprint inserts a structure, creating the material for its
+    // reduced_formula if needed; elements derived from the sites). kind non-empty
+    // (<= 64 chars); properties/conditions/convergence/uncertainty/settings JSON must
+    // parse as objects (empty = {}). output_names must name outputs of this update
+    // (resolved to artifact ids); job/attempt/workflow/step/campaign/node come from
+    // the job. Worker records must be PREDICTED. Limits: <= 64 records and <= 256 KiB
+    // of record JSON per update. Any violation makes update_job return kInvalid with
+    // the reason and store nothing (the API answers 400; the node fails the job, not
+    // retryable). A fenced-out (stale) update stores nothing.
+    virtual std::vector<cv1::Material> list_materials(const std::string& formula, const std::string& element,
+                                                      const std::string& campaign_id, std::size_t limit) = 0;
+    // With structures and the newest calculation per kind.
+    virtual std::optional<cv1::Material> get_material(const std::string& material_id) = 0;
+    virtual std::optional<cv1::StructureInfo> get_structure(const std::string& structure_id) = 0;
+    struct CalcQuery {
+        std::string material_id, structure_id, kind, campaign_id, workflow_id;
+        std::optional<tv1::Evidence> evidence;
+        std::size_t limit = 100;   // capped at 1000
+        std::string after;         // calc_id cursor from CalculationList.next; newest first
+    };
+    virtual cv1::CalculationList list_calculations(const CalcQuery& q) = 0;
+    virtual std::optional<cv1::Calculation> get_calculation(const std::string& calc_id) = 0;
+    // Admin import: evidence must be LITERATURE or MEASURED; output_names not allowed;
+    // same validation and limits as worker records. All or nothing.
+    virtual std::expected<cv1::ImportCalculationsReply, std::string> import_calculations(
+        const cv1::ImportCalculationsRequest& req, const std::string& actor, std::int64_t now_ms) = 0;
 
     virtual void audit(const std::string& actor, const std::string& action, const std::string& target,
                        const std::string& details_json, std::int64_t now_ms) = 0;

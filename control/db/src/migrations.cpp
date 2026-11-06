@@ -12,7 +12,7 @@ namespace {
 // Arbitrary constant: pg_advisory_xact_lock key for "fireforge schema".
 constexpr std::int64_t kMigrationLock = 0x4646'5343'4845'4d41;  // "FFSCHEMA"
 
-constexpr std::array<std::string_view, 5> kMigrations = {
+constexpr std::array<std::string_view, 6> kMigrations = {
     // 1: initial control-plane schema
     R"sql(
 CREATE TABLE nodes (
@@ -267,6 +267,61 @@ CREATE TABLE job_attempt_members (
 );
 CREATE INDEX job_attempt_members_live_idx ON job_attempt_members (expires_at) WHERE state IN ('LEASED', 'RUNNING');
 CREATE INDEX job_attempt_members_undelivered_idx ON job_attempt_members (node_id) WHERE NOT delivered;
+)sql",
+    // 6: materials database (docs/design/phase8.md §2-§3)
+    R"sql(
+CREATE TABLE materials (
+    material_id     text PRIMARY KEY,
+    reduced_formula text NOT NULL UNIQUE,
+    elements        text[] NOT NULL DEFAULT '{}',              -- sorted, unique
+    nsites_min      int NOT NULL DEFAULT 0 CHECK (nsites_min >= 0),
+    created_at      timestamptz NOT NULL
+);
+CREATE INDEX materials_elements_idx ON materials USING gin (elements);
+
+CREATE TABLE structures (
+    seq                 bigserial NOT NULL UNIQUE,
+    structure_id        text PRIMARY KEY,
+    material_id         text NOT NULL REFERENCES materials (material_id),
+    fingerprint         text NOT NULL UNIQUE,                  -- "fp1:..." (phase8.md §3)
+    structure           jsonb NOT NULL,                        -- tdr.v1.Structure (proto3 JSON)
+    spacegroup_number   int NOT NULL DEFAULT 0,
+    prototype           text NOT NULL DEFAULT '',
+    source_job_id       text,
+    parent_structure_id text,
+    created_at          timestamptz NOT NULL
+);
+CREATE INDEX structures_material_idx ON structures (material_id, seq);
+
+CREATE TABLE calculations (
+    seq              bigserial NOT NULL UNIQUE,                -- newest-first order and paging
+    calc_id          text PRIMARY KEY,
+    structure_id     text NOT NULL REFERENCES structures (structure_id),
+    material_id      text NOT NULL REFERENCES materials (material_id),
+    kind             text NOT NULL,
+    properties       jsonb NOT NULL DEFAULT '{}',
+    conditions       jsonb NOT NULL DEFAULT '{}',
+    method           jsonb NOT NULL DEFAULT '{}',              -- tdr.v1.Method (proto3 JSON)
+    convergence      jsonb NOT NULL DEFAULT '{}',
+    uncertainty      jsonb NOT NULL DEFAULT '{}',
+    evidence         text NOT NULL CHECK (evidence IN ('PREDICTED', 'LITERATURE', 'MEASURED')),
+    output_artifacts jsonb NOT NULL DEFAULT '{}',              -- output name -> artifact id
+    input_artifacts  text[] NOT NULL DEFAULT '{}',
+    job_id           text REFERENCES jobs (job_id),            -- NULL for imports
+    attempt_id       text,
+    workflow_id      text,
+    step             text COLLATE "C",
+    campaign_id      text REFERENCES campaigns (campaign_id),
+    node_id          text,
+    note             text NOT NULL DEFAULT '',
+    created_at       timestamptz NOT NULL
+);
+CREATE INDEX calculations_material_kind_idx ON calculations (material_id, kind, seq DESC);
+CREATE INDEX calculations_campaign_kind_idx ON calculations (campaign_id, kind, seq DESC);
+CREATE INDEX calculations_workflow_idx ON calculations (workflow_id, seq DESC);
+CREATE INDEX calculations_structure_idx ON calculations (structure_id, seq DESC);
+CREATE INDEX calculations_job_idx ON calculations (job_id);
+CREATE INDEX calculations_properties_idx ON calculations USING gin (properties);
 )sql",
 };
 

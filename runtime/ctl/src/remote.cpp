@@ -4,6 +4,7 @@
 #include "remote.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <sstream>
@@ -22,6 +23,7 @@
 #include <google/protobuf/util/json_util.h>
 
 #include "fireforge/control/v1/control.pb.h"
+#include "fireforge/control/v1/materials.pb.h"
 #include "fireforge/tdr/v1/job.pb.h"
 #include "tdr/http/http.hpp"
 #include "tdr/tls/tls.hpp"
@@ -199,6 +201,12 @@ constexpr const char* kCpUsage = R"(usage: tdrctl cp [--url URL] [--ca F] [--cer
   workflow-wait ID [--timeout S]                   exit 0 iff the workflow SUCCEEDED
   artifact ID                                      which nodes hold an artifact (+ pinned)
   artifact-pin ID | artifact-unpin ID              pinned artifacts are never evicted (Phase 5)
+  materials [--formula F] [--element E] [--campaign ID] [--limit N]     materials database (Phase 8)
+  material ID                                      structures + latest calculation per kind
+  calcs [--material ID] [--structure ID] [--kind K] [--campaign ID] [--workflow ID]
+        [--evidence PREDICTED|LITERATURE|MEASURED] [--limit N] [--after CALC_ID]   newest first
+  calc ID                                          one calculation in full
+  calc-import FILE                                 ImportCalculationsRequest JSON ("-" = stdin; admin)
 
 connection: --url/--ca/--cert/--key, else $TDR_CP_URL, $TDR_CP_CA, $TDR_CP_CERT, $TDR_CP_KEY
             (an admin certificate: tdrctl pki issue DIR --role admin NAME)
@@ -385,6 +393,106 @@ void print_job(const cv1::Job& j) {
                                  fmt_time(at.leased_unix_ms()), at.error().empty() ? "" : " — " + at.error());
 }
 
+// ---- materials database (Phase 8) ----------------------------------------------------
+
+std::string url_encode(const std::string& s) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += static_cast<char>(c);
+        else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0xf];
+        }
+    }
+    return out;
+}
+
+std::string clip(std::string s, std::size_t n) {
+    if (s.size() > n) s = s.substr(0, n - 3) + "...";
+    return s;
+}
+
+std::string evidence_name(::fireforge::tdr::v1::Evidence e) { return ::fireforge::tdr::v1::Evidence_Name(e); }
+
+void print_materials(const cv1::MaterialList& l) {
+    std::cout << std::format("{:<22} {:<20} {:<20} {:>10} {:>6} {:<20}\n", "MATERIAL_ID", "FORMULA", "ELEMENTS",
+                             "STRUCTURES", "CALCS", "CREATED");
+    for (const auto& m : l.materials()) {
+        std::string el;
+        for (const auto& e : m.elements()) el += (el.empty() ? "" : ",") + e;
+        std::cout << std::format("{:<22} {:<20} {:<20} {:>10} {:>6} {:<20}\n", m.material_id(), m.reduced_formula(), el,
+                                 m.structure_count(), m.calculation_count(), fmt_time(m.created_unix_ms()));
+    }
+}
+
+void print_calcs(const cv1::CalculationList& l) {
+    std::cout << std::format("{:<22} {:<14} {:<18} {:<10} {:<22} {:<20} {}\n", "CALC_ID", "FORMULA", "KIND", "EVIDENCE",
+                             "JOB", "CREATED", "PROPERTIES");
+    for (const auto& c : l.calculations())
+        std::cout << std::format("{:<22} {:<14} {:<18} {:<10} {:<22} {:<20} {}\n", c.calc_id(), c.reduced_formula(),
+                                 c.kind(), evidence_name(c.evidence()), c.job_id().empty() ? "-" : c.job_id(),
+                                 fmt_time(c.created_unix_ms()), clip(c.properties_json(), 60));
+    if (!l.next().empty()) std::cout << "more: --after " << l.next() << "\n";
+}
+
+void print_calc(const cv1::Calculation& c) {
+    const auto& m = c.method();
+    std::cout << "calculation: " << c.calc_id() << "\n"
+              << "kind:        " << c.kind() << "\n"
+              << "evidence:    " << evidence_name(c.evidence()) << "\n"
+              << "material:    " << c.material_id() << " (" << c.reduced_formula() << ")\n"
+              << "structure:   " << c.structure_id() << "\n"
+              << "created:     " << fmt_time(c.created_unix_ms()) << "\n";
+    if (!c.job_id().empty())
+        std::cout << "job:         " << c.job_id() << " attempt " << c.attempt_id() << " on " << c.node_id() << "\n";
+    if (!c.workflow_id().empty()) std::cout << "workflow:    " << c.workflow_id() << " step " << c.step() << "\n";
+    if (!c.campaign_id().empty()) std::cout << "campaign:    " << c.campaign_id() << "\n";
+    std::cout << "properties:  " << c.properties_json() << "\n"
+              << "conditions:  " << c.conditions_json() << "\n";
+    if (!m.solver().empty() || !m.engine().empty()) {
+        std::cout << "method:      " << m.solver() << (m.solver_version().empty() ? "" : " " + m.solver_version())
+                  << (m.engine().empty() ? "" : " engine=" + m.engine())
+                  << (m.functional().empty() ? "" : " functional=" + m.functional())
+                  << (m.preset().empty() ? "" : " preset=" + m.preset()) << "\n";
+        if (!m.settings_json().empty()) std::cout << "settings:    " << m.settings_json() << "\n";
+        for (const auto& pp : m.pseudopotentials()) std::cout << "pseudo:      " << pp << "\n";
+    }
+    if (c.convergence_json() != "{}") std::cout << "convergence: " << c.convergence_json() << "\n";
+    if (c.uncertainty_json() != "{}") std::cout << "uncertainty: " << c.uncertainty_json() << "\n";
+    for (const auto& o : c.outputs()) std::cout << "output:      " << o.name() << " = " << o.artifact_id() << "\n";
+    for (const auto& i : c.input_artifacts()) std::cout << "input:       " << i << "\n";
+    if (!c.note().empty()) std::cout << "note:        " << c.note() << "\n";
+}
+
+void print_material(const cv1::Material& m) {
+    std::string el;
+    for (const auto& e : m.elements()) el += (el.empty() ? "" : ",") + e;
+    std::cout << "material:   " << m.material_id() << " (" << m.reduced_formula() << ")\n"
+              << "elements:   " << el << "\n"
+              << "created:    " << fmt_time(m.created_unix_ms()) << "\n"
+              << "counts:     " << m.structure_count() << " structures, " << m.calculation_count() << " calculations\n";
+    if (m.structures_size() > 0) {
+        std::cout << std::format("\n{:<22} {:>5} {:<14} {:<6} {:<26} {}\n", "STRUCTURE", "SG", "PROTOTYPE", "SITES",
+                                 "SOURCE_JOB", "FINGERPRINT");
+        for (const auto& s : m.structures())
+            std::cout << std::format("{:<22} {:>5} {:<14} {:<6} {:<26} {}\n", s.structure_id(),
+                                     s.structure().spacegroup_number(),
+                                     s.structure().prototype().empty() ? "-" : s.structure().prototype(),
+                                     s.structure().sites_size(), s.source_job_id().empty() ? "-" : s.source_job_id(),
+                                     clip(s.structure().fingerprint(), 24));
+    }
+    if (m.latest_size() > 0) {
+        std::cout << std::format("\n{:<18} {:<22} {:<10} {:<20} {}\n", "KIND", "LATEST_CALC", "EVIDENCE", "CREATED",
+                                 "PROPERTIES");
+        for (const auto& c : m.latest())
+            std::cout << std::format("{:<18} {:<22} {:<10} {:<20} {}\n", c.kind(), c.calc_id(),
+                                     evidence_name(c.evidence()), fmt_time(c.created_unix_ms()),
+                                     clip(c.properties_json(), 80));
+    }
+}
+
 cv1::CampaignState parse_campaign_state(const std::string& s) {
     cv1::CampaignState st{};
     if (!cv1::CampaignState_Parse(s, &st) || st == cv1::CAMPAIGN_STATE_UNSPECIFIED)
@@ -403,7 +511,8 @@ int cp(const std::vector<std::string>& all_args) {
                         "--disk-mb", "--gpus", "--reason", "--limit", "--state", "--domain", "--description",
                         "--params", "--campaign", "--timeout", "--attempts", "--operation", "--input", "--env",
                         "--ranks", "--max-ranks-per-node", "--mpirun-arg",
-                        "--material", "--capability"});
+                        "--material", "--capability", "--formula", "--element", "--structure", "--kind",
+                        "--workflow", "--evidence", "--after"});
     if (a.positional.empty()) throw UsageError(std::string("cp needs a command\n") + kCpUsage);
     const std::string cmd = a.positional[0];
     auto need_arg = [&](const char* what) -> const std::string& {
@@ -628,6 +737,62 @@ int cp(const std::vector<std::string>& all_args) {
             if (!info.artifact().media_type().empty()) std::cout << "media type: " << info.artifact().media_type() << "\n";
             std::cout << "pinned:     " << (info.pinned() ? "yes" : "no") << "\n";
             for (const auto& n : info.node_ids()) std::cout << "on node:    " << n << "\n";
+        });
+    }
+    if (cmd == "materials" || cmd == "calcs") {
+        std::string t = cmd == "materials" ? "/api/v1/materials" : "/api/v1/calculations";
+        std::string sep = "?";
+        auto add = [&](const char* flag, const char* key) {
+            if (auto v = a.get(flag)) {
+                t += sep + key + "=" + url_encode(*v);
+                sep = "&";
+            }
+        };
+        if (cmd == "materials") {
+            add("--formula", "formula");
+            add("--element", "element");
+            add("--campaign", "campaign_id");
+        } else {
+            add("--material", "material_id");
+            add("--structure", "structure_id");
+            add("--kind", "kind");
+            add("--campaign", "campaign_id");
+            add("--workflow", "workflow_id");
+            add("--evidence", "evidence");
+            add("--after", "after");
+        }
+        if (auto l = a.get("--limit")) t += sep + "limit=" + std::to_string(to_u64("--limit", *l));
+        if (cmd == "materials") {
+            auto l = c.get<cv1::MaterialList>("GET", t);
+            return out(l, [&] { print_materials(l); });
+        }
+        auto l = c.get<cv1::CalculationList>("GET", t);
+        return out(l, [&] { print_calcs(l); });
+    }
+    if (cmd == "material") {
+        auto m = c.get<cv1::Material>("GET", "/api/v1/materials/" + url_encode(need_arg("ID")));
+        return out(m, [&] { print_material(m); });
+    }
+    if (cmd == "calc") {
+        auto calc = c.get<cv1::Calculation>("GET", "/api/v1/calculations/" + url_encode(need_arg("ID")));
+        return out(calc, [&] { print_calc(calc); });
+    }
+    if (cmd == "calc-import") {
+        auto file = need_arg("FILE");
+        std::stringstream body;
+        if (file == "-") body << std::cin.rdbuf();
+        else {
+            std::ifstream f(file);
+            if (!f) throw std::runtime_error("cannot read " + file);
+            body << f.rdbuf();
+        }
+        cv1::ImportCalculationsRequest req;
+        google::protobuf::util::JsonParseOptions po;
+        if (auto st = google::protobuf::util::JsonStringToMessage(body.str(), &req, po); !st.ok())
+            throw UsageError(file + ": not an ImportCalculationsRequest: " + std::string(st.message()));
+        auto rep = c.get<cv1::ImportCalculationsReply>("POST", "/api/v1/calculations:import", to_json(req, false));
+        return out(rep, [&] {
+            for (const auto& id : rep.calc_ids()) std::cout << id << "\n";
         });
     }
     throw UsageError("unknown cp command: " + cmd + "\n" + kCpUsage);

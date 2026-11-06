@@ -91,6 +91,7 @@ v1::JobStatus to_status(const journal::JobRecord& rec) {
     for (const auto& o : rec.outputs) *st.add_outputs() = o;
     if (!rec.checkpoint.artifact_id().empty()) *st.mutable_checkpoint() = rec.checkpoint;
     for (const auto& s : rec.spawn) *st.add_spawn() = s;
+    for (const auto& r : rec.records) *st.add_records() = r;
     return st;
 }
 

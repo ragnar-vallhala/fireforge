@@ -6,6 +6,7 @@
 #include <format>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -573,6 +574,83 @@ public:
         last_placement = o;
         ++place_calls;
         return reservations;
+    }
+
+    // Phase 8: seeded by tests; reads return them, imports append (minimal checks only).
+    std::map<std::string, cv1::Material> materials;
+    std::map<std::string, cv1::StructureInfo> structures;
+    std::vector<cv1::Calculation> calculations;  // oldest first
+    std::string last_formula, last_element, last_material_campaign;
+    std::size_t last_material_limit = 0;
+    std::optional<CalcQuery> last_calc_query;
+    std::vector<cv1::ImportCalculationsRequest> imports;
+
+    std::vector<cv1::Material> list_materials(const std::string& formula, const std::string& element,
+                                              const std::string& campaign_id, std::size_t limit) override {
+        maybe_fail();
+        last_formula = formula;
+        last_element = element;
+        last_material_campaign = campaign_id;
+        last_material_limit = limit;
+        std::vector<cv1::Material> out;
+        for (const auto& [_, m] : materials) {
+            if (!formula.empty() && m.reduced_formula() != formula) continue;
+            if (!element.empty() && std::find(m.elements().begin(), m.elements().end(), element) == m.elements().end())
+                continue;
+            if (out.size() < limit) out.push_back(m);
+        }
+        return out;
+    }
+    std::optional<cv1::Material> get_material(const std::string& id) override {
+        maybe_fail();
+        auto it = materials.find(id);
+        if (it == materials.end()) return std::nullopt;
+        return it->second;
+    }
+    std::optional<cv1::StructureInfo> get_structure(const std::string& id) override {
+        maybe_fail();
+        auto it = structures.find(id);
+        if (it == structures.end()) return std::nullopt;
+        return it->second;
+    }
+    cv1::CalculationList list_calculations(const CalcQuery& q) override {
+        maybe_fail();
+        last_calc_query = q;
+        cv1::CalculationList out;
+        for (auto it = calculations.rbegin(); it != calculations.rend(); ++it) {
+            if (!q.kind.empty() && it->kind() != q.kind) continue;
+            if (q.evidence && it->evidence() != *q.evidence) continue;
+            if (static_cast<std::size_t>(out.calculations_size()) < q.limit) *out.add_calculations() = *it;
+        }
+        return out;
+    }
+    std::optional<cv1::Calculation> get_calculation(const std::string& id) override {
+        maybe_fail();
+        for (const auto& c : calculations)
+            if (c.calc_id() == id) return c;
+        return std::nullopt;
+    }
+    std::expected<cv1::ImportCalculationsReply, std::string> import_calculations(
+        const cv1::ImportCalculationsRequest& req, const std::string& actor, std::int64_t now) override {
+        maybe_fail();
+        if (req.records().empty()) return std::unexpected("records must not be empty");
+        for (const auto& r : req.records())
+            if (r.evidence() != tv1::LITERATURE && r.evidence() != tv1::MEASURED)
+                return std::unexpected("imported records must have evidence LITERATURE or MEASURED");
+        imports.push_back(req);
+        cv1::ImportCalculationsReply out;
+        for (const auto& r : req.records()) {
+            cv1::Calculation c;
+            c.set_calc_id(std::format("calc-{}", calculations.size() + 1));
+            c.set_kind(r.kind());
+            c.set_evidence(r.evidence());
+            c.set_campaign_id(req.campaign_id());
+            c.set_created_unix_ms(now);
+            calculations.push_back(c);
+            out.add_calc_ids(c.calc_id());
+        }
+        audit_rows.push_back({actor, "calculations.import", req.campaign_id(), "{}", now});
+        return out;
     }
 
     std::map<std::string, std::string> pins;  // artifact_id -> pinned_by

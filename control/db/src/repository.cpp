@@ -3,6 +3,7 @@
 #include <string>
 
 #include "jobs.hpp"
+#include "materials.hpp"
 #include "workflows.hpp"
 #include "pg.hpp"
 #include "util.hpp"
@@ -129,8 +130,9 @@ cv1::Campaign campaign_from(const Result& r, int row) {
 
 class PgRepository final : public IRepository {
 public:
-    explicit PgRepository(const std::string& conninfo) : c_(conninfo), jobs_(c_), wf_(c_, jobs_) {
+    explicit PgRepository(const std::string& conninfo) : c_(conninfo), jobs_(c_), wf_(c_, jobs_), mat_(c_) {
         jobs_.set_workflows(&wf_);
+        jobs_.set_materials(&mat_);
         pg::migrate(c_);
     }
 
@@ -411,6 +413,27 @@ public:
         return jobs_.place_jobs(options, now_ms);
     }
 
+    // ---- materials database (materials.cpp) -------------------------------------------
+
+    std::vector<cv1::Material> list_materials(const std::string& formula, const std::string& element,
+                                              const std::string& campaign_id, std::size_t limit) override {
+        return mat_.list_materials(formula, element, campaign_id, limit);
+    }
+    std::optional<cv1::Material> get_material(const std::string& material_id) override {
+        return mat_.get_material(material_id);
+    }
+    std::optional<cv1::StructureInfo> get_structure(const std::string& structure_id) override {
+        return mat_.get_structure(structure_id);
+    }
+    cv1::CalculationList list_calculations(const CalcQuery& q) override { return mat_.list_calculations(q); }
+    std::optional<cv1::Calculation> get_calculation(const std::string& calc_id) override {
+        return mat_.get_calculation(calc_id);
+    }
+    std::expected<cv1::ImportCalculationsReply, std::string> import_calculations(
+        const cv1::ImportCalculationsRequest& req, const std::string& actor, std::int64_t now_ms) override {
+        return mat_.import_calculations(req, actor, now_ms);
+    }
+
     void audit(const std::string& actor, const std::string& action, const std::string& target,
                const std::string& details_json, std::int64_t now_ms) override {
         transact(c_, [&] {
@@ -456,6 +479,7 @@ private:
     Conn c_;
     JobStore jobs_;
     WorkflowStore wf_;
+    MaterialStore mat_;
 };
 
 #undef TS

@@ -450,6 +450,37 @@ BOOST_FIXTURE_TEST_CASE(insert_keeps_checkpoint_and_spawn, Fixture) {
     BOOST_TEST(r->spawn[0].name() == "s");
 }
 
+BOOST_FIXTURE_TEST_CASE(records_committed_with_outputs, Fixture) {
+    j->insert_job(make_job("job-r", 1, v1::COMMITTING));
+    j->begin_attempt(make_attempt("att-1", "job-r", 1));
+    std::vector<v1::CalcRecord> recs(2);
+    recs[0].set_kind("qe.relax");
+    recs[0].mutable_structure()->set_reduced_formula("ZrNiSn");
+    recs[0].mutable_structure()->add_lattice(5.9);
+    recs[0].set_properties_json(R"({"energy_ev":-12.5})");
+    recs[0].mutable_method()->set_solver("toy");
+    recs[0].add_output_names("z.txt");
+    recs[1].set_kind("phonon.slack");
+    recs[1].set_structure_id("st-1");
+    BOOST_TEST(j->commit_outputs("job-r", "att-1", {named('c', "z.txt", 3)}, {}, recs));
+    for (int pass = 0; pass < 2; ++pass) {
+        auto r = j->get_job("job-r");
+        BOOST_REQUIRE_EQUAL(r->records.size(), 2u);
+        BOOST_TEST(r->records[0].SerializeAsString() == recs[0].SerializeAsString());
+        BOOST_TEST(r->records[1].structure_id() == "st-1");
+        BOOST_TEST(j->list_jobs(v1::COMPLETED, 10).at(0).records.size() == 2u);
+        j.reset();
+        j = open_sqlite_journal(db_path);
+    }
+    // insert_job keeps records too; a job without records has none.
+    auto rec = make_job("job-ins", 2, v1::COMPLETED);
+    rec.records = {recs[1]};
+    j->insert_job(rec);
+    BOOST_TEST(j->get_job("job-ins")->records.at(0).kind() == "phonon.slack");
+    j->insert_job(make_job("job-none", 3, v1::COMPLETED));
+    BOOST_TEST(j->get_job("job-none")->records.empty());
+}
+
 BOOST_AUTO_TEST_CASE(migrates_v1_database) {
     const fs::path dir = fs::path("/tmp/claude-1000") / tdr::new_id("journal-mig");
     const fs::path db = dir / "journal.db";
@@ -506,6 +537,7 @@ PRAGMA user_version = 1;
         BOOST_REQUIRE_EQUAL(r->outputs.size(), 1u);
         BOOST_TEST(r->outputs[0].name().empty());
         BOOST_TEST(r->spawn.empty());
+        BOOST_TEST(r->records.empty());
         BOOST_TEST(r->checkpoint.artifact_id().empty());
         jr->set_checkpoint("old-job", named('7', "checkpoint", 2));
         BOOST_TEST(jr->get_job("old-job")->checkpoint.size() == 2u);
@@ -516,7 +548,7 @@ PRAGMA user_version = 1;
         sqlite3_stmt* st = nullptr;
         BOOST_REQUIRE(sqlite3_prepare_v2(raw, "PRAGMA user_version", -1, &st, nullptr) == SQLITE_OK);
         BOOST_REQUIRE(sqlite3_step(st) == SQLITE_ROW);
-        BOOST_TEST(sqlite3_column_int(st, 0) == 2);
+        BOOST_TEST(sqlite3_column_int(st, 0) == 3);
         sqlite3_finalize(st);
         sqlite3_close(raw);
     }

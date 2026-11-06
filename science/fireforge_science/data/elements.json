@@ -1,0 +1,395 @@
+{
+ "format": "fireforge.elements.v1",
+ "description": "Elemental crustal abundance, price and toxicity class for te.evaluate screening scores (phase8.md §4). Values are approximate screening inputs, not procurement data.",
+ "sources": {
+  "abundance_ppm": "CRC Handbook of Chemistry and Physics, 97th ed. (2016), sec. 14, 'Abundance of Elements in the Earth's Crust and in the Sea' (continental crust, mg/kg), as tabulated in Wikipedia 'Abundance of elements in Earth's crust' (CRC column). One source for every element.",
+  "price_usd_per_kg": "USGS Mineral Commodity Summaries 2025 (https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf), Salient Statistics, 2024 estimates, converted to USD/kg (1 lb = 0.453592 kg, 1 troy oz = 31.1035 g). Where USGS has no metal price: Wikipedia 'Prices of chemical elements' with its cited source and year. Oxide/concentrate prices converted to contained element are marked uncertain (lower than metal prices).",
+  "toxicity": "Class 0 low, 1 moderate, 2 high, from EU CLP (EC 1272/2008) Annex VI harmonised classifications of the element or its common compounds, IARC Monograph groups and EU RoHS (2011/65/EU). Assigned from these listings without per-element re-verification; judgement calls marked uncertain."
+ },
+ "elements": {
+  "Li": {
+   "abundance_ppm": 20,
+   "price_usd_per_kg": 74.5,
+   "price_note": "USGS MCS 2025: battery-grade Li2CO3 $14,000/t (2024e), per kg contained Li (18.8 %); Li metal ~$81-86/kg (Wikipedia, SMM 2020)",
+   "toxicity": 1,
+   "toxicity_note": "Li salts Acute Tox. 4; ECHA RAC (2021) proposed Repr. 1A for Li carbonate/chloride/hydroxide",
+   "uncertain": [
+    "price_usd_per_kg",
+    "toxicity"
+   ]
+  },
+  "Mg": {
+   "abundance_ppm": 23300,
+   "price_usd_per_kg": 7.72,
+   "price_note": "USGS MCS 2025: magnesium metal, US spot Western, $3.50/lb (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "flammable powder only",
+   "uncertain": []
+  },
+  "Al": {
+   "abundance_ppm": 82300,
+   "price_usd_per_kg": 2.87,
+   "price_note": "USGS MCS 2025: ingot, US market spot, 130 c/lb (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "flammable powder only",
+   "uncertain": []
+  },
+  "Si": {
+   "abundance_ppm": 282000,
+   "price_usd_per_kg": 3.97,
+   "price_note": "USGS MCS 2025: silicon metal, 180 c/lb Si (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "no harmonised health classification",
+   "uncertain": []
+  },
+  "Sc": {
+   "abundance_ppm": 22,
+   "price_usd_per_kg": 1840,
+   "price_note": "USGS MCS 2025: Sc2O3 99.99 % $1,200/kg oxide (2024e), per kg contained Sc (65.2 %); metal much higher",
+   "toxicity": 0,
+   "toxicity_note": "no harmonised classification; limited data",
+   "uncertain": [
+    "price_usd_per_kg",
+    "toxicity"
+   ]
+  },
+  "Ti": {
+   "abundance_ppm": 5650,
+   "price_usd_per_kg": 13,
+   "price_note": "USGS MCS 2025: titanium sponge $13/kg (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "metal low hazard",
+   "uncertain": []
+  },
+  "V": {
+   "abundance_ppm": 120,
+   "price_usd_per_kg": 21.5,
+   "price_note": "USGS MCS 2025: V2O5 $5.45/lb (2024e), per kg contained V (56 %); V metal ~$357-385/kg (Wikipedia, SMM 2020)",
+   "toxicity": 1,
+   "toxicity_note": "V2O5 harmonised Muta. 2, Repr. 2, STOT RE 1; IARC 2B; metal low hazard",
+   "uncertain": [
+    "price_usd_per_kg",
+    "toxicity"
+   ]
+  },
+  "Cr": {
+   "abundance_ppm": 102,
+   "price_usd_per_kg": 12.35,
+   "price_note": "USGS MCS 2025: chromium metal $5.60/lb (2024e)",
+   "toxicity": 1,
+   "toxicity_note": "metal/Cr(III) low hazard; Cr(VI) IARC 1, Carc. 1B, RoHS-restricted",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "Mn": {
+   "abundance_ppm": 950,
+   "price_usd_per_kg": 1.82,
+   "price_note": "Wikipedia 'Prices of chemical elements' (BGR, 2019 avg.), electrolytic Mn 99.7 %; USGS gives ore only",
+   "toxicity": 1,
+   "toxicity_note": "chronic inhalation neurotoxicity (manganism)",
+   "uncertain": [
+    "price_usd_per_kg"
+   ]
+  },
+  "Fe": {
+   "abundance_ppm": 56300,
+   "price_usd_per_kg": 0.424,
+   "price_note": "Wikipedia 'Prices of chemical elements' (SMM 2020): pig iron; USGS MCS gives scrap/ore only",
+   "toxicity": 0,
+   "toxicity_note": "no classification",
+   "uncertain": [
+    "price_usd_per_kg"
+   ]
+  },
+  "Co": {
+   "abundance_ppm": 25,
+   "price_usd_per_kg": 37.5,
+   "price_note": "USGS MCS 2025: US spot cathode $17/lb (2024e)",
+   "toxicity": 2,
+   "toxicity_note": "Co metal harmonised Carc. 1B, Muta. 2, Repr. 1B, sensitiser (ATP 2020); IARC 2A (2022)",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "Ni": {
+   "abundance_ppm": 84,
+   "price_usd_per_kg": 17.0,
+   "price_note": "USGS MCS 2025: LME cash $17,000/t (2024e)",
+   "toxicity": 1,
+   "toxicity_note": "Ni metal Carc. 2, Skin Sens. 1; Ni compounds Carc. 1A / IARC 1",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "Cu": {
+   "abundance_ppm": 60,
+   "price_usd_per_kg": 9.26,
+   "price_note": "USGS MCS 2025: LME grade A cash 420 c/lb (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "metal low hazard",
+   "uncertain": []
+  },
+  "Zn": {
+   "abundance_ppm": 70,
+   "price_usd_per_kg": 2.78,
+   "price_note": "USGS MCS 2025: LME cash 126 c/lb (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "aquatic toxicity only",
+   "uncertain": []
+  },
+  "Ga": {
+   "abundance_ppm": 19,
+   "price_usd_per_kg": 500,
+   "price_note": "USGS MCS 2025: high-purity Ga import unit value $500/kg (2024e); ~$1,530/kg in Aug 2026 after export controls (Wikipedia/Stockatomics)",
+   "toxicity": 0,
+   "toxicity_note": "no carcinogenicity for the metal (GaAs hazard is from As)",
+   "uncertain": [
+    "price_usd_per_kg",
+    "toxicity"
+   ]
+  },
+  "Ge": {
+   "abundance_ppm": 1.5,
+   "price_usd_per_kg": 2100,
+   "price_note": "USGS MCS 2025: germanium metal $2,100/kg (2024e); ~$4,860/kg in Aug 2026 (Wikipedia/Stockatomics)",
+   "toxicity": 0,
+   "toxicity_note": "no harmonised health classification",
+   "uncertain": [
+    "price_usd_per_kg"
+   ]
+  },
+  "As": {
+   "abundance_ppm": 1.8,
+   "price_usd_per_kg": 4.41,
+   "price_note": "USGS MCS 2025: arsenic metal $2/lb (2024e)",
+   "toxicity": 2,
+   "toxicity_note": "Acute Tox. 3; compounds Carc. 1A; IARC 1",
+   "uncertain": []
+  },
+  "Se": {
+   "abundance_ppm": 0.05,
+   "price_usd_per_kg": 24,
+   "price_note": "USGS MCS 2025: US annual average $24/kg (2024e)",
+   "toxicity": 1,
+   "toxicity_note": "harmonised Acute Tox. 3, STOT RE 2",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "Y": {
+   "abundance_ppm": 33,
+   "price_usd_per_kg": 33,
+   "price_note": "USGS MCS 2025: yttrium metal 99.9 % $33/kg (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "no harmonised classification",
+   "uncertain": []
+  },
+  "Zr": {
+   "abundance_ppm": 165,
+   "price_usd_per_kg": 25,
+   "price_note": "USGS MCS 2025: zirconium sponge, ex-works China, $25/kg (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "flammable powder only",
+   "uncertain": []
+  },
+  "Nb": {
+   "abundance_ppm": 20,
+   "price_usd_per_kg": 26,
+   "price_note": "USGS MCS 2025: ferroniobium unit value $26/kg (2024e; ~65 % Nb); Nb metal ~$61-86/kg (Wikipedia, SMM 2020)",
+   "toxicity": 0,
+   "toxicity_note": "no classification",
+   "uncertain": [
+    "price_usd_per_kg"
+   ]
+  },
+  "Mo": {
+   "abundance_ppm": 1.2,
+   "price_usd_per_kg": 47,
+   "price_note": "USGS MCS 2025: $47/kg Mo, molybdic oxide basis (2024e)",
+   "toxicity": 1,
+   "toxicity_note": "metal low hazard; MoO3 Carc. 2",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "Ru": {
+   "abundance_ppm": 0.001,
+   "price_usd_per_kg": 14146,
+   "price_note": "USGS MCS 2025: $440/troy oz (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "metal low hazard (RuO4 toxic)",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "Rh": {
+   "abundance_ppm": 0.001,
+   "price_usd_per_kg": 147893,
+   "price_note": "USGS MCS 2025: $4,600/troy oz (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "no classification",
+   "uncertain": []
+  },
+  "Pd": {
+   "abundance_ppm": 0.015,
+   "price_usd_per_kg": 31508,
+   "price_note": "USGS MCS 2025: $980/troy oz (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "metal low hazard; salts are sensitisers",
+   "uncertain": []
+  },
+  "Ag": {
+   "abundance_ppm": 0.075,
+   "price_usd_per_kg": 891,
+   "price_note": "USGS MCS 2025: bullion $27.70/troy oz (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "metal low hazard",
+   "uncertain": []
+  },
+  "Cd": {
+   "abundance_ppm": 0.15,
+   "price_usd_per_kg": 4.1,
+   "price_note": "USGS MCS 2025: metal $4.1/kg (2024e)",
+   "toxicity": 2,
+   "toxicity_note": "Carc. 1B, Muta. 2, Repr. 2, STOT RE 1; IARC 1; RoHS-restricted",
+   "uncertain": []
+  },
+  "In": {
+   "abundance_ppm": 0.25,
+   "price_usd_per_kg": 340,
+   "price_note": "USGS MCS 2025: 99.99 %, US warehouse $340/kg (2024e)",
+   "toxicity": 1,
+   "toxicity_note": "InP IARC 2A; indium-compound inhalation lung disease",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "Sn": {
+   "abundance_ppm": 2.3,
+   "price_usd_per_kg": 30.9,
+   "price_note": "USGS MCS 2025: LME cash 1,400 c/lb (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "metal / inorganic Sn low hazard",
+   "uncertain": []
+  },
+  "Sb": {
+   "abundance_ppm": 0.2,
+   "price_usd_per_kg": 20.9,
+   "price_note": "USGS MCS 2025: metal $9.50/lb (2024e; prices spiked in 2024)",
+   "toxicity": 1,
+   "toxicity_note": "Sb2O3 Carc. 2; IARC 2A (trivalent Sb, 2023)",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "Te": {
+   "abundance_ppm": 0.001,
+   "price_usd_per_kg": 75,
+   "price_note": "USGS MCS 2025: US annual average $75/kg (2024e)",
+   "toxicity": 1,
+   "toxicity_note": "Te compounds acutely toxic; element classification not verified",
+   "uncertain": [
+    "toxicity"
+   ]
+  },
+  "La": {
+   "abundance_ppm": 39,
+   "price_usd_per_kg": 4.85,
+   "price_note": "Wikipedia 'Prices of chemical elements' (SMM Feb 2020): La metal 99 %; USGS gives La2O3 ~ $1/kg",
+   "toxicity": 0,
+   "toxicity_note": "no harmonised classification",
+   "uncertain": [
+    "price_usd_per_kg",
+    "toxicity"
+   ]
+  },
+  "Hf": {
+   "abundance_ppm": 3.0,
+   "price_usd_per_kg": 4600,
+   "price_note": "USGS MCS 2025: unwrought hafnium $4,600/kg (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "flammable powder only",
+   "uncertain": []
+  },
+  "Ta": {
+   "abundance_ppm": 2.0,
+   "price_usd_per_kg": 208,
+   "price_note": "USGS MCS 2025: tantalite $170/kg Ta2O5 content (2024e), per kg contained Ta (81.9 %); metal ~$300/kg (Wikipedia, ISE 2019)",
+   "toxicity": 0,
+   "toxicity_note": "no classification",
+   "uncertain": [
+    "price_usd_per_kg"
+   ]
+  },
+  "W": {
+   "abundance_ppm": 1.25,
+   "price_usd_per_kg": 31.5,
+   "price_note": "USGS MCS 2025: concentrate $250/mtu WO3 (2024e), per kg contained W (79.3 %)",
+   "toxicity": 0,
+   "toxicity_note": "no harmonised classification for the metal",
+   "uncertain": [
+    "price_usd_per_kg"
+   ]
+  },
+  "Re": {
+   "abundance_ppm": 0.0007,
+   "price_usd_per_kg": 1370,
+   "price_note": "USGS MCS 2025: metal pellets 99.99 % $1,370/kg (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "no classification; limited data",
+   "uncertain": []
+  },
+  "Os": {
+   "abundance_ppm": 0.0015,
+   "price_usd_per_kg": 30000,
+   "price_note": "Wikipedia 'Prices of chemical elements' (Element Sales, 2025); not priced by USGS",
+   "toxicity": 1,
+   "toxicity_note": "OsO4 (forms from fine metal in air) very toxic",
+   "uncertain": [
+    "price_usd_per_kg",
+    "toxicity"
+   ]
+  },
+  "Ir": {
+   "abundance_ppm": 0.001,
+   "price_usd_per_kg": 154323,
+   "price_note": "USGS MCS 2025: $4,800/troy oz (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "no classification",
+   "uncertain": []
+  },
+  "Pt": {
+   "abundance_ppm": 0.005,
+   "price_usd_per_kg": 30543,
+   "price_note": "USGS MCS 2025: $950/troy oz (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "metal low hazard; chloroplatinates sensitisers",
+   "uncertain": []
+  },
+  "Au": {
+   "abundance_ppm": 0.004,
+   "price_usd_per_kg": 77162,
+   "price_note": "USGS MCS 2025: $2,400/troy oz (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "no classification",
+   "uncertain": []
+  },
+  "Pb": {
+   "abundance_ppm": 14,
+   "price_usd_per_kg": 2.43,
+   "price_note": "USGS MCS 2025: North American refined 110 c/lb (2024e)",
+   "toxicity": 2,
+   "toxicity_note": "Repr. 1A; IARC 2A (inorganic); RoHS-restricted",
+   "uncertain": []
+  },
+  "Bi": {
+   "abundance_ppm": 0.0085,
+   "price_usd_per_kg": 11.7,
+   "price_note": "USGS MCS 2025: 99.99 % Rotterdam $5.30/lb (2024e)",
+   "toxicity": 0,
+   "toxicity_note": "low toxicity",
+   "uncertain": []
+  }
+ }
+}

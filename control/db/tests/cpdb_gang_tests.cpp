@@ -216,12 +216,13 @@ BOOST_AUTO_TEST_CASE(migrates_v4_database_to_v5) {
     db.node("a", 8);
     auto p = db.plain();
     psql(db.conninfo,
-         "DROP TABLE gang_holds, job_attempt_members; ALTER TABLE nodes DROP COLUMN last_lease_poll;"
+         "DROP TABLE calculations, structures, materials;"
+         " DROP TABLE gang_holds, job_attempt_members; ALTER TABLE nodes DROP COLUMN last_lease_poll;"
          " ALTER TABLE jobs DROP COLUMN is_gang, DROP COLUMN pending_reason, DROP COLUMN gang_tried;"
          " DELETE FROM schema_migrations WHERE version >= 5");
     BOOST_TEST(schema_version(db.conninfo) == 4);
     auto repo = open_pg_repository(db.conninfo);
-    BOOST_TEST(schema_version(db.conninfo) == 5);
+    BOOST_TEST(schema_version(db.conninfo) == 6);
     BOOST_TEST(psql(db.conninfo, "SELECT is_gang::text || pending_reason FROM jobs") == "false");
     db.repo = std::move(repo);
     auto l = db.poll_free("a", T0 + 1);

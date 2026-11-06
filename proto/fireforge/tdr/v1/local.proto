@@ -6,6 +6,7 @@ syntax = "proto3";
 package fireforge.tdr.v1;
 
 import "fireforge/tdr/v1/job.proto";
+import "fireforge/tdr/v1/record.proto";
 import "fireforge/control/v1/control.proto";
 
 // ---------------------------------------------------------------------------
@@ -77,6 +78,7 @@ message WorkerResult {
   bool retryable = 4;     // failure may succeed on another attempt
   repeated OutputFile outputs = 5;
   repeated StepSpec spawn = 6;     // Phase 6: steps to add to the workflow (success only)
+  repeated CalcRecord records = 7; // Phase 8: calculation records (success only, phase8.md §2)
 }
 
 // worker -> daemon (WORKER_CHECKPOINT), reply Ack or ERROR. Phase 6.

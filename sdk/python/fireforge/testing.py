@@ -82,7 +82,8 @@ class FakeDaemon:
 
     Recorded: ``checkpoints`` (WorkerCheckpoint messages, in order),
     ``checkpoint_files`` (file content at receive time, same order),
-    ``spawned`` (StepSpecs from the result).
+    ``spawned`` (StepSpecs from the result), ``records`` (CalcRecords from
+    the result).
     """
 
     def __init__(self, operation: str = "test.op", params: dict | str | None = None, *,
@@ -203,6 +204,11 @@ class FakeDaemon:
     def spawned(self) -> list:
         """StepSpecs the worker spawned (``WorkerResult.spawn``; [] without a result)."""
         return list(self.result.spawn) if self.result is not None else []
+
+    @property
+    def records(self) -> list:
+        """CalcRecords the worker attached (``WorkerResult.records``; [] without a result)."""
+        return list(self.result.records) if self.result is not None else []
 
     def checkpoint_path(self, msg: local_pb2.WorkerCheckpoint) -> Path:
         p = Path(msg.path)

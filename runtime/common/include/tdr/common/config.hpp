@@ -34,6 +34,7 @@ struct Config {
     struct Node {
         std::string name;             // default: hostname
         std::string advertise_address = "auto";
+        std::string capabilities;     // Phase 8: extra advertised capabilities, comma-separated (e.g. "sci,qe")
     } node;
 
     struct Network {

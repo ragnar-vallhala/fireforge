@@ -129,6 +129,13 @@ public:
     // Phase 6: result.spawn is kept with the job (JobStatus.spawn) when it
     // completes; output names (JobStatus.outputs) come from OutputFile.name, else
     // the relative path; a duplicate name fails the job (non-retryable).
+    // Phase 8 (phase8.md §2): result.records of a successful result are
+    // committed with the outputs (JobStatus.records). Checked here: <= 64
+    // records, <= 256 KiB of record JSON, each with a kind, structure_id or
+    // structure, evidence PREDICTED; a violation returns the error AND keeps
+    // the result as a non-retryable failure (the job FAILs on exit). At commit,
+    // a record output_name that is not an output of the result fails the job
+    // (non-retryable). Failed results' records are dropped.
     std::expected<void, std::string> on_worker_result(const v1::WorkerResult& result);
 
     // Phase 6 (phase6.md §6): the attempt must be RUNNING and its job have

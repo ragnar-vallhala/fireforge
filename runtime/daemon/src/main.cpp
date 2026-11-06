@@ -319,6 +319,14 @@ private:
         if (reg.physical().gpu_count() > 0) reg.add_capabilities("gpu:nvidia");
         if (supervisor_->cgroups_enabled()) reg.add_capabilities("cgroups");
         if (has_job_user) reg.add_capabilities("job-user");
+        for (std::size_t pos = 0; pos <= cfg_.node.capabilities.size();) {  // [node] capabilities = a,b
+            const auto end = std::min(cfg_.node.capabilities.find(',', pos), cfg_.node.capabilities.size());
+            auto cap = cfg_.node.capabilities.substr(pos, end - pos);
+            cap.erase(0, cap.find_first_not_of(" \t"));
+            cap.erase(cap.find_last_not_of(" \t") + 1);
+            if (!cap.empty()) reg.add_capabilities(cap);
+            pos = end + 1;
+        }
         aopts.local_capacity = res_.capacity;
         aopts.policy_cache = cfg_.policy_cache();
         aopts.peer_refresh = std::chrono::seconds(10);

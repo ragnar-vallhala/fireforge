@@ -116,5 +116,33 @@ def spawn_fail(context):
     return JobResult(success=False, error="nope")
 
 
+@worker.task("demo.record")
+def record(context):
+    context.save_output("relaxed", {"energy_ev": -3.2})
+    context.record("qe.relax",
+                   structure={"lattice": [5.6, 0, 0, 0, 5.6, 0, 0, 0, 5.6],
+                              "sites": [{"species": "Na", "frac": [0, 0, 0]},
+                                        {"species": "Cl", "frac": [0.5, 0.5, 0.5]}],
+                              "reduced_formula": "NaCl", "fingerprint": "fp1:abc"},
+                   properties={"energy_ev": -3.2}, conditions={"pressure_gpa": 0},
+                   method={"solver": "toy", "engine": "toy", "settings": {"ecut_ry": 40}},
+                   outputs=["relaxed"])
+    context.record("te.evaluate", structure_id="st-1", properties={"zt_peak": 1.1})
+    return None
+
+
+@worker.task("demo.record_fail")
+def record_fail(context):
+    context.record("qe.relax", structure_id="st-1")
+    return JobResult(success=False, error="nope")
+
+
+@worker.task("demo.record_bad_output")
+def record_bad_output(context):
+    context.save_output("relaxed", {"energy_ev": -3.2})
+    context.record("qe.relax", structure_id="st-1", outputs=["relaxed", "bands"])
+    return None
+
+
 if __name__ == "__main__":
     worker.run()

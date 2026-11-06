@@ -1,0 +1,57 @@
+// Phase 8: calculation records and structures (docs/design/phase8.md §2–§3).
+// Workers attach CalcRecords to a successful WorkerResult; they reach the control
+// plane with the job's COMPLETED update and are stored in the same transaction.
+syntax = "proto3";
+
+package fireforge.tdr.v1;
+
+message Site {
+  string species = 1;              // element symbol
+  repeated double frac = 2;        // fractional coordinates (3)
+}
+
+// A crystal structure. JSON form (proto3 JSON) is the science package's Structure.
+message Structure {
+  repeated double lattice = 1;     // 9 floats, Å, row-major: a, b, c vectors
+  repeated Site sites = 2;
+  string formula = 3;              // e.g. "Zr1 Ni1 Sn1" (pymatgen style)
+  string reduced_formula = 4;      // e.g. "ZrNiSn"
+  int32 spacegroup_number = 5;
+  string spacegroup_symbol = 6;
+  string prototype = 7;            // e.g. "half-heusler", "rocksalt", "element"
+  string fingerprint = 8;          // "fp1:<sha256>" (phase8.md §3); dedup key
+  string parent_structure_id = 9;  // e.g. the unrelaxed input of a relaxation
+  string source = 10;              // "crystal.halfheusler", "import", ...
+  repeated double magmoms = 11;    // optional, μB per site
+}
+
+enum Evidence {
+  PREDICTED = 0;                   // computed by FireForge (workers can set only this)
+  LITERATURE = 1;                  // published value (admin import)
+  MEASURED = 2;                    // experiment (admin import)
+}
+
+message Method {
+  string solver = 1;               // "quantum-espresso", "phonopy", "boltztrap2", "toy", ...
+  string solver_version = 2;
+  string engine = 3;               // "qe" | "toy" | "" (pure post-processing)
+  string functional = 4;           // "PBE"
+  repeated string pseudopotentials = 5;  // "<file> md5:<hex>"
+  string preset = 6;               // "screening" | "accurate"
+  string settings_json = 7;        // ecut, k-mesh, smearing, conv_thr, supercell, tau_s, ...
+}
+
+message CalcRecord {
+  string kind = 1;                 // "qe.relax", "phonon.slack", "te.evaluate", ... (phase8.md §4)
+  string structure_id = 2;         // known structure, or
+  Structure structure = 3;         // inline (deduplicated by fingerprint); one of the two is required
+  string properties_json = 4;      // flat JSON object; units in key names
+  string conditions_json = 5;      // temperature, doping, strain, ...
+  Method method = 6;
+  repeated string output_names = 7;      // this job's named outputs with the raw data
+  repeated string input_artifacts = 8;
+  string convergence_json = 9;
+  string uncertainty_json = 10;
+  Evidence evidence = 11;
+  string note = 12;
+}

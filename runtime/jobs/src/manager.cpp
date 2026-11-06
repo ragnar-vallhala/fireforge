@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <boost/asio/post.hpp>
+#include <google/protobuf/util/json_util.h>
 
 #include "tdr/common/common.hpp"
 
@@ -37,6 +38,9 @@ constexpr std::string_view kArtifactPrefix = "artifact://sha256/";
 constexpr std::string_view kDefaultMediaType = "application/octet-stream";
 constexpr std::size_t kMaxJobIdLength = 128;
 constexpr std::string_view kDefaultCheckpointName = "checkpoint";
+// Phase 8 (phase8.md §2): the control plane's limits, checked early here.
+constexpr int kMaxRecords = 64;
+constexpr std::size_t kMaxRecordsJsonBytes = 256 * 1024;
 
 // "artifact://sha256/<64 lowercase hex>" -> hex. Local re-implementation so
 // this module does not depend on the artifacts library's free functions.
@@ -120,6 +124,35 @@ bool is_within(const fs::path& base, const fs::path& p) {
     return bi == base.end();
 }
 
+// Phase 8: sanity and limits of a successful result's records. "" = fine.
+// Size counts each record's proto3 JSON (what the control plane receives).
+std::string check_records(const v1::WorkerResult& r) {
+    if (!r.success() || r.records().empty()) return {};
+    if (r.records_size() > kMaxRecords) {
+        return std::format("too many records: {} (max {})", r.records_size(), kMaxRecords);
+    }
+    std::size_t json_bytes = 0;
+    for (int i = 0; i < r.records_size(); ++i) {
+        const auto& rec = r.records(i);
+        if (rec.kind().empty()) return std::format("record {}: kind is empty", i);
+        if (rec.structure_id().empty() && !rec.has_structure()) {
+            return std::format("record {} ({}): structure_id or structure required", i, rec.kind());
+        }
+        if (rec.evidence() != v1::PREDICTED) {
+            return std::format("record {} ({}): worker records must have evidence PREDICTED", i, rec.kind());
+        }
+        std::string j;
+        if (!google::protobuf::util::MessageToJsonString(rec, &j).ok()) {
+            return std::format("record {} ({}): cannot encode as JSON", i, rec.kind());
+        }
+        json_bytes += j.size();
+    }
+    if (json_bytes > kMaxRecordsJsonBytes) {
+        return std::format("too many records: {} bytes of record JSON (max {})", json_bytes, kMaxRecordsJsonBytes);
+    }
+    return {};
+}
+
 struct QueueKey {
     std::int64_t created_ms = 0;
     std::uint64_t seq = 0;
@@ -151,6 +184,9 @@ struct JobManager::Impl {
         bool cancel_requested = false;
         std::string cancel_reason;
         std::optional<v1::WorkerResult> result;
+        // Phase 8: the result was refused (invalid records); the attempt fails
+        // non-retryable with result->error() however the process exits.
+        bool result_invalid = false;
     };
 
     struct QueueEntry {
@@ -523,6 +559,13 @@ struct JobManager::Impl {
             return;
         }
 
+        if (a->result_invalid) {
+            const std::string err = a->result->error();
+            journal.finish_attempt(attempt_id, AttemptState::kFailed, info.exit_code, info.signal, err);
+            fail_or_retry(job_id, from, err, /*retryable=*/false);
+            return;
+        }
+
         if (info.kind == ExitKind::kExited && info.exit_code == 0) {
             if (!a->result || a->result->success()) {
                 commit(*a);
@@ -616,6 +659,20 @@ struct JobManager::Impl {
                 fail_or_retry(job_id, v1::COMMITTING, err, /*retryable=*/false);
                 return;
             }
+            // Phase 8: a record's output_names must name outputs of this result.
+            if (a.result && a.result->success()) {
+                for (int i = 0; i < a.result->records_size(); ++i) {
+                    const auto& rec = a.result->records(i);
+                    for (const auto& n : rec.output_names()) {
+                        if (names.contains(n)) continue;
+                        const std::string err =
+                            std::format("record {} ({}): unknown output name '{}'", i, rec.kind(), n);
+                        journal.finish_attempt(a.id, AttemptState::kFailed, 0, 0, err);
+                        fail_or_retry(job_id, v1::COMMITTING, err, /*retryable=*/false);
+                        return;
+                    }
+                }
+            }
         }
 
         std::vector<v1::NamedArtifact> named;
@@ -646,17 +703,22 @@ struct JobManager::Impl {
             named.push_back(std::move(n));
         }
         std::vector<v1::StepSpec> spawn;
-        if (a.result && a.result->success()) spawn.assign(a.result->spawn().begin(), a.result->spawn().end());
+        std::vector<v1::CalcRecord> records;
+        if (a.result && a.result->success()) {
+            spawn.assign(a.result->spawn().begin(), a.result->spawn().end());
+            records.assign(a.result->records().begin(), a.result->records().end());
+        }
 
-        if (!journal.commit_outputs(job_id, a.id, named, spawn)) {
+        if (!journal.commit_outputs(job_id, a.id, named, spawn, records)) {
             // Fencing: the attempt is no longer current. Outputs stay in the
             // store unreferenced; the job is not touched.
             log_warn("job {}: commit by stale attempt {} rejected", job_id, a.id);
             journal.finish_attempt(a.id, AttemptState::kAbandoned, 0, 0, "commit fenced: attempt no longer current");
             return;
         }
-        log_info("job {}: COMMITTING -> COMPLETED ({} outputs, {} artifacts{})", job_id, named.size(), distinct,
-                 spawn.empty() ? std::string() : std::format(", {} spawned steps", spawn.size()));
+        log_info("job {}: COMMITTING -> COMPLETED ({} outputs, {} artifacts{}{})", job_id, named.size(), distinct,
+                 spawn.empty() ? std::string() : std::format(", {} spawned steps", spawn.size()),
+                 records.empty() ? std::string() : std::format(", {} records", records.size()));
         notify(job_id, v1::COMPLETED);
 
         if (!opts.keep_work_dirs) {
@@ -894,9 +956,22 @@ struct JobManager::Impl {
         Attempt* a = running_attempt(r.attempt_id());
         if (!a) return std::unexpected("unknown or finished attempt: " + r.attempt_id());
         if (a->result) return std::unexpected("result already received for attempt " + r.attempt_id());
+        log_debug("job {}: worker result success={} outputs={} spawn={} records={}", a->job_id, r.success(),
+                  r.outputs_size(), r.spawn_size(), r.records_size());
+        if (const std::string bad = check_records(r); !bad.empty()) {
+            // Kept as a non-retryable failure (applied on exit); the worker
+            // hears about it now (the daemon replies ERROR).
+            v1::WorkerResult failed;
+            failed.set_attempt_id(r.attempt_id());
+            failed.set_success(false);
+            failed.set_error("invalid result: " + bad);
+            failed.set_retryable(false);
+            a->result = std::move(failed);
+            a->result_invalid = true;
+            log_warn("job {}: attempt {} result rejected: {}", a->job_id, a->id, bad);
+            return std::unexpected("invalid result: " + bad);
+        }
         a->result = r;
-        log_debug("job {}: worker result success={} outputs={} spawn={}", a->job_id, r.success(), r.outputs_size(),
-                  r.spawn_size());
         return {};
     }
 

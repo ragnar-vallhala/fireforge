@@ -8,20 +8,22 @@ Phase 4 (distributed execution: central queue + leases, `docs/design/phase4.md`)
 Phase 5 (artifact infrastructure: peer transfer, placement, retention, `docs/design/phase5.md`) is done.
 Phase 6 (workflow engine: DAGs, fan-out, checkpoints, ranked placement, `docs/design/phase6.md`) is done.
 Phase 7 (multi-node MPI: gang placement, reserve-and-drain, launch agent, `docs/design/phase7.md`) is done.
+Phase 8 (scientific integration: QE/phonopy/BoltzTraP2 thermoelectric workflow, materials database, `docs/design/phase8.md`) is implemented; the validation run is in progress.
 
 ## Memory cap — mandatory
 
 All builds, tests and other heavy commands MUST run through `tools/capped`.
 It puts the process in the shared `fireforge-build.slice`, which has ONE
-8 GiB memory limit (no swap) for everything running in it, including several
+8 GiB memory limit (no swap) and a 4-core CPU quota for everything running in it, including several
 agents building in parallel.
 
 ```sh
 tools/build.sh [-B build/<name>] [-t <target>] [--test] [-R <ctest regex>]
-tools/pytest.sh [pytest args]
+tools/pytest.sh [pytest args]       # SDK tests; pass science/tests for the science package
 tools/gen_proto.sh                 # regenerate Python protobuf code
 tools/e2e.sh [pytest args]         # real tdrd + tdrctl + tdrcp end-to-end tests
 tools/pg.sh start|stop|psql|conninfo  # private dev Postgres in build/pg (no sudo)
+tools/sci-setup.sh                 # science venv packages + SSSP pseudopotentials + doctor
 tools/capped <any other command>
 ```
 
@@ -48,7 +50,7 @@ sdk/python/fireforge/     Python worker SDK (tests in sdk/python/tests)
 docs/design/              design docs
 deploy/                   systemd unit, example config
 tools/                    build / cap scripts
-science/                  later phases
+science/fireforge_science/ science worker (Phase 8): crystalforge, quantumforge, phonoforge, transportforge, stabilityforge, evaluate/validate, workflows
 ```
 
 ## Conventions

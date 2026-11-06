@@ -12,6 +12,8 @@ lease_poll = 2
 lease_poll_idle = 10
 
 [node]
+# Phase 8: extra capabilities to advertise, e.g. sci,qe,phonopy,phono3py,boltztrap2
+# capabilities =
 # Default: hostname
 name =
 # auto = detect (LAN + Tailscale), one address, or an explicit list

@@ -4,6 +4,8 @@ syntax = "proto3";
 
 package fireforge.tdr.v1;
 
+import "fireforge/tdr/v1/record.proto";
+
 // Lifecycle (Description.md section 10.1).
 // Phase 1 local path: CREATED -> QUEUED -> ASSIGNED -> RUNNING -> COMMITTING -> COMPLETED
 // LEASED is used once the control plane hands out leases (Phase 4).
@@ -128,4 +130,5 @@ message JobStatus {
   repeated NamedArtifact outputs = 14;  // same artifacts as output_artifacts, with names (same order)
   NamedArtifact checkpoint = 15;        // latest checkpoint (empty artifact_id = none)
   repeated StepSpec spawn = 16;         // steps the successful attempt spawned (WorkerResult.spawn)
+  repeated CalcRecord records = 17;     // Phase 8: records of the successful attempt (WorkerResult.records)
 }

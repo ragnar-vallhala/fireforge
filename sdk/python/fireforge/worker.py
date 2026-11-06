@@ -24,6 +24,9 @@ Phase 6 (docs/design/phase6.md): named inputs (``context.input(name)``),
 checkpoints (``context.checkpoint`` / ``context.load_checkpoint``) and
 dynamic fan-out (``context.spawn``) for workflow steps.
 
+Phase 8 (docs/design/phase8.md §2): calculation records (``context.record``)
+travel with a successful result to the control plane's materials database.
+
 Phase 7 (docs/design/phase7.md §8): under MPI (``JobSpec.mpi``) only rank 0
 talks to the daemon; other ranks run the task with a detached context (see
 ``Worker.run`` and ``fireforge.mpi``).
@@ -49,10 +52,12 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Mapping, NamedTuple
+
+from google.protobuf import json_format
 
 from . import _pb, mpi as _mpi
-from ._pb import local_pb2
+from ._pb import local_pb2, record_pb2
 from ._version import __version__
 from .protocol import FrameReader, FrameWriter, ProtocolError
 from .workflow import MAX_SPAWN, STEP_NAME_RE, WorkflowError, build_step_spec
@@ -64,6 +69,13 @@ HANDSHAKE_TIMEOUT_S = 30.0
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_CONFIG = 2
+
+# Phase 8 record limits (phase8.md §2; also enforced by tdrd and the control plane).
+MAX_RECORDS = 64
+MAX_RECORDS_JSON_BYTES = 256 * 1024
+MAX_RECORD_KIND = 64
+_METHOD_KEYS = ("solver", "solver_version", "engine", "functional", "pseudopotentials", "preset",
+                "settings", "settings_json")
 
 REQUIRED_ENV = ("FIREFORGE_IPC_SOCKET", "FIREFORGE_ATTEMPT_ID", "FIREFORGE_ATTEMPT_TOKEN")
 
@@ -201,8 +213,21 @@ def _unlink_quiet(path) -> None:
 
 
 def default_worker_argv() -> list[str]:
-    """Command that re-runs the current worker program (``spawn`` default)."""
+    """Command that re-runs the current worker program (``spawn`` default).
+
+    ``FIREFORGE_WORKER_ARGV`` (a JSON list, e.g. ``["fireforge-sci"]``) overrides it, so
+    spawned steps use a node-independent command instead of this node's interpreter path."""
     import __main__
+
+    override = os.environ.get("FIREFORGE_WORKER_ARGV", "").strip()
+    if override:
+        try:
+            argv = json.loads(override)
+        except ValueError as e:
+            raise WorkerError(f"FIREFORGE_WORKER_ARGV is not JSON: {e}") from None
+        if not (isinstance(argv, list) and argv and all(isinstance(x, str) and x for x in argv)):
+            raise WorkerError("FIREFORGE_WORKER_ARGV must be a non-empty JSON list of strings")
+        return argv
 
     spec = getattr(__main__, "__spec__", None)
     if spec is not None and spec.name:
@@ -214,6 +239,100 @@ def default_worker_argv() -> list[str]:
     if not a0 or a0 == "-c" or not os.path.isfile(a0):
         raise WorkerError("spawn: cannot derive the worker command from sys.argv; pass argv=")
     return [sys.executable, os.path.abspath(a0), *sys.argv[1:]]
+
+
+def _json_object(value: Any, what: str) -> str:
+    """Record JSON field: None -> "", a mapping (or a JSON object string) -> compact JSON.
+
+    NaN / infinity are rejected (ValueError): they are not JSON.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value, parse_constant=_reject_constant)
+        except ValueError as exc:
+            raise ValueError(f"record {what}: invalid JSON: {exc}") from None
+        if not isinstance(parsed, dict):
+            raise ValueError(f"record {what}: must be a JSON object")
+        value = parsed
+    elif not isinstance(value, Mapping):
+        raise ValueError(f"record {what}: expected a dict, got {type(value).__name__}")
+    try:
+        return json.dumps(dict(value), separators=(",", ":"), allow_nan=False, default=_jsonable)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"record {what}: {exc}") from None
+
+
+def _reject_constant(name: str):
+    raise ValueError(f"{name} is not allowed")
+
+
+def _record_structure(structure: Any) -> "record_pb2.Structure":
+    """dict (proto3 JSON of tdr.v1.Structure), a Structure message, or an object with to_proto()/to_json()."""
+    if isinstance(structure, record_pb2.Structure):
+        msg = record_pb2.Structure()
+        msg.CopyFrom(structure)
+        return msg
+    if not isinstance(structure, Mapping):
+        to_proto = getattr(structure, "to_proto", None)
+        to_json = getattr(structure, "to_json", None)
+        if callable(to_proto):
+            p = to_proto()
+            if isinstance(p, record_pb2.Structure):
+                return p
+            if hasattr(p, "SerializeToString"):  # same message from another descriptor pool
+                return record_pb2.Structure.FromString(p.SerializeToString())
+            raise ValueError(f"record structure: to_proto() returned {type(p).__name__}")
+        if callable(to_json):
+            structure = to_json()
+        else:
+            raise ValueError("record structure: expected a dict, a record_pb2.Structure or an object "
+                             f"with to_proto()/to_json(), got {type(structure).__name__}")
+    try:
+        # Round-trip through json first: NaN/inf rejected, numpy etc. converted.
+        data = json.loads(json.dumps(dict(structure), allow_nan=False, default=_jsonable))
+        return json_format.ParseDict(data, record_pb2.Structure())
+    except (TypeError, ValueError, json_format.ParseError) as exc:
+        raise ValueError(f"record structure: {exc}") from None
+
+
+def _record_method(method: Any) -> "record_pb2.Method | None":
+    if method is None:
+        return None
+    if isinstance(method, record_pb2.Method):
+        m = record_pb2.Method()
+        m.CopyFrom(method)
+        return m
+    if not isinstance(method, Mapping):
+        raise ValueError(f"record method: expected a dict or record_pb2.Method, got {type(method).__name__}")
+    unknown = sorted(set(method) - set(_METHOD_KEYS))
+    if unknown:
+        raise ValueError(f"record method: unknown key(s) {', '.join(map(repr, unknown))} "
+                         f"(allowed: {', '.join(_METHOD_KEYS)})")
+    if "settings" in method and "settings_json" in method:
+        raise ValueError("record method: pass settings or settings_json, not both")
+    m = record_pb2.Method()
+    for key in ("solver", "solver_version", "engine", "functional", "preset"):
+        v = method.get(key)
+        if v is not None:
+            if not isinstance(v, str):
+                raise ValueError(f"record method: {key} must be a string")
+            setattr(m, key, v)
+    pps = method.get("pseudopotentials") or ()
+    if isinstance(pps, str) or not all(isinstance(x, str) for x in pps):
+        raise ValueError("record method: pseudopotentials must be a list of strings")
+    m.pseudopotentials.extend(pps)
+    if method.get("settings") is not None:
+        m.settings_json = _json_object(method["settings"], "method settings")
+    elif method.get("settings_json"):
+        m.settings_json = _json_object(method["settings_json"], "method settings_json")
+    return m
+
+
+def _record_json_size(rec: "record_pb2.CalcRecord") -> int:
+    """Bytes of the record's compact proto3 JSON (what the limit counts)."""
+    return len(json.dumps(json_format.MessageToDict(rec), separators=(",", ":")).encode())
 
 
 class _Checkpointer:
@@ -368,6 +487,8 @@ class Context:
         self.cancel_reason: str = ""
         self._saved: dict[str, OutputRef] = {}  # by relative path, insertion-ordered
         self._spawned: list[Any] = []           # job_pb2.StepSpec, in call order
+        self._records: list[Any] = []           # record_pb2.CalcRecord, in call order
+        self._records_json_bytes = 0
         self._ck = _Checkpointer(self, clock or time.monotonic, background_flush)
 
     @property
@@ -717,6 +838,102 @@ class Context:
             c.CopyFrom(s)
             out.append(c)
         return out
+
+    # -- calculation records (phase8.md §2) ----------------------------------
+
+    def record(self, kind: str, *, structure: Any = None, structure_id: str | None = None,
+               properties: Mapping[str, Any] | None = None, conditions: Mapping[str, Any] | None = None,
+               method: Any = None, outputs=(), input_artifacts=(), convergence: Mapping[str, Any] | None = None,
+               uncertainty: Mapping[str, Any] | None = None, note: str = "") -> "record_pb2.CalcRecord | None":
+        """Attach a calculation record to this attempt's result; returns it (a copy).
+
+        Records only take effect if the attempt succeeds (``WorkerResult.records``);
+        the control plane stores them with the job's COMPLETED update.
+
+        ``kind``: e.g. "qe.relax" (1..64 chars). Exactly one of ``structure_id``
+        (a known structure) or ``structure``: a dict (proto3 JSON of
+        ``tdr.v1.Structure``), a ``record_pb2.Structure``, or an object with
+        ``to_proto()`` / ``to_json()`` (``fireforge_science.Structure``).
+        ``properties`` / ``conditions`` / ``convergence`` / ``uncertainty``:
+        JSON-able dicts (units in key names; NaN / inf are rejected). ``method``:
+        a ``record_pb2.Method`` or a dict with keys solver, solver_version, engine,
+        functional, pseudopotentials, preset and settings (a dict, stored as
+        settings_json) or settings_json. ``outputs``: names (or ``OutputRef``) of
+        this job's outputs holding the raw data; checked when the result is
+        built (a name that is not an output fails the attempt, not retryable).
+        Evidence is always PREDICTED. Limits: ``MAX_RECORDS`` (64) records and
+        ``MAX_RECORDS_JSON_BYTES`` (256 KiB) of record JSON per result.
+
+        Raises ValueError on invalid arguments or a limit. In a detached
+        context (non-root MPI rank) nothing is recorded and None is returned.
+        """
+        if self.detached:
+            return None
+        if not isinstance(kind, str) or not kind or len(kind) > MAX_RECORD_KIND:
+            raise ValueError(f"record kind must be a non-empty string of at most {MAX_RECORD_KIND} chars, "
+                             f"got {kind!r}")
+        if (structure is None) == (not structure_id):
+            raise ValueError(f"record({kind!r}): pass exactly one of structure= or structure_id=")
+        if len(self._records) >= MAX_RECORDS:
+            raise ValueError(f"record({kind!r}): at most {MAX_RECORDS} records per result")
+        rec = record_pb2.CalcRecord(kind=kind, evidence=record_pb2.PREDICTED)
+        if structure_id:
+            if not isinstance(structure_id, str):
+                raise ValueError(f"record({kind!r}): structure_id must be a string")
+            rec.structure_id = structure_id
+        else:
+            rec.structure.CopyFrom(_record_structure(structure))
+        rec.properties_json = _json_object(properties, "properties")
+        rec.conditions_json = _json_object(conditions, "conditions")
+        rec.convergence_json = _json_object(convergence, "convergence")
+        rec.uncertainty_json = _json_object(uncertainty, "uncertainty")
+        m = _record_method(method)
+        if m is not None:
+            rec.method.CopyFrom(m)
+        if isinstance(outputs, (str, OutputRef)):
+            outputs = [outputs]
+        for o in outputs:
+            name = o.name if isinstance(o, OutputRef) else o
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"record({kind!r}): output names must be non-empty strings, got {o!r}")
+            rec.output_names.append(name)
+        if isinstance(input_artifacts, str):
+            input_artifacts = [input_artifacts]
+        for a in input_artifacts:
+            if not isinstance(a, str) or not a:
+                raise ValueError(f"record({kind!r}): input_artifacts must be artifact id strings, got {a!r}")
+            rec.input_artifacts.append(a)
+        if not isinstance(note, str):
+            raise ValueError(f"record({kind!r}): note must be a string")
+        rec.note = note
+        size = _record_json_size(rec)
+        if self._records_json_bytes + size > MAX_RECORDS_JSON_BYTES:
+            raise ValueError(f"record({kind!r}): records would exceed {MAX_RECORDS_JSON_BYTES} bytes of JSON "
+                             f"({self._records_json_bytes} + {size})")
+        self._records.append(rec)
+        self._records_json_bytes += size
+        out = record_pb2.CalcRecord()
+        out.CopyFrom(rec)
+        return out
+
+    @property
+    def records(self) -> list:
+        """CalcRecords added with ``record`` so far (copies)."""
+        out = []
+        for r in self._records:
+            c = record_pb2.CalcRecord()
+            c.CopyFrom(r)
+            out.append(c)
+        return out
+
+    def _check_record_outputs(self, outputs: list[OutputRef]) -> None:
+        names = {ref.name for ref in outputs}
+        for i, rec in enumerate(self._records):
+            for n in rec.output_names:
+                if n not in names:
+                    avail = ", ".join(sorted(names)) or "none"
+                    raise WorkerError(f"record {i} ({rec.kind}): {n!r} is not an output of this result "
+                                      f"(outputs: {avail})")
 
     # -- result assembly ----------------------------------------------------
 
@@ -1075,6 +1292,8 @@ class Worker:
             value = fn(context)
             outcome = self._normalize(context, value)
             outputs = context._collect_outputs(outcome.artifacts) if outcome.success else []
+            if outcome.success:
+                context._check_record_outputs(outputs)
         except WorkerError as exc:  # includes Cancelled
             res.success, res.retryable = False, exc.retryable
             res.error = f"{type(exc).__name__}: {exc}"
@@ -1090,6 +1309,7 @@ class Worker:
             for ref in outputs:
                 res.outputs.add(path=ref.path, media_type=ref.media_type, name=ref.name)
             res.spawn.extend(context._spawned)
+            res.records.extend(context._records)
         else:
             res.error = outcome.error or "task reported failure"
             res.retryable = bool(outcome.retryable)

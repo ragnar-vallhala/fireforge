@@ -12,6 +12,7 @@
 #include <map>
 #include <set>
 
+#include "materials.hpp"
 #include "util.hpp"
 #include "workflows.hpp"
 
@@ -635,6 +636,13 @@ UpdateOutcome JobStore::update_job(const std::string& job_id, const std::string&
             return out;
         }
 
+        // Records come with the COMPLETED update only (phase8.md §2).
+        if (!u.records().empty() && u.state() != tv1::COMPLETED) {
+            out.result = UpdateResult::kInvalid;
+            out.message = "records are allowed only with a COMPLETED update";
+            return out;
+        }
+
         // Ends the attempt. Gang: the reporting member takes the attempt's state,
         // every other live member is revoked (its node learns via renew_leases).
         auto end_attempt = [&](const char* state, const std::string& error) {
@@ -738,13 +746,28 @@ UpdateOutcome JobStore::update_job(const std::string& job_id, const std::string&
                 if (!u.spawn().empty()) {
                     if (wf.empty()) invalid = "only workflow steps may spawn";
                     else invalid = wf_->prepare_spawn(wf, step, u.spawn(), exp);
+                    if (!invalid.empty()) invalid = "invalid spawn: " + invalid;
+                }
+                // Records (phase8.md §2), validated before anything is written.
+                MaterialStore::Context rctx;
+                if (invalid.empty() && !u.records().empty()) {
+                    rctx.job_id = job_id;
+                    rctx.attempt_id = cur_attempt;
+                    rctx.workflow_id = wf;
+                    rctx.step = step;
+                    rctx.node_id = node_id;
+                    rctx.campaign_id =
+                        c_.exec("SELECT coalesce(campaign_id, '') FROM jobs WHERE job_id = $1", job_id).str(0, 0);
+                    for (const auto& o : carrier.outputs())
+                        if (!o.name().empty()) rctx.outputs.try_emplace(o.name(), o.artifact_id());
+                    if (auto e = mat_->validate(u.records(), rctx); !e.empty()) invalid = "invalid records: " + e;
                 }
                 c_.exec("UPDATE jobs SET outputs = coalesce(($2::jsonb) -> 'outputs', '[]'::jsonb) WHERE job_id = $1",
                         job_id, json);
                 upsert_locations(node_id, json, "outputs", "", now_ms);
                 if (!invalid.empty()) {
-                    // Outputs are kept; the job fails for good.
-                    const std::string err = "invalid spawn: " + invalid;
+                    // Outputs are kept; the job fails for good (nothing spawned, no records).
+                    const std::string& err = invalid;
                     end_attempt("FAILED", err);
                     set_job(tv1::FAILED, err);
                     engine(tv1::FAILED, err, nullptr);
@@ -754,6 +777,7 @@ UpdateOutcome JobStore::update_job(const std::string& job_id, const std::string&
                     return out;
                 }
                 end_attempt("SUCCEEDED", "");
+                if (!u.records().empty()) mat_->store(u.records(), rctx, now_ms);
                 c_.exec("UPDATE jobs SET state = 'COMPLETED', last_error = '', progress_fraction = 1, updated_at = " TS(2)
                         " WHERE job_id = $1",
                         job_id, now_ms);

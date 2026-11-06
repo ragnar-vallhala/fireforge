@@ -119,6 +119,8 @@ public:
     // fenced RUNNING JobUpdate with `checkpoint` (name set) and announce it.
     // Leases with spec.resume_checkpoint fetch it like an input before submit.
     // COMPLETED updates carry named outputs (JobStatus.outputs) and JobStatus.spawn.
+    // Phase 8: they also carry JobStatus.records; a COMPLETED update answered
+    // 400 is replaced by FAILED (not retryable) with the control plane's error.
     void on_checkpoint(const std::string& local_job_id, const tv1::NamedArtifact& checkpoint);
 
     // Phase 7: gang leases. A lease with `gang` runs as a local job:

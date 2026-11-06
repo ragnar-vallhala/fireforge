@@ -1,0 +1,215 @@
+{
+ "format": "fireforge.literature.v1",
+ "description": "Literature reference values for the Phase 8 half-Heusler validation set (phase8.md \u00a78). Each non-null value carries a DOI that was resolved via Crossref and checked against the paper text or abstract. confidence: A = value in that paper's own data, B = quoted from a cited primary source not read, C = approximate (figure/text approximation). kind 'total' means total thermal conductivity, not kappa_l (electronic part small for undoped samples, not verified). Null values are unverified; see notes.",
+ "compounds": {
+  "ZrNiSn": {
+   "roles": [
+    "Zr",
+    "Ni",
+    "Sn"
+   ],
+   "lattice_constant_angstrom": {
+    "value": 6.11,
+    "doi": "10.2320/matertrans.47.1453",
+    "citation": "Muta et al., Mater. Trans. 47, 1453 (2006)",
+    "note": "arc-melted, SPS, annealed 1073 K 1 week polycrystal (Table 1, 0.6110 nm); a Ni-rich Sn-flux crystal gives 6.1033(2) A (Fu et al., Adv. Sci. 2020, doi:10.1002/advs.201902409)",
+    "confidence": "A"
+   },
+   "band_gap_pbe_ev": {
+    "value": 0.52,
+    "doi": "10.1002/advs.77630",
+    "citation": "Kumar, Sahni, Neophytou, Adv. Sci. (2026)",
+    "note": "QE + ONCV, PBE; character from Raghuvanshi et al., J. Mater. Chem. A (2020), doi:10.1039/D0TA06810A (PBE: VBM Gamma, CBM X)",
+    "character": "indirect",
+    "transition": "Gamma-X",
+    "functional": "PBE",
+    "confidence": "A"
+   },
+   "kappa_l_300k_w_mk": {
+    "value": 10.1,
+    "doi": "10.2320/matertrans.47.1453",
+    "citation": "Muta et al., Mater. Trans. 47, 1453 (2006)",
+    "note": "undoped, room temperature (Table 2); measured kappa_l is strongly sample-dependent (~10 down to <5 W/m/K with Ni excess / fine grains)",
+    "kind": "lattice",
+    "confidence": "A"
+   },
+   "zt_peak": {
+    "value": 1.1,
+    "doi": "10.1021/acsami.9b12599",
+    "citation": "Chauhan et al., ACS Appl. Mater. Interfaces (2019)",
+    "note": "Hf-free ZrNi1.03Sn; Hf-alloyed record: Zr0.75Hf0.25NiSn0.99Sb0.01 ZT 1.33 at 873 K (Ai et al., Nat. Commun. 2025, doi:10.1038/s41467-025-61868-x)",
+    "type": "n",
+    "t_k": 873,
+    "composition": "ZrNi1.03Sn",
+    "confidence": "A (abstract)"
+   }
+  },
+  "HfNiSn": {
+   "roles": [
+    "Hf",
+    "Ni",
+    "Sn"
+   ],
+   "lattice_constant_angstrom": {
+    "value": 6.083,
+    "doi": "10.1103/PhysRevB.92.125436",
+    "citation": "Holuj et al., Phys. Rev. B 92, 125436 (2015)",
+    "note": "bulk value quoted from Jeitschko, Metall. Trans. 1, 3159 (1970), doi:10.1007/BF03038432 (primary not read)",
+    "confidence": "B"
+   },
+   "band_gap_pbe_ev": {
+    "value": 0.39,
+    "doi": "10.1002/advs.77630",
+    "citation": "Kumar, Sahni, Neophytou, Adv. Sci. (2026)",
+    "note": "QE + ONCV, PBE; character from Raghuvanshi et al., J. Mater. Chem. A (2020), doi:10.1039/D0TA06810A (PBE: VBM Gamma, CBM X)",
+    "character": "indirect",
+    "transition": "Gamma-X",
+    "functional": "PBE",
+    "confidence": "A"
+   },
+   "kappa_l_300k_w_mk": {
+    "value": null,
+    "doi": null,
+    "citation": null,
+    "note": "no verified single value; only a second-hand range of 6.7-10 W/m/K total kappa (Holuj 2015 citing Uher et al., PRB 59, 8615 (1999))",
+    "kind": "lattice"
+   },
+   "zt_peak": {
+    "value": 1.0,
+    "doi": "10.1002/aenm.201100126",
+    "citation": "Joshi et al., Adv. Energy Mater. (2011)",
+    "note": "nanostructured, hot pressed; 600-700 C",
+    "type": "n",
+    "t_k": 923,
+    "composition": "Hf0.75Zr0.25NiSn0.99Sb0.01",
+    "confidence": "A (abstract)"
+   }
+  },
+  "TiNiSn": {
+   "roles": [
+    "Ti",
+    "Ni",
+    "Sn"
+   ],
+   "lattice_constant_angstrom": {
+    "value": 5.9304,
+    "doi": "10.3390/ma11040536",
+    "citation": "Barczak et al., Materials 11, 536 (2018)",
+    "note": "solid-state + hot pressed, Rietveld (Table 1); 5.926 A extrapolated without interstitial Ni",
+    "confidence": "A"
+   },
+   "band_gap_pbe_ev": {
+    "value": 0.45,
+    "doi": "10.1002/advs.77630",
+    "citation": "Kumar, Sahni, Neophytou, Adv. Sci. (2026)",
+    "note": "QE + ONCV, PBE; also 0.45 eV PBE in Zahedifar & Kratzer, PRB 97, 035204 (2018); character from Raghuvanshi et al., J. Mater. Chem. A (2020), doi:10.1039/D0TA06810A (PBE: VBM Gamma, CBM X)",
+    "character": "indirect",
+    "transition": "Gamma-X",
+    "functional": "PBE",
+    "confidence": "A"
+   },
+   "kappa_l_300k_w_mk": {
+    "value": 6.0,
+    "doi": "10.3390/ma11040536",
+    "citation": "Barczak et al., Materials 11, 536 (2018)",
+    "note": "at 323 K, kappa - L T/rho; 88 % dense sample without porosity correction (likely low)",
+    "kind": "lattice",
+    "confidence": "A"
+   },
+   "zt_peak": {
+    "value": 0.9,
+    "doi": "10.1039/d4cc06695b",
+    "citation": "Kennedy et al., Chem. Commun. (2025)",
+    "note": "Cu-interstitial TiNiSn",
+    "type": "n",
+    "t_k": 723,
+    "composition": "TiNiCu0.03Sn",
+    "confidence": "A"
+   }
+  },
+  "NbFeSb": {
+   "roles": [
+    "Nb",
+    "Fe",
+    "Sb"
+   ],
+   "lattice_constant_angstrom": {
+    "value": 5.95,
+    "doi": "10.1063/5.0018260",
+    "citation": "Tian et al., J. Appl. Phys. (2020)",
+    "note": "experimental value quoted from Tian et al., PCCP 20, 21960 (2018), doi:10.1039/C8CP04287J (primary not read); also 5.95 A in Zeeshan et al., PRMaterials 2, 065407 (2018)",
+    "confidence": "B"
+   },
+   "band_gap_pbe_ev": {
+    "value": 0.51,
+    "doi": "10.1039/D5MH00228A",
+    "citation": "Sahni et al., Mater. Horiz. (2025)",
+    "note": "QE PBE, no SOC; other codes 0.54-0.55 eV (Tian et al., Mater. Today Phys. 2021, doi:10.1016/j.mtphys.2020.100278)",
+    "character": "indirect",
+    "transition": "L-X",
+    "functional": "PBE",
+    "confidence": "A"
+   },
+   "kappa_l_300k_w_mk": {
+    "value": 14.0,
+    "doi": "10.1038/s41467-018-08223-5",
+    "citation": "Zhu et al., Nat. Commun. 10, 270 (2019)",
+    "note": "TOTAL kappa of undoped NbFeSb at room temperature (data in Suppl. Fig. 8); ~17 W/m/K quoted elsewhere (Zhu et al., Nat. Commun. 2018)",
+    "kind": "total",
+    "confidence": "C"
+   },
+   "zt_peak": {
+    "value": 1.5,
+    "doi": "10.1038/ncomms9144",
+    "citation": "Fu et al., Nat. Commun. 6, 8144 (2015)",
+    "note": "levitation melting + SPS; also FeNb0.86Hf0.14Sb",
+    "type": "p",
+    "t_k": 1200,
+    "composition": "FeNb0.88Hf0.12Sb",
+    "confidence": "A"
+   }
+  },
+  "ZrCoSb": {
+   "roles": [
+    "Zr",
+    "Co",
+    "Sb"
+   ],
+   "lattice_constant_angstrom": {
+    "value": 6.0648,
+    "doi": "10.2320/matertrans.46.1481",
+    "citation": "Sekimoto et al., Mater. Trans. 46, 1481 (2005)",
+    "note": "arc-melted, room-temperature XRD, small CoZr2/Zr impurities",
+    "confidence": "A"
+   },
+   "band_gap_pbe_ev": {
+    "value": 1.073,
+    "doi": "10.1016/j.heliyon.2019.e01155",
+    "citation": "Joshi et al., Heliyon 5, e01155 (2019)",
+    "note": "WIEN2k PBE at relaxed a = 6.0912 A; character from VBM at L (Zhu et al. 2018, Duan et al. 2026), CBM location not verified - least solid gap entry",
+    "character": "indirect",
+    "transition": "L-?",
+    "functional": "PBE",
+    "confidence": "B"
+   },
+   "kappa_l_300k_w_mk": {
+    "value": 19.0,
+    "doi": "10.1038/s41467-018-04958-3",
+    "citation": "Zhu et al., Nat. Commun. 9, 2497 (2018)",
+    "note": "TOTAL kappa of undoped ZrCoSb at room temperature, quoted from He et al., Mater. Today Phys. 1, 24 (2017), doi:10.1016/j.mtphys.2017.05.002",
+    "kind": "total",
+    "confidence": "C"
+   },
+   "zt_peak": {
+    "value": 1.2,
+    "doi": "10.1021/jacs.6c12433",
+    "citation": "Duan et al., J. Am. Chem. Soc. (2026)",
+    "note": "Co-deficient, Sn-doped, Hf-alloyed ZrCoSb (exact formula not in abstract); ZrCoBi family: 1.42 at 973 K (Zhu et al., Nat. Commun. 2018)",
+    "type": "p",
+    "t_k": 973,
+    "composition": "Zr(Hf)Co(1-x)Sb(Sn)",
+    "confidence": "A (abstract)"
+   }
+  }
+ }
+}

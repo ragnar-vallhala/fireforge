@@ -8,4 +8,4 @@ tools/build.sh -B "$BUILD" -t tdrctl
 tools/build.sh -B "$BUILD" -t tdr-launch
 tools/build.sh -B "$BUILD" -t tdrcp
 [[ -f sdk/python/fireforge/control/v1/control_pb2.py ]] || tools/gen_proto.sh
-TDR_BUILD="$PWD/$BUILD" PYTHONPATH=sdk/python exec tools/capped .venv/bin/python -m pytest tests/e2e "$@"
+TDR_BUILD="$PWD/$BUILD" PYTHONPATH=sdk/python:science exec tools/capped .venv/bin/python -m pytest tests/e2e "$@"

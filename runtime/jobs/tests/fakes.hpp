@@ -130,7 +130,8 @@ public:
         return out;
     }
     bool commit_outputs(const std::string& job_id, const std::string& attempt_id,
-                        const std::vector<v1::NamedArtifact>& outs, const std::vector<v1::StepSpec>& spawn) override {
+                        const std::vector<v1::NamedArtifact>& outs, const std::vector<v1::StepSpec>& spawn,
+                        const std::vector<v1::CalcRecord>& records) override {
         auto it = jobs.find(job_id);
         if (it == jobs.end() || it->second.state != v1::COMMITTING || it->second.current_attempt_id != attempt_id) {
             return false;
@@ -142,6 +143,7 @@ public:
                 it->second.output_artifacts.push_back(o.artifact_id());
         }
         it->second.spawn = spawn;
+        it->second.records = records;
         it->second.state = v1::COMPLETED;
         it->second.updated_unix_ms = unix_ms();
         attempts.at(attempt_id).state = AttemptState::kSucceeded;

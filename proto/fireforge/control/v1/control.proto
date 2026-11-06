@@ -6,6 +6,7 @@ syntax = "proto3";
 package fireforge.control.v1;
 
 import "fireforge/tdr/v1/job.proto";
+import "fireforge/tdr/v1/record.proto";
 
 // ---- nodes ----------------------------------------------------------------
 
@@ -306,6 +307,8 @@ message JobUpdate {
   // ---- Phase 6 ----
   repeated fireforge.tdr.v1.StepSpec spawn = 9;  // COMPLETED only: fan-out (phase6.md §5)
   ArtifactRef checkpoint = 10;     // RUNNING only: new latest checkpoint (name set)
+  // ---- Phase 8 ----
+  repeated fireforge.tdr.v1.CalcRecord records = 11;  // COMPLETED only: stored with the update (phase8.md §2)
 }
 
 message LeaseRequest {

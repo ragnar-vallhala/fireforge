@@ -21,7 +21,8 @@
 // pull loop and their inputs are protected_inputs().
 //
 // Phase 6 (phase6.md §5, §6): COMPLETED updates carry named outputs
-// (ArtifactRef.name from JobStatus.outputs) and JobStatus.spawn. A checkpoint
+// (ArtifactRef.name from JobStatus.outputs), JobStatus.spawn and (Phase 8)
+// JobStatus.records. A checkpoint
 // of a leased job queues a fenced RUNNING update with `checkpoint`; an unsent
 // one for the same lease is replaced instead (coalesced). A lease's
 // spec.resume_checkpoint is fetched like an input and protected while waiting.
@@ -36,13 +37,14 @@
 // file is removed once the lease's outcome is queued.
 //
 // State file (RemoteOptions::state_file, replaced atomically: tmp + fsync +
-// rename), version 4 (version 1 files, which lack "submitted"/"spec", are
+// rename), version 5 (version 1 files, which lack "submitted"/"spec", are
 // read as all submitted; version 2 files are read as is: v3 only adds the
 // Phase 6 JobUpdate fields, spawn/checkpoint/output names, inside "update";
-// v4 only adds the optional lease fields "gang" and "gang_file"):
+// v4 only adds the optional lease fields "gang" and "gang_file"; v5 only adds
+// the Phase 8 JobUpdate.records inside "update"):
 //
 //   {
-//     "version": 4,
+//     "version": 5,
 //     "leases": [                      // mapping, keyed by local job id
 //       {"local_job_id": "job-x.a2", "job_id": "job-x", "attempt_id": "att-...",
 //        "fencing_token": 2, "attempt_number": 2,
@@ -59,7 +61,9 @@
 //   }
 //
 // A mapping entry is removed once its terminal update is acknowledged (2xx),
-// or dropped (409 / 404 / other 4xx). On start(), a non-terminal lease with no
+// or dropped (409 / 404 / other 4xx). Exception (phase8.md §2): a COMPLETED
+// update answered 400 (invalid records, spawn, ...) is replaced by a FAILED,
+// not retryable, update of the same attempt carrying the control plane's error. On start(), a non-terminal lease with no
 // local job is "local job lost" if it was submitted, else its inputs are
 // fetched again (resuming .part files) and it runs: on on_registered() or
 // set_fetcher(), whichever comes first with a fetcher (or no inputs needed). Missing file = empty state; an
@@ -177,7 +181,7 @@ bool bool_field(const json::object& o, std::string_view key, bool dflt = false) 
 // JobManager::submit: "input artifact not found locally: ..." or
 // "resume checkpoint not found locally: ...".
 constexpr std::string_view kInputMissing = "not found locally";
-constexpr std::uint64_t kStateVersion = 4;
+constexpr std::uint64_t kStateVersion = 5;
 
 std::uint32_t clamp32(std::uint64_t v) {
     return v > std::numeric_limits<std::uint32_t>::max() ? std::numeric_limits<std::uint32_t>::max()
@@ -846,6 +850,7 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
             case tv1::COMPLETED: {
                 Pending& p = queue_outcome(local, l, tv1::COMPLETED, {}, false, named_outputs_of(st));
                 for (const auto& sp : st.spawn()) *p.update.add_spawn() = sp;
+                for (const auto& rec : st.records()) *p.update.add_records() = rec;
                 break;
             }
             case tv1::FAILED: queue_outcome(local, l, tv1::FAILED, st.last_error(), true, {}); break;
@@ -968,6 +973,26 @@ struct RemoteExecutor::Impl : std::enable_shared_from_this<Impl> {
         const std::string sname = tv1::JobState_Name(p.update.state());
         if (!r) {
             const int s = r.error().http_status;
+            if (s == 400 && p.update.state() == tv1::COMPLETED) {
+                // The result itself is invalid (phase8.md §2): the job fails, not retryable.
+                const std::string err = "control plane rejected the result: " + describe(r.error());
+                last_error = "status update: " + describe(r.error());
+                log_error("remote: COMPLETED update for job {} rejected ({}); reporting FAILED", p.job_id,
+                          describe(r.error()));
+                Pending f;
+                f.job_id = p.job_id;
+                f.local_id = p.local_id;
+                f.terminal = true;
+                f.update.set_attempt_id(p.update.attempt_id());
+                f.update.set_fencing_token(p.update.fencing_token());
+                f.update.set_state(tv1::FAILED);
+                f.update.set_error(err);
+                f.update.set_retryable(false);
+                outbox.push_front(std::move(f));
+                save();
+                send_next_update();
+                return;
+            }
             if (s == 409 || s == 404) {
                 ++stale_updates;
                 log_warn("remote: {} update for job {} (attempt {}) is stale ({}); dropped", sname, p.job_id,

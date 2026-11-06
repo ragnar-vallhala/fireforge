@@ -194,6 +194,45 @@ rank without a size variable (bare PMIx): size 0 = unknown.
   `command.env`/`env=`). Typical pattern: rank 0 reads params/inputs and
   broadcasts them (e.g. with mpi4py).
 
+## Calculation records (Phase 8)
+
+A task attaches calculation records to its result; they reach the control
+plane's materials database with the job's COMPLETED update
+(`docs/design/phase8.md` §2). They only count if the attempt succeeds.
+
+```python
+ref = context.save_output("relaxed", relaxed.to_json())
+context.record(
+    "qe.relax",
+    structure=relaxed,                  # dict (tdr.v1.Structure JSON), record_pb2.Structure,
+                                        # or an object with to_proto()/to_json()
+    properties={"energy_ev": -812.3, "pressure_kbar": 0.4},   # units in key names
+    conditions={"pressure_gpa": 0},
+    method={"solver": "quantum-espresso", "solver_version": "7.2", "engine": "qe",
+            "functional": "PBE", "pseudopotentials": ["Zr.upf md5:..."],
+            "preset": "screening", "settings": {"ecutwfc_ry": 45}},   # or settings_json="..."
+    outputs=[ref],                      # names (or OutputRef) of this job's outputs
+    convergence={"steps": 12}, uncertainty=None, input_artifacts=[], note="")
+context.record("te.evaluate", structure_id="st-...", properties={"zt_peak": 1.2})
+```
+
+`context.record(kind, *, structure=None, structure_id=None, properties=None,
+conditions=None, method=None, outputs=(), input_artifacts=(), convergence=None,
+uncertainty=None, note="")` returns the `record_pb2.CalcRecord` (a copy);
+`context.records` lists them. Checked client-side (`ValueError`): `kind`
+1..64 chars; exactly one of `structure` / `structure_id`; JSON fields are
+dicts (or a JSON object string) without NaN/infinity; `method` keys limited
+to solver, solver_version, engine, functional, pseudopotentials, preset,
+settings / settings_json; at most `MAX_RECORDS` (64) records and
+`MAX_RECORDS_JSON_BYTES` (256 KiB) of record JSON per result. When the
+result is built, every name in `outputs` must be an output of the result,
+else the attempt fails (`WorkerError`, not retryable). Evidence is always
+PREDICTED. tdrd re-checks the limits (a violation fails the job, not
+retryable), and so does the control plane (400: the node reports the job
+FAILED, not retryable). In a detached context (non-root MPI rank)
+`record` is a no-op and returns None. Local jobs show the records in
+`tdrctl status`.
+
 ## Testing
 
 `fireforge.testing.FakeDaemon` plays the daemon side on a temp Unix socket:
@@ -209,7 +248,8 @@ with FakeDaemon("transport.calculate", {"t": 300}) as d:
 
 Phase 6 options: `add_input(data, name=...)`, `FakeDaemon(workflow_id=, step=,
 checkpoint_enabled=, resume_checkpoint=b"..." | Path, checkpoint_error="msg")`;
-recorded: `d.checkpoints`, `d.checkpoint_files`, `d.spawned`.
+recorded: `d.checkpoints`, `d.checkpoint_files`, `d.spawned`. Phase 8: `d.records`
+(CalcRecords of the result).
 
 Phase 7: `d.run_worker(script, mpi_rank=1, mpi_size=4, mpi_flavour="ompi"|"pmi"|"pmix")`
 simulates an MPI rank (`fireforge.testing.mpi_env(rank, size, flavour=,

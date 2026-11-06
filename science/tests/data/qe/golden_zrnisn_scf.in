@@ -1,0 +1,40 @@
+&CONTROL
+  calculation = 'scf'
+  prefix = 'ff'
+  outdir = './tmp'
+  pseudo_dir = '/pseudo'
+  disk_io = 'low'
+  tprnfor = .true.
+  tstress = .true.
+/
+&SYSTEM
+  ibrav = 0
+  nat = 3
+  ntyp = 3
+  ecutwfc = 60.0
+  ecutrho = 480.0
+  occupations = 'smearing'
+  smearing = 'mv'
+  degauss = 0.01
+  nspin = 2
+  starting_magnetization(2) = 0.5
+/
+&ELECTRONS
+  conv_thr = 3d-9
+  mixing_beta = 0.4
+  electron_maxstep = 200
+/
+ATOMIC_SPECIES
+  Zr 91.224000 Zr_pbe_v1.uspp.F.UPF
+  Ni 58.693400 ni_pbe_v1.4.uspp.F.UPF
+  Sn 118.710000 Sn_pbe_v1.uspp.F.UPF
+CELL_PARAMETERS angstrom
+      0.0000000000     3.0565000000     3.0565000000
+      3.0565000000     0.0000000000     3.0565000000
+      3.0565000000     3.0565000000     0.0000000000
+ATOMIC_POSITIONS crystal
+  Zr    0.0000000000    0.0000000000    0.0000000000
+  Ni    0.2500000000    0.2500000000    0.2500000000
+  Sn    0.5000000000    0.5000000000    0.5000000000
+K_POINTS automatic
+  8 8 8 0 0 0

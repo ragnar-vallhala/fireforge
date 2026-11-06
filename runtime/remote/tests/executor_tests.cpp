@@ -726,7 +726,7 @@ BOOST_FIXTURE_TEST_CASE(corrupt_state_file_is_moved_aside, Fixture) {
     make();
     BOOST_TEST(exec->active_leases().empty());
     BOOST_TEST(fs::exists(ropts.state_file.string() + ".corrupt"));
-    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);  // rewritten empty
+    BOOST_TEST(state_file_text().find("\"version\":5") != std::string::npos);  // rewritten empty
 }
 
 BOOST_FIXTURE_TEST_CASE(full_artifact_sync_pages, Fixture) {
@@ -1029,7 +1029,7 @@ BOOST_FIXTURE_TEST_CASE(version1_state_file_is_read, Fixture) {
     exec->on_registered("ff-node-1");
     BOOST_REQUIRE(run_until([&] { return has_terminal_update("old"); }));
     BOOST_TEST(last_update("old")->error() == "local job lost");
-    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);
+    BOOST_TEST(state_file_text().find("\"version\":5") != std::string::npos);
 }
 
 BOOST_FIXTURE_TEST_CASE(announce_reaches_client, Fixture) {
@@ -1125,7 +1125,7 @@ BOOST_FIXTURE_TEST_CASE(named_outputs_and_spawn_survive_executor_restart, Fixtur
     BOOST_REQUIRE(run_until([&] { return mgr->status("job-p.a1")->state() == tv1::COMPLETED; }));
     BOOST_REQUIRE(run_until([&] { return exec->stats().pending_updates == 1u; }));
     BOOST_TEST(state_file_text().find("cand-2") != std::string::npos);
-    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);
+    BOOST_TEST(state_file_text().find("\"version\":5") != std::string::npos);
     // job-q completes while no executor runs: start() queues it from the
     // JobManager's status (journal).
     exec.reset();
@@ -1502,7 +1502,7 @@ BOOST_FIXTURE_TEST_CASE(gang_info_survives_executor_restart, GangFixture) {
     BOOST_REQUIRE(run_until([&] { return !update_states("job-r").empty() && exec->stats().pending_updates == 0; }));
     const fs::path file = ropts.gang_dir / (l.attempt_id() + ".json");
     BOOST_TEST(fs::exists(file));
-    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);
+    BOOST_TEST(state_file_text().find("\"version\":5") != std::string::npos);
     exec.reset();
     make_executor();
     auto g = exec->gang_by_id(l.attempt_id());
@@ -1531,7 +1531,112 @@ BOOST_FIXTURE_TEST_CASE(version3_state_file_is_read, Fixture) {
     exec->on_registered("ff-node-1");
     BOOST_REQUIRE(run_until([&] { return has_terminal_update("v3"); }));
     BOOST_TEST(last_update("v3")->state() == tv1::COMPLETED);
-    BOOST_TEST(state_file_text().find("\"version\":4") != std::string::npos);
+    BOOST_TEST(state_file_text().find("\"version\":5") != std::string::npos);
+}
+
+// ---- Phase 8: calculation records ---------------------------------------------------
+
+namespace {
+tv1::WorkerResult records_result(const std::string& att) {
+    tv1::WorkerResult r = named_result(att);
+    auto* c = r.add_records();
+    c->set_kind("qe.relax");
+    c->mutable_structure()->set_reduced_formula("NaCl");
+    c->mutable_structure()->set_fingerprint("fp1:abc");
+    c->set_properties_json(R"({"energy_ev":-3.25})");
+    c->mutable_method()->set_engine("toy");
+    c->add_output_names("greeting");
+    auto* c2 = r.add_records();
+    c2->set_kind("te.evaluate-record");
+    c2->set_structure_id("st-1");
+    return r;
+}
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(completion_carries_records, Fixture) {
+    make();
+    lease_once({make_lease("job-r", kWaitForGo)});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return update_states("job-r").size() == 1u && exec->stats().pending_updates == 0; }));
+    BOOST_TEST(last_update("job-r")->records_size() == 0);  // RUNNING
+    const fs::path wd = workdir_of(*mgr, tmp.path / "work", "job-r.a1");
+    const auto r = records_result(mgr->status("job-r.a1")->current_attempt_id());
+    BOOST_REQUIRE(mgr->on_worker_result(r).has_value());
+    std::ofstream(wd / "go") << "";
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-r"); }));
+    const auto* u = last_update("job-r");
+    BOOST_TEST(u->state() == tv1::COMPLETED);
+    BOOST_REQUIRE(u->records_size() == 2);
+    BOOST_TEST(u->records(0).SerializeAsString() == r.records(0).SerializeAsString());
+    BOOST_TEST(u->records(1).structure_id() == "st-1");
+    BOOST_TEST(u->outputs(0).name() == "greeting");
+}
+
+BOOST_FIXTURE_TEST_CASE(records_survive_executor_restart, Fixture) {
+    capacity = {4, 1024 * kMiB, 3};
+    make();
+    lease_once({make_lease("job-p", kWaitForGo), make_lease("job-q", kWaitForGo)});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] {
+        return update_states("job-p").size() == 1u && update_states("job-q").size() == 1u &&
+               exec->stats().pending_updates == 0;
+    }));
+    // job-p: COMPLETED update waits in the persisted outbox.
+    connected = false;
+    BOOST_REQUIRE(mgr->on_worker_result(records_result(mgr->status("job-p.a1")->current_attempt_id())).has_value());
+    std::ofstream(workdir_of(*mgr, tmp.path / "work", "job-p.a1") / "go") << "";
+    BOOST_REQUIRE(run_until([&] { return mgr->status("job-p.a1")->state() == tv1::COMPLETED; }));
+    BOOST_REQUIRE(run_until([&] { return exec->stats().pending_updates == 1u; }));
+    BOOST_TEST(state_file_text().find("te.evaluate-record") != std::string::npos);
+    // job-q completes with no executor running, then the whole node restarts
+    // (new manager over the same journal): records come from the journal.
+    exec.reset();
+    BOOST_REQUIRE(mgr->on_worker_result(records_result(mgr->status("job-q.a1")->current_attempt_id())).has_value());
+    std::ofstream(workdir_of(*mgr, tmp.path / "work", "job-q.a1") / "go") << "";
+    BOOST_REQUIRE(run_until([&] { return mgr->status("job-q.a1")->state() == tv1::COMPLETED; }));
+    mgr.reset();
+    journal.reset();
+    connected = true;
+    make();
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return has_terminal_update("job-p") && has_terminal_update("job-q"); }));
+    for (const auto* id : {"job-p", "job-q"}) {
+        const auto* u = last_update(id);
+        BOOST_TEST(u->state() == tv1::COMPLETED, id);
+        BOOST_REQUIRE(u->records_size() == 2);
+        BOOST_TEST(u->records(0).kind() == "qe.relax", id);
+        BOOST_TEST(u->records(0).output_names(0) == "greeting", id);
+        BOOST_TEST(u->records(1).kind() == "te.evaluate-record", id);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(rejected_completion_is_reported_failed_not_retryable, Fixture) {
+    make();
+    client.updates.auto_reply = [](const FakeClient::Update& u) {
+        if (u.update.state() == tv1::COMPLETED) {
+            return std::optional<Result<cv1::Job>>(fail<cv1::Job>(400, "record 0: unknown structure_id"));
+        }
+        cv1::Job j;
+        j.set_job_id(u.job_id);
+        return std::optional<Result<cv1::Job>>(j);
+    };
+    lease_once({make_lease("job-x", kWaitForGo)});
+    exec->on_registered("ff-node-1");
+    BOOST_REQUIRE(run_until([&] { return update_states("job-x").size() == 1u && exec->stats().pending_updates == 0; }));
+    BOOST_REQUIRE(mgr->on_worker_result(records_result(mgr->status("job-x.a1")->current_attempt_id())).has_value());
+    std::ofstream(workdir_of(*mgr, tmp.path / "work", "job-x.a1") / "go") << "";
+    BOOST_REQUIRE(run_until([&] { return update_states("job-x").size() == 3u && exec->stats().pending_updates == 0; }));
+    BOOST_TEST(update_states("job-x") == (std::vector<tv1::JobState>{tv1::RUNNING, tv1::COMPLETED, tv1::FAILED}),
+               boost::test_tools::per_element());
+    const auto* u = last_update("job-x");
+    BOOST_TEST(!u->retryable());
+    BOOST_TEST(u->attempt_id() == "att-job-x-1");
+    BOOST_TEST(u->fencing_token() == 1u);
+    BOOST_TEST(u->records_size() == 0);
+    BOOST_TEST(u->error().find("unknown structure_id") != std::string::npos);
+    BOOST_TEST(exec->active_leases().empty());
+    BOOST_TEST(state_file_text().find("job-x") == std::string::npos);
+    BOOST_TEST(mgr->status("job-x.a1")->state() == tv1::COMPLETED);  // local result stays
 }
 
 BOOST_AUTO_TEST_SUITE_END()

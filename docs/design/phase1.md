@@ -241,6 +241,9 @@ run for minutes to days, so durability wins and `synchronous=FULL` stays.
 
 - `journal::update_attempt_process` also moves the attempt to `kRunning`.
 - `journal::commit_outputs` sets COMPLETED itself; the job manager emits the listener event.
+- Phase 8: `JobRecord.records` and a defaulted `records` argument of
+  `journal::commit_outputs` (calculation records stored with the outputs;
+  journal schema v3 adds `jobs.records_pb`).
 - `ipc::Connection::close()` drops queued writes; send a final ERROR and let the peer hang up.
 - The supervisor moves every process in its cgroup into `<root>/daemon` at
   construction, so `tdrd` creates it before anything else. Don't install a

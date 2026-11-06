@@ -1,0 +1,68 @@
+// Phase 8: materials database API payloads (docs/design/phase8.md §2), proto3 JSON.
+syntax = "proto3";
+
+package fireforge.control.v1;
+
+import "fireforge/tdr/v1/record.proto";
+
+message Material {
+  string material_id = 1;          // "mat-<hex>"
+  string reduced_formula = 2;      // unique
+  repeated string elements = 3;    // sorted
+  int64 created_unix_ms = 4;
+  uint32 structure_count = 5;
+  uint32 calculation_count = 6;
+  repeated StructureInfo structures = 7;      // GET /materials/{id} only
+  repeated Calculation latest = 8;            // GET /materials/{id} only: newest per kind
+}
+
+message StructureInfo {
+  string structure_id = 1;         // "st-<hex>"
+  string material_id = 2;
+  fireforge.tdr.v1.Structure structure = 3;
+  string source_job_id = 4;
+  int64 created_unix_ms = 5;
+}
+
+message NamedArtifactId {
+  string name = 1;
+  string artifact_id = 2;
+}
+
+message Calculation {
+  string calc_id = 1;              // "calc-<hex>"
+  string structure_id = 2;
+  string material_id = 3;
+  string reduced_formula = 4;
+  string kind = 5;
+  string properties_json = 6;
+  string conditions_json = 7;
+  fireforge.tdr.v1.Method method = 8;
+  string convergence_json = 9;
+  string uncertainty_json = 10;
+  fireforge.tdr.v1.Evidence evidence = 11;
+  repeated NamedArtifactId outputs = 12;   // output_names resolved to artifact ids
+  repeated string input_artifacts = 13;
+  string job_id = 14;
+  string attempt_id = 15;
+  string workflow_id = 16;
+  string step = 17;
+  string campaign_id = 18;
+  string node_id = 19;
+  string note = 20;
+  int64 created_unix_ms = 21;
+}
+
+message MaterialList { repeated Material materials = 1; }
+message CalculationList {
+  repeated Calculation calculations = 1;
+  string next = 2;                 // pass as ?after= for the next page ("" = end)
+}
+
+// POST /api/v1/calculations:import (admin). evidence LITERATURE or MEASURED;
+// structure inline (or structure_id). campaign_id optional.
+message ImportCalculationsRequest {
+  repeated fireforge.tdr.v1.CalcRecord records = 1;
+  string campaign_id = 2;
+}
+message ImportCalculationsReply { repeated string calc_ids = 1; }

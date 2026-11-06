@@ -15,7 +15,7 @@ namespace tdr::journal {
 
 namespace {
 
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 3;
 constexpr int kBusyTimeoutMs = 5000;
 
 constexpr const char* kSchemaV1 = R"sql(
@@ -83,10 +83,16 @@ ALTER TABLE jobs ADD COLUMN checkpoint_size INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN checkpoint_media_type TEXT NOT NULL DEFAULT '';
 )sql";
 
+// Phase 8: calculation records of the committed attempt (phase8.md §2),
+// serialized JobStatus holding only `records` (binary protobuf); empty = none.
+constexpr const char* kSchemaV3 = R"sql(
+ALTER TABLE jobs ADD COLUMN records_pb BLOB NOT NULL DEFAULT x'';
+)sql";
+
 constexpr const char* kJobColumns =
     "job_id, spec, state, attempts_used, current_attempt_id, last_error, created_ms, updated_ms, "
     "progress_fraction, progress_message, spawn_json, checkpoint_id, checkpoint_name, checkpoint_size, "
-    "checkpoint_media_type";
+    "checkpoint_media_type, records_pb";
 
 // spawn_json holds the JSON array of StepSpec (proto3 JSON, proto field names);
 // "" = none. Encoded through the JobStatus.spawn field, the only repeated
@@ -117,6 +123,22 @@ std::vector<v1::StepSpec> spawn_from_json(const std::string& job_id, const std::
         throw JournalError("journal: corrupt spawn list for job " + job_id);
     }
     return {holder.spawn().begin(), holder.spawn().end()};
+}
+
+std::string records_to_blob(const std::vector<v1::CalcRecord>& records) {
+    if (records.empty()) return {};
+    v1::JobStatus holder;
+    for (const auto& r : records) *holder.add_records() = r;
+    std::string out;
+    if (!holder.SerializeToString(&out)) throw JournalError("journal: cannot encode records");
+    return out;
+}
+
+std::vector<v1::CalcRecord> records_from_blob(const std::string& job_id, const std::string& blob) {
+    if (blob.empty()) return {};
+    v1::JobStatus holder;
+    if (!holder.ParseFromString(blob)) throw JournalError("journal: corrupt records for job " + job_id);
+    return {holder.records().begin(), holder.records().end()};
 }
 
 std::vector<v1::NamedArtifact> unnamed(const std::vector<std::string>& ids) {
@@ -307,7 +329,7 @@ public:
         Tx tx(db_);
         {
             auto s = stmt(std::format("INSERT INTO jobs ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, "
-                                      "?11, ?12, ?13, ?14, ?15)",
+                                      "?11, ?12, ?13, ?14, ?15, ?16)",
                                       kJobColumns));
             s->bind(1, job.job_id).bind_blob(2, spec).bind(3, static_cast<int>(job.state));
             s->bind(4, job.attempts_used).bind(5, job.current_attempt_id).bind(6, job.last_error);
@@ -316,6 +338,7 @@ public:
             s->bind(11, spawn_to_json(job.spawn));
             s->bind(12, job.checkpoint.artifact_id()).bind(13, job.checkpoint.name());
             s->bind(14, job.checkpoint.size()).bind(15, job.checkpoint.media_type());
+            s->bind_blob(16, records_to_blob(job.records));
             s->exec();
         }
         write_outputs(job.job_id, job.outputs.empty() ? unnamed(job.output_artifacts) : job.outputs);
@@ -477,16 +500,19 @@ public:
 
     bool commit_outputs(const std::string& job_id, const std::string& attempt_id,
                         const std::vector<v1::NamedArtifact>& outputs,
-                        const std::vector<v1::StepSpec>& spawn) override {
+                        const std::vector<v1::StepSpec>& spawn,
+                        const std::vector<v1::CalcRecord>& records) override {
         const std::string spawn_json = spawn_to_json(spawn);
+        const std::string records_blob = records_to_blob(records);
         Tx tx(db_);
         const std::int64_t now = unix_ms();
         {
             auto s = stmt(
-                "UPDATE jobs SET state = ?4, updated_ms = ?5, spawn_json = ?6 "
+                "UPDATE jobs SET state = ?4, updated_ms = ?5, spawn_json = ?6, records_pb = ?7 "
                 "WHERE job_id = ?1 AND state = ?2 AND current_attempt_id = ?3 AND ?3 <> ''");
             s->bind(1, job_id).bind(2, static_cast<int>(v1::COMMITTING)).bind(3, attempt_id);
             s->bind(4, static_cast<int>(v1::COMPLETED)).bind(5, now).bind(6, spawn_json);
+            s->bind_blob(7, records_blob);
             s->exec();
         }
         if (sqlite3_changes(db_) != 1) return false;  // Tx dtor rolls back (nothing changed anyway)
@@ -583,6 +609,7 @@ private:
         Tx tx(db_);
         if (version < 1) exec_sql(db_, kSchemaV1);
         if (version < 2) exec_sql(db_, kSchemaV2);
+        if (version < 3) exec_sql(db_, kSchemaV3);
         exec_sql(db_, std::format("PRAGMA user_version = {}", kSchemaVersion).c_str());
         tx.commit();
     }
@@ -639,6 +666,7 @@ private:
         j.checkpoint.set_name(s.text(12));
         j.checkpoint.set_size(static_cast<std::uint64_t>(s.i64(13)));
         j.checkpoint.set_media_type(s.text(14));
+        j.records = records_from_blob(j.job_id, s.blob(15));
         return j;
     }
 

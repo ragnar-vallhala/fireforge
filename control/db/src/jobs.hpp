@@ -8,12 +8,15 @@
 namespace tdr::cpdb {
 
 class WorkflowStore;
+class MaterialStore;
 
 class JobStore {
 public:
     explicit JobStore(pg::Conn& c) : c_(c) {}
     // The workflow engine runs inside job transitions (phase6.md §4).
     void set_workflows(WorkflowStore* wf) { wf_ = wf; }
+    // COMPLETED updates store their records (phase8.md §2).
+    void set_materials(MaterialStore* m) { mat_ = m; }
 
     std::expected<cv1::Job, std::string> create_job(const tv1::JobSpec& spec, const std::string& submitted_by,
                                                     std::int64_t now_ms);
@@ -74,6 +77,7 @@ private:
 
     pg::Conn& c_;
     WorkflowStore* wf_ = nullptr;
+    MaterialStore* mat_ = nullptr;
     // Threshold for jobs.strict; updated by every place_jobs call.
     std::uint64_t strict_bytes_ = PlacementOptions{}.strict_input_bytes;
     GangOptions gang_;
