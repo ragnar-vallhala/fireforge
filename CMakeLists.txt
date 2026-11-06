@@ -55,6 +55,7 @@ add_subdirectory(runtime/remote)
 add_subdirectory(runtime/gang)
 add_subdirectory(control/db)
 add_subdirectory(control/api)
+add_subdirectory(control/ui)
 
 # Executables.
 add_subdirectory(runtime/daemon)

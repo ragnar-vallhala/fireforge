@@ -1,0 +1,500 @@
+{
+ "calculations": [
+  {
+   "calc_id": "calc-45b042b25a62b2e2",
+   "structure_id": "st-7ebeda93657573d1",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "qe.relax",
+   "properties_json": "{\"energy_ev\": -8242.678620063514, \"a_angstrom\": 6.150253516385458, \"pressure_kbar\": 0.13291700592779135, \"magnetization_mub\": 0.0000005469437051973869, \"energy_ev_per_atom\": -2747.5595400211714, \"volume_a3_per_atom\": 19.386428504689576, \"magnetization_mub_per_atom\": 0.00000018231456839912896}",
+   "conditions_json": "{\"fix_cell\": false, \"pressure_kbar\": 0.0}",
+   "method": {
+    "solver": "quantum-espresso",
+    "solver_version": "6.7MaX",
+    "engine": "qe",
+    "functional": "PBE",
+    "preset": "screening",
+    "settings_json": "{\"calculation\":\"vc-relax\",\"conv_thr_ry\":3.0000000000000004e-09,\"cpus\":4,\"degauss_ry\":0.01,\"ecutrho_ry\":480.0,\"ecutwfc_ry\":60.0,\"fix_cell\":false,\"forc_conv_thr_ry_bohr\":0.0001,\"kmesh\":[8,8,8],\"nspin\":2,\"preset\":\"screening\",\"press_conv_thr_kbar\":0.5,\"smearing\":\"mv\",\"starting_magnetization\":{\"Ni\":0.5,\"Sn\":0.0,\"Zr\":0.0}}"
+   },
+   "convergence_json": "{\"steps\": 3, \"converged\": true}",
+   "uncertainty_json": "{}",
+   "outputs": [
+    {
+     "name": "energy",
+     "artifact_id": "artifact://sha256/7a8f6ecb96af11250977ca06d84860478cc2999ad99e73abd250f058cd91ee13"
+    },
+    {
+     "name": "log",
+     "artifact_id": "artifact://sha256/d28e8a40bcec4ac4f1c6dc3d06f0c1c1f59ec43235cdab2f5ee6686dbeef02f2"
+    },
+    {
+     "name": "structure",
+     "artifact_id": "artifact://sha256/3af2326da9078ff358b3e4abf582dc932c0b399377d416b4c4be713b47ad25ca"
+    }
+   ],
+   "job_id": "job-9bfcf0793db7395e",
+   "attempt_id": "att-256db5952f4652a6",
+   "workflow_id": "wf-e3988d44d56f0017",
+   "step": "ZrNiSn.relax",
+   "campaign_id": "camp-0e851725149fbd2b",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793967049854"
+  },
+  {
+   "calc_id": "calc-cb7b665ce32d033e",
+   "structure_id": "st-50ab47a71ec8afb0",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "literature.zt_peak",
+   "properties_json": "{\"zt_peak\": 1.1, \"carrier_type\": \"n\"}",
+   "conditions_json": "{\"t_k\": 873, \"composition\": \"ZrNi1.03Sn\"}",
+   "method": {},
+   "convergence_json": "{}",
+   "uncertainty_json": "{}",
+   "evidence": "LITERATURE",
+   "campaign_id": "camp-0e851725149fbd2b",
+   "note": "Chauhan et al., ACS Appl. Mater. Interfaces (2019) doi:10.1021/acsami.9b12599 Hf-free ZrNi1.03Sn; Hf-alloyed record: Zr0.75Hf0.25NiSn0.99Sb0.01 ZT 1.33 at 873 K (Ai et al., Nat. Commun. 2025, doi:10.1038/s41467-025-61868-x)",
+   "created_unix_ms": "1793965643884"
+  },
+  {
+   "calc_id": "calc-671747726defd336",
+   "structure_id": "st-50ab47a71ec8afb0",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "literature.kappa_l",
+   "properties_json": "{\"quantity\": \"lattice\", \"kappa_l_w_mk_300k\": 10.1}",
+   "conditions_json": "{}",
+   "method": {},
+   "convergence_json": "{}",
+   "uncertainty_json": "{}",
+   "evidence": "LITERATURE",
+   "campaign_id": "camp-0e851725149fbd2b",
+   "note": "Muta et al., Mater. Trans. 47, 1453 (2006) doi:10.2320/matertrans.47.1453 undoped, room temperature (Table 2); measured kappa_l is strongly sample-dependent (~10 down to <5 W/m/K with Ni excess / fine grains)",
+   "created_unix_ms": "1793965643884"
+  },
+  {
+   "calc_id": "calc-8548fc50917aace4",
+   "structure_id": "st-50ab47a71ec8afb0",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "literature.band_gap",
+   "properties_json": "{\"character\": \"indirect\", \"functional\": \"PBE\", \"band_gap_ev\": 0.52}",
+   "conditions_json": "{}",
+   "method": {},
+   "convergence_json": "{}",
+   "uncertainty_json": "{}",
+   "evidence": "LITERATURE",
+   "campaign_id": "camp-0e851725149fbd2b",
+   "note": "Kumar, Sahni, Neophytou, Adv. Sci. (2026) doi:10.1002/advs.77630 QE + ONCV, PBE; character from Raghuvanshi et al., J. Mater. Chem. A (2020), doi:10.1039/D0TA06810A (PBE: VBM Gamma, CBM X)",
+   "created_unix_ms": "1793965643884"
+  },
+  {
+   "calc_id": "calc-54340404404e4865",
+   "structure_id": "st-50ab47a71ec8afb0",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "literature.lattice",
+   "properties_json": "{\"a_angstrom\": 6.11}",
+   "conditions_json": "{}",
+   "method": {},
+   "convergence_json": "{}",
+   "uncertainty_json": "{}",
+   "evidence": "LITERATURE",
+   "campaign_id": "camp-0e851725149fbd2b",
+   "note": "Muta et al., Mater. Trans. 47, 1453 (2006) doi:10.2320/matertrans.47.1453 arc-melted, SPS, annealed 1073 K 1 week polycrystal (Table 1, 0.6110 nm); a Ni-rich Sn-flux crystal gives 6.1033(2) A (Fu et al., Adv. Sci. 2020, doi:10.1002/advs.201902409)",
+   "created_unix_ms": "1793965643884"
+  },
+  {
+   "calc_id": "calc-1fc71b8671595e9e",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "te.validation",
+   "properties_json": "{\"gap_pass\": true, \"stable_pass\": false, \"lattice_pass\": true, \"kappa_bte_pass\": false, \"kappa_bte_ratio\": 0.07048991842988311, \"gap_deviation_ev\": 0.03199999999999992, \"kappa_slack_pass\": false, \"kappa_slack_ratio\": 0.0029739223720627126, \"gap_character_pass\": false, \"lattice_deviation_rel\": -0.0036158786564643376}",
+   "conditions_json": "{}",
+   "method": {
+    "solver": "fireforge_science.validate",
+    "engine": "toy",
+    "settings_json": "{\"tolerances\":{\"lattice_rel\":0.02,\"gap_ev\":0.2,\"kappa_slack_factor\":3.0,\"kappa_bte_factor\":1.5,\"kappa_rank_min_fraction\":0.75},\"reference\":\"literature_halfheusler.json\"}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{}",
+   "outputs": [
+    {
+     "name": "report.json",
+     "artifact_id": "artifact://sha256/fbf2191fdb161a31da48afbe69857690b2ad127b9b2c9cb8bd6eb596e13eb88a"
+    },
+    {
+     "name": "report.md",
+     "artifact_id": "artifact://sha256/dcdb4f704dd2091ecbe25284bc81af87b9e0c5a492669d61856d25fc824cf7e8"
+    }
+   ],
+   "job_id": "job-953bcf8c01d095ed",
+   "attempt_id": "att-30754f40ec4ca25d",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "validate",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793964529571"
+  },
+  {
+   "calc_id": "calc-6467dec7ae84f7e2",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "te.evaluate",
+   "properties_json": "{\"toxicity\": 1, \"zt_peak_n\": 1.9292979880181793, \"zt_peak_p\": 2.6887028408277733, \"t_peak_n_k\": 1050.0, \"t_peak_p_k\": 1100.0, \"band_gap_ev\": 0.5519999999999999, \"born_stable\": true, \"cost_usd_kg\": 25.859338250677336, \"screen_pass\": false, \"kappa_l_300k\": 0.7119481761418195, \"zt_avg_low_n\": 0.339091580853166, \"zt_avg_low_p\": 0.4017900694962933, \"zt_avg_high_n\": 1.8124811137941563, \"zt_avg_high_p\": 2.448782980484473, \"pf_peak_uw_cmk2\": 55.89301974622645, \"zt_avg_extreme_n\": 1.809196457134084, \"zt_avg_extreme_p\": 2.620431741511147, \"abundance_ppm_min\": 2.3, \"doping_peak_n_cm3\": 100000000000000000000, \"doping_peak_p_cm3\": 177800000000000000000, \"pf_peak_n_uw_cmk2\": 36.978243663323525, \"pf_peak_p_uw_cmk2\": 55.89301974622645, \"dynamically_stable\": false, \"formation_ev_per_atom\": -0.785340034308041, \"zt_avg_intermediate_n\": 1.117231744771727, \"zt_avg_intermediate_p\": 1.3861797689653808, \"e_above_hull_ev_per_atom\": 0.0}",
+   "conditions_json": "{\"t_k_max\": 1200.0, \"t_k_min\": 300.0, \"kappa_source\": \"bte\"}",
+   "method": {
+    "solver": "fireforge_science.evaluate",
+    "engine": "toy",
+    "preset": "screening",
+    "settings_json": "{\"tau_s\":1e-14,\"kappa_source\":\"bte\",\"thresholds\":{\"dynamically_stable\":true,\"born_stable\":true,\"e_above_hull_max_ev\":0.1,\"band_gap_min_ev\":0.05,\"zt_peak_min\":0.3},\"crta\":true}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{\"crta\": true, \"tau_s\": 0.00000000000001, \"kappa_l_factor\": null}",
+   "outputs": [
+    {
+     "name": "evaluation",
+     "artifact_id": "artifact://sha256/aad3a0bfe59371c5286cec15355989df5b1e456134de0cfe1a07019fd4a873e2"
+    }
+   ],
+   "job_id": "job-d37bb7dd0c33e233",
+   "attempt_id": "att-63a1455510275a30",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.evaluate/evaluate.bte",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "note": "ZT under CRTA with assumed tau; scales with tau",
+   "created_unix_ms": "1793964529134"
+  },
+  {
+   "calc_id": "calc-a5819a2a11472feb",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "phonon.bte",
+   "properties_json": "{\"kappa_l_w_mk_300k\": 0.7119481761418195, \"kappa_l_w_mk_500k\": 0.4319052259830462, \"kappa_l_w_mk_800k\": 0.270990652316784, \"kappa_l_w_mk_1100k\": 0.19731735932881353}",
+   "conditions_json": "{\"t_k\": [300.0, 500.0, 800.0, 1100.0], \"mesh\": [11, 11, 11]}",
+   "method": {
+    "solver": "phono3py",
+    "solver_version": "4.10.0",
+    "engine": "toy",
+    "functional": "toy",
+    "preset": "screening",
+    "settings_json": "{\"amplitude_a\":0.03,\"cutoff_pair_a\":4.0,\"forces\":{\"settings\":{\"kmesh\":[4,4,4],\"model\":\"morse+cosine-bands\",\"preset\":\"screening\"},\"solver\":\"toy\",\"solver_version\":\"toy-1\"},\"mesh\":[11,11,11],\"method\":\"RTA\",\"phonon_supercell\":[[2,0,0],[0,2,0],[0,0,2]],\"supercell\":[[2,0,0],[0,2,0],[0,0,2]]}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{\"model\": \"phono3py-rta\", \"cutoff_pair_a\": 4.0}",
+   "outputs": [
+    {
+     "name": "kappa3",
+     "artifact_id": "artifact://sha256/61cc8e1e34d4cb8fd9b73ea55d831478eb7794f78368da1fc69bdad783d6ea43"
+    }
+   ],
+   "job_id": "job-49cc8fcb4fad6a13",
+   "attempt_id": "att-e5284380f5b7584e",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.evaluate/fc3/kappa3",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793964528277"
+  },
+  {
+   "calc_id": "calc-8710a1724b889ae9",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "te.evaluate",
+   "properties_json": "{\"toxicity\": 1, \"zt_peak_n\": 4.702982834347892, \"zt_peak_p\": 4.970538997822166, \"t_peak_n_k\": 600.0, \"t_peak_p_k\": 650.0, \"band_gap_ev\": 0.5519999999999999, \"born_stable\": true, \"cost_usd_kg\": 25.859338250677336, \"screen_pass\": false, \"kappa_l_300k\": 0.030036615957833395, \"zt_avg_low_n\": 2.6950748751030846, \"zt_avg_low_p\": 2.8483384644993612, \"zt_avg_high_n\": 2.747487330024245, \"zt_avg_high_p\": 3.4577987598865474, \"pf_peak_uw_cmk2\": 55.89301974622645, \"zt_avg_extreme_n\": 2.1216278847387717, \"zt_avg_extreme_p\": 3.041356348353071, \"abundance_ppm_min\": 2.3, \"doping_peak_n_cm3\": 10000000000000000000, \"doping_peak_p_cm3\": 17780000000000000000, \"pf_peak_n_uw_cmk2\": 36.978243663323525, \"pf_peak_p_uw_cmk2\": 55.89301974622645, \"dynamically_stable\": false, \"formation_ev_per_atom\": -0.785340034308041, \"zt_avg_intermediate_n\": 4.071799404221961, \"zt_avg_intermediate_p\": 4.458373592502242, \"e_above_hull_ev_per_atom\": 0.0}",
+   "conditions_json": "{\"t_k_max\": 1200.0, \"t_k_min\": 300.0, \"kappa_source\": \"slack\"}",
+   "method": {
+    "solver": "fireforge_science.evaluate",
+    "engine": "toy",
+    "preset": "screening",
+    "settings_json": "{\"tau_s\":1e-14,\"kappa_source\":\"slack\",\"thresholds\":{\"dynamically_stable\":true,\"born_stable\":true,\"e_above_hull_max_ev\":0.1,\"band_gap_min_ev\":0.05,\"zt_peak_min\":0.3},\"crta\":true}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{\"crta\": true, \"tau_s\": 0.00000000000001, \"kappa_l_factor\": 2.0}",
+   "outputs": [
+    {
+     "name": "evaluation",
+     "artifact_id": "artifact://sha256/0d91fd95cdeb6f593888e4e310cd65e59043be1a5ad7b403b32762e766b1dc4e"
+    }
+   ],
+   "job_id": "job-f468404cc85a006b",
+   "attempt_id": "att-0847f4472b36abd1",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.evaluate",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "note": "ZT under CRTA with assumed tau; scales with tau",
+   "created_unix_ms": "1793964489732"
+  },
+  {
+   "calc_id": "calc-1ab42c06602abe6f",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "transport.crta",
+   "properties_json": "{\"tau_s\": 0.00000000000001, \"band_gap_ev\": 0.5519999999999999, \"t_pf_max_n_k\": 1200.0, \"t_pf_max_p_k\": 1200.0, \"doping_opt_n_cm3\": 1000000000000000000000, \"doping_opt_p_cm3\": 1000000000000000000000, \"pf_max_n_uw_cmk2\": 36.978243663323525, \"pf_max_p_uw_cmk2\": 55.89301974622648, \"seebeck_n_uv_k_300k\": -29.675309463486993, \"seebeck_n_uv_k_800k\": -79.105853329569, \"seebeck_p_uv_k_300k\": 54.992720790969166, \"seebeck_p_uv_k_800k\": 129.41285974829103, \"pf_max_n_over_tau_w_mk2s\": 369782436633.2352, \"pf_max_p_over_tau_w_mk2s\": 558930197462.2648}",
+   "conditions_json": "{\"t_k_max\": 1200.0, \"t_k_min\": 300.0, \"doping_cm3_max\": 1000000000000000000000, \"doping_cm3_min\": 1000000000000000000}",
+   "method": {
+    "solver": "BoltzTraP2",
+    "solver_version": "26.3.1",
+    "engine": "toy",
+    "functional": "toy",
+    "preset": "screening",
+    "settings_json": "{\"lpfac\":5,\"npts\":4000,\"erange_ev\":1.5,\"tau_s\":1e-14,\"crta\":true,\"n_equivalences\":2121,\"bands\":{\"solver\":\"toy\",\"solver_version\":\"toy-1\",\"preset\":\"screening\",\"model\":\"morse+cosine-bands\",\"kmesh_dense\":[23,23,23],\"nbands\":4,\"nk_irreducible\":364}}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{\"crta\": true, \"tau_s\": 0.00000000000001}",
+   "outputs": [
+    {
+     "name": "transport",
+     "artifact_id": "artifact://sha256/e14e2a1a2c32f184e819cdc2aac55b2e6b6611e7caf656a5cd594ab656c43569"
+    }
+   ],
+   "job_id": "job-abba3fb4b14f7753",
+   "attempt_id": "att-ae74a1a2335bcc16",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.transport",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "note": "constant relaxation time approximation: sigma and kappa_e scale with the assumed tau; not absolute conductivities",
+   "created_unix_ms": "1793964488801"
+  },
+  {
+   "calc_id": "calc-39c7a37e9d769319",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "phonon.slack",
+   "properties_json": "{\"gruneisen\": 30.774509936919884, \"theta_a_k\": 215.8786539204739, \"theta_d_k\": 311.3508958553452, \"kappa_l_w_mk_300k\": 0.030036615957833395, \"kappa_l_w_mk_500k\": 0.018021969574700036, \"kappa_l_w_mk_800k\": 0.011263730984187523, \"kappa_l_w_mk_1100k\": 0.008191804352136381, \"kappa_l_times_t_w_m\": 9.010984787350019}",
+   "conditions_json": "{\"t_k\": [300.0, 500.0, 800.0, 1100.0], \"gruneisen_source\": \"qha\"}",
+   "method": {
+    "solver": "phonopy",
+    "solver_version": "4.10.0",
+    "engine": "toy",
+    "functional": "toy",
+    "preset": "screening",
+    "settings_json": "{\"amplitude_a\":0.01,\"forces\":{\"settings\":{\"kmesh\":[4,4,4],\"model\":\"morse+cosine-bands\",\"preset\":\"screening\"},\"solver\":\"toy\",\"solver_version\":\"toy-1\"},\"gruneisen\":\"dD/dlnV over volumes, acoustic RMS\",\"mesh\":[20,20,20],\"supercell\":[[2,0,0],[0,2,0],[0,0,2]],\"volume_strains\":[-0.02,0.0,0.02]}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{\"model\": \"slack\", \"factor\": 2}",
+   "outputs": [
+    {
+     "name": "phonon",
+     "artifact_id": "artifact://sha256/3c623aca2b659dbf8a5df801a519941861ccd083a948951497e4ce09fc401ded"
+    }
+   ],
+   "job_id": "job-8855ee65cce5cc48",
+   "attempt_id": "att-2e716eeaf840aff5",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.phonon/collect",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793964422248"
+  },
+  {
+   "calc_id": "calc-21c0f073adf29171",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "phonon.harmonic",
+   "properties_json": "{\"v_l_m_s\": 4031.7616044517513, \"v_s_m_s\": 1682.3549098738426, \"v_t_m_s\": 1481.732041116743, \"gruneisen\": 30.774509936919884, \"theta_a_k\": 215.8786539204739, \"theta_d_k\": 311.3508958553452, \"max_freq_thz\": 7.946584772223411, \"min_freq_thz\": -0.61404, \"theta_d_sound_k\": 188.35908446136926, \"gruneisen_cv_300k\": 5.426581720404983, \"dynamically_stable\": false, \"theta_d_debye_fit_k\": 212.41397538146785, \"gruneisen_acoustic_mean\": 12.548310405811819}",
+   "conditions_json": "{\"mesh\": [20, 20, 20], \"volume_strains\": [-0.02, 0.0, 0.02], \"reference_strain\": 0.0}",
+   "method": {
+    "solver": "phonopy",
+    "solver_version": "4.10.0",
+    "engine": "toy",
+    "functional": "toy",
+    "preset": "screening",
+    "settings_json": "{\"amplitude_a\":0.01,\"forces\":{\"settings\":{\"kmesh\":[4,4,4],\"model\":\"morse+cosine-bands\",\"preset\":\"screening\"},\"solver\":\"toy\",\"solver_version\":\"toy-1\"},\"gruneisen\":\"dD/dlnV over volumes, acoustic RMS\",\"mesh\":[20,20,20],\"supercell\":[[2,0,0],[0,2,0],[0,0,2]],\"volume_strains\":[-0.02,0.0,0.02]}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{}",
+   "outputs": [
+    {
+     "name": "fc2",
+     "artifact_id": "artifact://sha256/73f62dac7f7232e9ee11f6d493fbd03b2bd769af9f0a652b349f602a6186f59e"
+    },
+    {
+     "name": "phonon",
+     "artifact_id": "artifact://sha256/3c623aca2b659dbf8a5df801a519941861ccd083a948951497e4ce09fc401ded"
+    }
+   ],
+   "job_id": "job-8855ee65cce5cc48",
+   "attempt_id": "att-2e716eeaf840aff5",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.phonon/collect",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793964422248"
+  },
+  {
+   "calc_id": "calc-2dd4fea1038e679b",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "qe.bands",
+   "properties_json": "{\"cbm_ev\": 0.5519999999999999, \"nbands\": 4, \"nelect\": 4.0, \"vbm_ev\": 0.0, \"fermi_ev\": 0.27599999999999997, \"gap_direct\": true, \"band_gap_ev\": 0.5519999999999999, \"nk_irreducible\": 364, \"spin_polarized\": false}",
+   "conditions_json": "{}",
+   "method": {
+    "solver": "toy",
+    "solver_version": "toy-1",
+    "engine": "toy",
+    "functional": "toy",
+    "preset": "screening",
+    "settings_json": "{\"kmesh_dense\":[23,23,23],\"model\":\"morse+cosine-bands\",\"nbands\":4,\"nk_irreducible\":364,\"preset\":\"screening\"}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{}",
+   "outputs": [
+    {
+     "name": "bands",
+     "artifact_id": "artifact://sha256/a8c33b3c1ace10c1dadbaf1433765d17cd82c2fa901fc39bfc015d11da9e3799"
+    },
+    {
+     "name": "log",
+     "artifact_id": "artifact://sha256/70d426aa54d4397486019c245e9a04eae385eb77954c94e00ddd37b83b5e63e6"
+    }
+   ],
+   "job_id": "job-5106f2d5eb5c7481",
+   "attempt_id": "att-e95dac758f56eb13",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.nscf",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793964419594"
+  },
+  {
+   "calc_id": "calc-c4560505127b0b91",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "stability.formation",
+   "properties_json": "{\"on_hull\": true, \"hull_phases\": [\"Ni\", \"Sn\", \"Zr\", \"ZrNiSn\"], \"formation_ev_per_atom\": -0.785340034308041, \"e_above_hull_ev_per_atom\": 0.0}",
+   "conditions_json": "{\"pressure_gpa\": 0, \"temperature_k\": 0}",
+   "method": {
+    "solver": "pymatgen.PhaseDiagram",
+    "solver_version": "2026.10.24",
+    "engine": "toy",
+    "preset": "screening",
+    "settings_json": "{\"n_entries\":4,\"references\":{\"Co\":-3.212151212100209,\"Fe\":-3.031484278264762,\"Hf\":-1.9239875374054929,\"Nb\":-2.050796715465318,\"Ni\":-3.276538352734855,\"Sb\":-2.726490045597865,\"Sn\":-1.596908169781547,\"Ti\":-2.1787117944295598,\"Zr\":-1.9239875374054929}}"
+   },
+   "convergence_json": "{}",
+   "uncertainty_json": "{}",
+   "outputs": [
+    {
+     "name": "stability",
+     "artifact_id": "artifact://sha256/6405e4afccc322359f315ec7871471a49f2fc0e7b3f399b5d46901e71f8ea8ec"
+    }
+   ],
+   "job_id": "job-8c5ba83c782d7dcb",
+   "attempt_id": "att-2fd048bbf99c65a3",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.formation",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "note": "hull vs the elements and compounds given to this step only",
+   "created_unix_ms": "1793964417923"
+  },
+  {
+   "calc_id": "calc-712bcab443e527fc",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "stability.elastic",
+   "properties_json": "{\"v_l\": 4516.770203269229, \"v_m\": 2242.295013498606, \"v_t\": 1986.201421967041, \"c11_gpa\": 204.61229997853576, \"c12_gpa\": 77.29431331140995, \"c44_gpa\": 18.499811281184165, \"bulk_gpa\": 119.73364220045188, \"shear_gpa\": 31.19621824929233, \"born_stable\": true, \"theta_d_elastic_k\": 251.05085339179126}",
+   "conditions_json": "{}",
+   "method": {
+    "solver": "toy",
+    "solver_version": "toy-1",
+    "engine": "toy",
+    "functional": "toy",
+    "preset": "screening",
+    "settings_json": "{\"model\":\"morse+cosine-bands\",\"preset\":\"screening\",\"relax_ions\":true,\"strain\":0.01}"
+   },
+   "convergence_json": "{\"strain\": 0.01, \"relax_ions\": true}",
+   "uncertainty_json": "{}",
+   "outputs": [
+    {
+     "name": "elastic",
+     "artifact_id": "artifact://sha256/c81e55b56f8e5967d249c7bda3ecda3f1290cace2223f1f4529f6c487830c817"
+    }
+   ],
+   "job_id": "job-effd8ec51a0c6919",
+   "attempt_id": "att-0bc80a12ec52e3c2",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.elastic",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793964416034"
+  },
+  {
+   "calc_id": "calc-9a366e926f38c699",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "qe.scf",
+   "properties_json": "{\"fermi_ev\": 0.27599999999999997, \"energy_ev\": -9.153454162846018, \"pressure_kbar\": -0.000000021494780468127423, \"energy_ev_per_atom\": -3.0511513876153393}",
+   "conditions_json": "{}",
+   "method": {
+    "solver": "toy",
+    "solver_version": "toy-1",
+    "engine": "toy",
+    "functional": "toy",
+    "preset": "screening",
+    "settings_json": "{\"kmesh\":[8,8,8],\"model\":\"morse+cosine-bands\",\"preset\":\"screening\"}"
+   },
+   "convergence_json": "{\"converged\": true}",
+   "uncertainty_json": "{}",
+   "outputs": [
+    {
+     "name": "log",
+     "artifact_id": "artifact://sha256/d91ece81fa3b26ac1df4035702a530a13e8556060ceda852967ba81a984fc2b9"
+    },
+    {
+     "name": "save",
+     "artifact_id": "artifact://sha256/fa475411da70c0ca84ae3506b9fe6cb3e61cad89c447300c5fff198c6a70285f"
+    }
+   ],
+   "job_id": "job-40eeca6b06de277b",
+   "attempt_id": "att-4a738ce1d381a181",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.scf",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793964415452"
+  },
+  {
+   "calc_id": "calc-18bcbeee64fc9b28",
+   "structure_id": "st-cb6413b4b4e5314b",
+   "material_id": "mat-2ca105572a0e89c6",
+   "reduced_formula": "ZrNiSn",
+   "kind": "qe.relax",
+   "properties_json": "{\"energy_ev\": -9.153454162846018, \"a_angstrom\": 6.087906981409003, \"pressure_kbar\": -0.00000002149470478695896, \"magnetization_mub\": 0.0, \"energy_ev_per_atom\": -3.0511513876153393, \"volume_a3_per_atom\": 18.802810898191336, \"magnetization_mub_per_atom\": 0.0}",
+   "conditions_json": "{\"fix_cell\": false, \"pressure_kbar\": 0.0}",
+   "method": {
+    "solver": "toy",
+    "solver_version": "toy-1",
+    "engine": "toy",
+    "functional": "toy",
+    "preset": "screening",
+    "settings_json": "{\"fix_cell\":false,\"kmesh\":[8,8,8],\"model\":\"morse+cosine-bands\",\"preset\":\"screening\"}"
+   },
+   "convergence_json": "{\"steps\": 4, \"converged\": true}",
+   "uncertainty_json": "{}",
+   "outputs": [
+    {
+     "name": "energy",
+     "artifact_id": "artifact://sha256/e614679f879f93130ec870773e6774e7333ee51c7788db9a18bfe973819ebb94"
+    },
+    {
+     "name": "log",
+     "artifact_id": "artifact://sha256/417ac332c98ee28e0f48ec6f03148912cba3c1fed0c8e57168abb5f5b987800d"
+    },
+    {
+     "name": "structure",
+     "artifact_id": "artifact://sha256/0a83d68a1ffd1da0552f87bb78abbcb7ef57ea769b830f868111d5706b3f1b0c"
+    }
+   ],
+   "job_id": "job-f94b126170b81c45",
+   "attempt_id": "att-3d8d3b30872ef82a",
+   "workflow_id": "wf-1db237cbfb7b2002",
+   "step": "ZrNiSn.relax",
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "created_unix_ms": "1793964414062"
+  }
+ ]
+}

@@ -1,0 +1,733 @@
+{
+"workflow_id": "wf-1db237cbfb7b2002",
+"name": "te-validation-toy-screening",
+"state": "SUCCEEDED",
+"submitted_by": "admin:admin",
+"created_unix_ms": "1793964394636",
+"updated_unix_ms": "1793964529571",
+"finished_unix_ms": "1793964529571",
+"step_counts": {
+"COMPLETED": 228
+},
+"steps": [
+{
+"name": "ref.Zr",
+"state": "COMPLETED",
+"job_id": "job-53de028147eaf2c7",
+"spec": {
+"name": "ref.Zr",
+"inputs": []
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964402916"
+},
+{
+"name": "refrelax.Zr",
+"state": "COMPLETED",
+"job_id": "job-e4825493d1d13c54",
+"spec": {
+"name": "refrelax.Zr",
+"inputs": [
+{
+"step": "ref.Zr",
+"output": "structure",
+"input_name": "structure"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964413764"
+},
+{
+"name": "ZrNiSn.build",
+"state": "COMPLETED",
+"job_id": "job-2ae39ec762c60949",
+"spec": {
+"name": "ZrNiSn.build",
+"inputs": []
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964402987"
+},
+{
+"name": "ZrNiSn.relax",
+"state": "COMPLETED",
+"job_id": "job-f94b126170b81c45",
+"spec": {
+"name": "ZrNiSn.relax",
+"inputs": [
+{
+"step": "ZrNiSn.build",
+"output": "cand.ZrNiSn.y4c",
+"input_name": "structure"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964414062"
+},
+{
+"name": "ZrNiSn.formation",
+"state": "COMPLETED",
+"job_id": "job-8c5ba83c782d7dcb",
+"spec": {
+"name": "ZrNiSn.formation",
+"inputs": [
+{
+"step": "ZrNiSn.relax",
+"output": "energy",
+"input_name": "compound"
+},
+{
+"step": "refrelax.Zr",
+"output": "energy",
+"input_name": "ref.Zr"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964417923"
+},
+{
+"name": "ZrNiSn.scf",
+"state": "COMPLETED",
+"job_id": "job-40eeca6b06de277b",
+"spec": {
+"name": "ZrNiSn.scf",
+"inputs": [
+{
+"step": "ZrNiSn.relax",
+"output": "structure",
+"input_name": "structure"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964415452"
+},
+{
+"name": "ZrNiSn.nscf",
+"state": "COMPLETED",
+"job_id": "job-5106f2d5eb5c7481",
+"spec": {
+"name": "ZrNiSn.nscf",
+"inputs": [
+{
+"step": "ZrNiSn.relax",
+"output": "structure",
+"input_name": "structure"
+},
+{
+"step": "ZrNiSn.scf",
+"output": "save",
+"input_name": "save"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964419594"
+},
+{
+"name": "ZrNiSn.transport",
+"state": "COMPLETED",
+"job_id": "job-abba3fb4b14f7753",
+"spec": {
+"name": "ZrNiSn.transport",
+"inputs": [
+{
+"step": "ZrNiSn.nscf",
+"output": "bands",
+"input_name": "bands"
+},
+{
+"step": "ZrNiSn.relax",
+"output": "structure",
+"input_name": "structure"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964488801"
+},
+{
+"name": "ZrNiSn.phonon",
+"state": "COMPLETED",
+"job_id": "job-4ab6119a26dacf7e",
+"spec": {
+"name": "ZrNiSn.phonon",
+"inputs": [
+{
+"step": "ZrNiSn.relax",
+"output": "structure",
+"input_name": "structure"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964415687"
+},
+{
+"name": "ZrNiSn.elastic",
+"state": "COMPLETED",
+"job_id": "job-effd8ec51a0c6919",
+"spec": {
+"name": "ZrNiSn.elastic",
+"inputs": [
+{
+"step": "ZrNiSn.relax",
+"output": "structure",
+"input_name": "structure"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964416034"
+},
+{
+"name": "ZrNiSn.evaluate",
+"state": "COMPLETED",
+"job_id": "job-f468404cc85a006b",
+"spec": {
+"name": "ZrNiSn.evaluate",
+"inputs": [
+{
+"step": "ZrNiSn.transport",
+"output": "transport",
+"input_name": "transport"
+},
+{
+"step": "ZrNiSn.phonon",
+"output": "phonon",
+"spawned": true,
+"input_name": "phonon"
+},
+{
+"step": "ZrNiSn.phonon",
+"output": "fc2",
+"spawned": true,
+"input_name": "fc2"
+},
+{
+"step": "ZrNiSn.elastic",
+"output": "elastic",
+"input_name": "elastic"
+},
+{
+"step": "ZrNiSn.nscf",
+"output": "bands",
+"input_name": "bands"
+},
+{
+"step": "ZrNiSn.relax",
+"output": "structure",
+"input_name": "structure"
+},
+{
+"step": "ZrNiSn.formation",
+"output": "stability",
+"input_name": "stability"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964489732"
+},
+{
+"name": "validate",
+"state": "COMPLETED",
+"job_id": "job-953bcf8c01d095ed",
+"spec": {
+"name": "validate",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate",
+"output": "evaluation",
+"spawned": true
+}
+],
+"run_if": "ALWAYS"
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964529571"
+},
+{
+"name": "ZrNiSn.phonon/v0.d001",
+"state": "COMPLETED",
+"job_id": "job-ec30568562636a51",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v0.d001",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v0.d001",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964418418"
+},
+{
+"name": "ZrNiSn.phonon/v0.d002",
+"state": "COMPLETED",
+"job_id": "job-8acbcf565e337477",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v0.d002",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v0.d002",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964418561"
+},
+{
+"name": "ZrNiSn.phonon/v0.d003",
+"state": "COMPLETED",
+"job_id": "job-05a1bccccb8b3fcc",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v0.d003",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v0.d003",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964418712"
+},
+{
+"name": "ZrNiSn.phonon/v1.d001",
+"state": "COMPLETED",
+"job_id": "job-ad30d16f46fe779b",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v1.d001",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v1.d001",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964418641"
+},
+{
+"name": "ZrNiSn.phonon/v1.d002",
+"state": "COMPLETED",
+"job_id": "job-d107de750e37cd78",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v1.d002",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v1.d002",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964418765"
+},
+{
+"name": "ZrNiSn.phonon/v1.d003",
+"state": "COMPLETED",
+"job_id": "job-700fada7f4726f65",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v1.d003",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v1.d003",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964418825"
+},
+{
+"name": "ZrNiSn.phonon/v2.d001",
+"state": "COMPLETED",
+"job_id": "job-28e2c5982f424cdd",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v2.d001",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v2.d001",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964418938"
+},
+{
+"name": "ZrNiSn.phonon/v2.d002",
+"state": "COMPLETED",
+"job_id": "job-79c18a7aca8527de",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v2.d002",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v2.d002",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964419031"
+},
+{
+"name": "ZrNiSn.phonon/v2.d003",
+"state": "COMPLETED",
+"job_id": "job-444556a96cb8e848",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/v2.d003",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "supercell.v2.d003",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964419351"
+},
+{
+"name": "ZrNiSn.phonon/collect",
+"state": "COMPLETED",
+"job_id": "job-8855ee65cce5cc48",
+"parent_step": "ZrNiSn.phonon",
+"spec": {
+"name": "ZrNiSn.phonon/collect",
+"inputs": [
+{
+"step": "ZrNiSn.phonon",
+"output": "plan",
+"input_name": "plan"
+},
+{
+"step": "ZrNiSn.phonon/v0.d001",
+"output": "forces",
+"input_name": "forces.v0.d001"
+},
+{
+"step": "ZrNiSn.phonon/v0.d002",
+"output": "forces",
+"input_name": "forces.v0.d002"
+},
+{
+"step": "ZrNiSn.phonon/v0.d003",
+"output": "forces",
+"input_name": "forces.v0.d003"
+},
+{
+"step": "ZrNiSn.phonon/v1.d001",
+"output": "forces",
+"input_name": "forces.v1.d001"
+},
+{
+"step": "ZrNiSn.phonon/v1.d002",
+"output": "forces",
+"input_name": "forces.v1.d002"
+},
+{
+"step": "ZrNiSn.phonon/v1.d003",
+"output": "forces",
+"input_name": "forces.v1.d003"
+},
+{
+"step": "ZrNiSn.phonon/v2.d001",
+"output": "forces",
+"input_name": "forces.v2.d001"
+},
+{
+"step": "ZrNiSn.phonon/v2.d002",
+"output": "forces",
+"input_name": "forces.v2.d002"
+},
+{
+"step": "ZrNiSn.phonon/v2.d003",
+"output": "forces",
+"input_name": "forces.v2.d003"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964422248"
+},
+{
+"name": "ZrNiSn.evaluate/fc3",
+"state": "COMPLETED",
+"job_id": "job-92639a11d9d86d23",
+"parent_step": "ZrNiSn.evaluate",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate",
+"output": "in.structure",
+"input_name": "structure"
+},
+{
+"step": "ZrNiSn.evaluate",
+"output": "in.fc2",
+"input_name": "fc2"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964501393"
+},
+{
+"name": "ZrNiSn.evaluate/evaluate.bte",
+"state": "COMPLETED",
+"job_id": "job-d37bb7dd0c33e233",
+"parent_step": "ZrNiSn.evaluate",
+"spec": {
+"name": "ZrNiSn.evaluate/evaluate.bte",
+"depends_on": [
+"ZrNiSn.evaluate/fc3"
+],
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "kappa3",
+"spawned": true,
+"input_name": "kappa3"
+},
+{
+"step": "ZrNiSn.evaluate",
+"output": "in.transport",
+"input_name": "transport"
+},
+{
+"step": "ZrNiSn.evaluate",
+"output": "in.phonon",
+"input_name": "phonon"
+},
+{
+"step": "ZrNiSn.evaluate",
+"output": "in.stability",
+"input_name": "stability"
+},
+{
+"step": "ZrNiSn.evaluate",
+"output": "in.elastic",
+"input_name": "elastic"
+},
+{
+"step": "ZrNiSn.evaluate",
+"output": "in.bands",
+"input_name": "bands"
+},
+{
+"step": "ZrNiSn.evaluate",
+"output": "in.structure",
+"input_name": "structure"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964529134"
+},
+{
+"name": "ZrNiSn.evaluate/fc3/d0001",
+"state": "COMPLETED",
+"job_id": "job-04dcab7ad8ffae5e",
+"parent_step": "ZrNiSn.evaluate/fc3",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3/d0001",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "supercell.d0001",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964512176"
+},
+{
+"name": "ZrNiSn.evaluate/fc3/d0002",
+"state": "COMPLETED",
+"job_id": "job-8a4d794c4463dab2",
+"parent_step": "ZrNiSn.evaluate/fc3",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3/d0002",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "supercell.d0002",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964511872"
+},
+{
+"name": "ZrNiSn.evaluate/fc3/d0003",
+"state": "RUNNING",
+"job_id": "job-490a2e6c4a74363c",
+"parent_step": "ZrNiSn.evaluate/fc3",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3/d0003",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "supercell.d0003",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964511974"
+},
+{
+"name": "ZrNiSn.evaluate/fc3/d0004",
+"state": "FAILED",
+"job_id": "job-efd074842edb9c3e",
+"parent_step": "ZrNiSn.evaluate/fc3",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3/d0004",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "supercell.d0004",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964512056"
+},
+{
+"name": "ZrNiSn.evaluate/fc3/d0005",
+"state": "COMPLETED",
+"job_id": "job-92173a8ce675de25",
+"parent_step": "ZrNiSn.evaluate/fc3",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3/d0005",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "supercell.d0005",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964512115"
+},
+{
+"name": "ZrNiSn.evaluate/fc3/d0006",
+"state": "COMPLETED",
+"job_id": "job-0e50bfe38d0f24ce",
+"parent_step": "ZrNiSn.evaluate/fc3",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3/d0006",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "supercell.d0006",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964512322"
+},
+{
+"name": "ZrNiSn.evaluate/fc3/d0007",
+"state": "COMPLETED",
+"job_id": "job-c74cce6faaf7d53c",
+"parent_step": "ZrNiSn.evaluate/fc3",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3/d0007",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "supercell.d0007",
+"input_name": "supercell"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964512456"
+},
+{
+"name": "ZrNiSn.evaluate/fc3/kappa3",
+"state": "COMPLETED",
+"job_id": "job-49cc8fcb4fad6a13",
+"parent_step": "ZrNiSn.evaluate/fc3",
+"spec": {
+"name": "ZrNiSn.evaluate/fc3/kappa3",
+"inputs": [
+{
+"step": "ZrNiSn.evaluate/fc3",
+"output": "plan3",
+"input_name": "plan3"
+},
+{
+"step": "ZrNiSn.evaluate/fc3/d0001",
+"output": "forces",
+"input_name": "forces.d0001"
+},
+{
+"step": "ZrNiSn.evaluate/fc3/d0002",
+"output": "forces",
+"input_name": "forces.d0002"
+},
+{
+"step": "ZrNiSn.evaluate/fc3/d0003",
+"output": "forces",
+"input_name": "forces.d0003"
+},
+{
+"step": "ZrNiSn.evaluate/fc3/d0004",
+"output": "forces",
+"input_name": "forces.d0004"
+},
+{
+"step": "ZrNiSn.evaluate/fc3/d0005",
+"output": "forces",
+"input_name": "forces.d0005"
+},
+{
+"step": "ZrNiSn.evaluate/fc3/d0006",
+"output": "forces",
+"input_name": "forces.d0006"
+},
+{
+"step": "ZrNiSn.evaluate/fc3/d0007",
+"output": "forces",
+"input_name": "forces.d0007"
+}
+]
+},
+"node_id": "ff-node-46dea36f2b2afb4e",
+"updated_unix_ms": "1793964528277"
+}
+]
+}

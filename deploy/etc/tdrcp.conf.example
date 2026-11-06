@@ -70,5 +70,13 @@ offline_after = 90
 #max_nodes = 16
 #max_ranks = 4096
 
+[ui]
+# Web dashboard (docs/design/phase9.md) at https://HOST:PORT/ui/, served from files
+# compiled into tdrcp. Browsers need a client certificate (`tdrctl pki issue DIR
+# --role viewer|admin NAME`, then `tdrctl pki p12 DIR NAME`), must trust ca.crt as an
+# authority, and the server certificate needs the browser's host name or IP as a SAN.
+# false: / and /ui/* return 404.
+#enabled = true
+
 [log]
 level = info

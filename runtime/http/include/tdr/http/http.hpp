@@ -10,6 +10,7 @@
 #include <expected>
 #include <functional>
 #include <map>
+#include <utility>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,12 +32,20 @@ struct Request {
     std::string content_type;
     std::optional<tls::Identity> peer;                // verified client identity
     std::string remote;                               // "ip:port"
+    std::map<std::string, std::string> headers;       // lower-case names; repeats joined with ", "
+
+    // Header value or "" (name in lower case).
+    std::string header(const std::string& name) const {
+        auto it = headers.find(name);
+        return it == headers.end() ? std::string{} : it->second;
+    }
 };
 
 struct Response {
     int status = 200;
     std::string body;
     std::string content_type = "application/json";
+    std::vector<std::pair<std::string, std::string>> headers = {};  // extra response headers
 };
 
 using Handler = std::function<Response(Request&)>;

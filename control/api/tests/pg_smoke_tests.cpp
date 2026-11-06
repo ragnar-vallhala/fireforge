@@ -25,6 +25,7 @@ http::Response call(ControlApi& api, const std::string& method, const std::strin
     r.method = method;
     r.path = path;
     r.body = std::move(body);
+    if (!r.body.empty()) r.content_type = "application/json";  // like tdrctl and tdrd
     r.peer = std::move(peer);
     return api.handle(r);
 }

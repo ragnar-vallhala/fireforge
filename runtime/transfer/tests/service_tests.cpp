@@ -496,9 +496,15 @@ BOOST_FIXTURE_TEST_CASE(fetches_beyond_max_fetching_queue, Fixture) {
     auto s = n(1).svc->stats();
     BOOST_TEST(s.fetching == 0u);
     BOOST_TEST(s.queued == 3u);
-    BOOST_REQUIRE(run_until(io, [&] { return n(1).svc->stats().fetching == 1; }));
-    BOOST_TEST(n(1).svc->stats().queued == 2u);
-    BOOST_REQUIRE(run_until(io, [&] { return done == 3; }));
+    // run_until runs the loop in 5 ms slices, so a whole fetch may finish between checks:
+    // assert the cap and the accounting at every check instead of an exact snapshot.
+    bool capped = true;
+    BOOST_REQUIRE(run_until(io, [&] {
+        auto t = n(1).svc->stats();
+        capped = capped && t.fetching <= 1 && t.queued + t.fetching + t.fetched == 3;
+        return done == 3;
+    }));
+    BOOST_TEST(capped);
     BOOST_TEST(n(1).svc->stats().fetched == 3u);
 }
 

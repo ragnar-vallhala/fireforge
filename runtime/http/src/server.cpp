@@ -1,4 +1,5 @@
 // HttpsServer: Boost.Beast HTTP/1.1 over TLS (mTLS), keep-alive, single io thread.
+#include <cctype>
 #include <optional>
 #include <system_error>
 #include <unordered_map>
@@ -179,8 +180,15 @@ private:
         if (qpos != std::string_view::npos) req.query = parse_query(target.substr(qpos + 1));
         req.body = std::move(msg.body());
         if (auto it = msg.find(bhttp::field::content_type); it != msg.end()) req.content_type = std::string(it->value());
+        for (const auto& f : msg) {
+            std::string name(f.name_string());
+            for (auto& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            auto [it, fresh] = req.headers.try_emplace(std::move(name), std::string(f.value()));
+            if (!fresh) it->second += ", " + std::string(f.value());
+        }
         req.peer = peer_;
         req.remote = remote_;
+        head_ = req.method == "HEAD";
 
         Response res;
         try {
@@ -203,9 +211,18 @@ private:
         res->result(static_cast<unsigned>(r.status));
         res->set(bhttp::field::server, "fireforge/" TDR_VERSION);
         if (!r.body.empty() || !r.content_type.empty()) res->set(bhttp::field::content_type, r.content_type);
-        res->body() = std::move(r.body);
+        for (const auto& [k, v] : r.headers) res->set(k, v);
         res->keep_alive(keep_alive);
-        res->prepare_payload();
+        if (head_) {
+            // HEAD: the GET headers (Content-Length of the body the handler built), no body.
+            const auto n = r.body.size();
+            res->prepare_payload();
+            res->content_length(n);
+            head_ = false;
+        } else {
+            res->body() = std::move(r.body);
+            res->prepare_payload();
+        }
         beast::get_lowest_layer(stream_).expires_after(server_->options.read_timeout);
         bhttp::async_write(stream_, *res,
                            [self = shared_from_this(), res, keep_alive, drain](error_code ec, std::size_t) {
@@ -255,6 +272,7 @@ private:
     std::unique_ptr<std::array<char, 16384>> drain_buf_;
     bool first_ = true;
     bool closed_ = false;
+    bool head_ = false;  // the request being answered is HEAD
 };
 
 void ServerCore::do_accept() {

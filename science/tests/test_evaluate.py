@@ -232,3 +232,14 @@ def test_tier2_force_needs_fc2(tmp_path):
     res, _, _ = run_task("te.evaluate", {"tier2": "force"}, _files(tmp_path),
                          workdir=tmp_path / "w")
     assert not res.success and "fc2" in res.error
+
+
+def test_record_curves_envelope():
+    from fireforge_science.evaluate import record_curves
+    doc = {"t_k": [300.0, 600.0], "kappa_l_w_mk": [4.0, 2.0],
+           "tables": {"p": {"zt": [[0.1, 0.3], [None, 0.5]], "pf_uw_cmk2": [[1, 2], [3, None]]},
+                      "n": {"zt": [[None, None], [0.2, 0.1]], "pf_uw_cmk2": [[1, 1], [2, 2]]}}}
+    c = record_curves(doc)
+    assert c["zt_p"] == [0.3, 0.5] and c["zt_n"] == [None, 0.2]
+    assert c["pf_p_uw_cmk2"] == [2, 3] and c["kappa_l_w_mk"] == [4.0, 2.0] and c["t_k"] == [300.0, 600.0]
+    assert record_curves({**doc, "kappa_l_w_mk": None})["kappa_l_w_mk"] is None

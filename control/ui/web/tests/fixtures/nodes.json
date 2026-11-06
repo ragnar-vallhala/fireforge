@@ -1,0 +1,97 @@
+{
+ "nodes": [
+  {
+   "node_id": "ff-node-46dea36f2b2afb4e",
+   "name": "hp-HP-Z4-G4-Workstation",
+   "health": "ONLINE",
+   "addresses": [
+    {
+     "type": "lan",
+     "address": "100.71.64.102",
+     "port": 7400
+    }
+   ],
+   "capabilities": [
+    "cpu",
+    "gpu:nvidia",
+    "cgroups",
+    "sci",
+    "qe",
+    "phonopy",
+    "phono3py",
+    "boltztrap2"
+   ],
+   "daemon_version": "0.1.0",
+   "physical": {
+    "cpu_cores": 24,
+    "memory_bytes": "67134836736",
+    "disk_bytes": "1005867986944",
+    "gpu_count": 1
+   },
+   "configured": {
+    "cpu_cores": 20,
+    "memory_bytes": "32212254720",
+    "gpu_count": 1
+   },
+   "policy": {
+    "version": "1",
+    "updated_unix_ms": "1793963660787"
+   },
+   "last_heartbeat": {
+    "node_id": "ff-node-46dea36f2b2afb4e",
+    "sent_unix_ms": "1793971023655",
+    "daemon_version": "0.1.0",
+    "capacity": {
+     "cpu_cores": 20,
+     "memory_bytes": "32212254720"
+    },
+    "allocated": {
+     "cpu_cores": 20,
+     "memory_bytes": "32212254720"
+    },
+    "cpu_utilization": 0.9252282157676348,
+    "memory_available_bytes": "40937459712",
+    "disk_available_bytes": "772608028672",
+    "running_jobs": 5,
+    "policy_version": "1",
+    "addresses": [
+     {
+      "type": "lan",
+      "address": "100.71.64.102",
+      "port": 7400
+     }
+    ],
+    "leases": [
+     {
+      "job_id": "job-3d63a3ddbfafc942",
+      "attempt_id": "att-ed5af5931ab404c0",
+      "fencing_token": "1"
+     },
+     {
+      "job_id": "job-90ddf8ff36ed0616",
+      "attempt_id": "att-3f1deb479471affc",
+      "fencing_token": "1"
+     },
+     {
+      "job_id": "job-dfd281ed8de4b967",
+      "attempt_id": "att-77a1ab6e1484b407",
+      "fencing_token": "1"
+     },
+     {
+      "job_id": "job-e2484b6b9eb060cd",
+      "attempt_id": "att-361b26c1a3c91d5a",
+      "fencing_token": "1"
+     },
+     {
+      "job_id": "job-e4fd7872e37880e0",
+      "attempt_id": "att-49169dee10b875df",
+      "fencing_token": "1"
+     }
+    ]
+   },
+   "registered_unix_ms": "1793963660787",
+   "last_seen_unix_ms": "1793971023670",
+   "cert_fingerprint": "e7b4e0ede462dffe4cd52f0eccf2ad07f6dc7e3c16100c69a54ff75fb4294d17"
+  }
+ ]
+}

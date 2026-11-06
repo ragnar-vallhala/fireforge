@@ -9,7 +9,9 @@
 #include <ostream>
 #include <string>
 
+#include <openssl/err.h>
 #include <openssl/pem.h>
+#include <openssl/pkcs12.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -108,6 +110,7 @@ BOOST_AUTO_TEST_CASE(tls_issue_all_roles_and_identity) {
         bool both;  // node certs are valid for both purposes (phase3.md §2)
     } cases[] = {{Role::kNode, "node-1", X509_PURPOSE_SSL_CLIENT, true},
                  {Role::kAdmin, "alice", X509_PURPOSE_SSL_CLIENT, false},
+                 {Role::kViewer, "vera", X509_PURPOSE_SSL_CLIENT, false},
                  {Role::kServer, "cp.example", X509_PURPOSE_SSL_SERVER, false}};
     for (const auto& c : cases) {
         IssueOptions o;
@@ -155,6 +158,8 @@ BOOST_AUTO_TEST_CASE(tls_role_parsing) {
     BOOST_TEST(parse_role("node").value() == Role::kNode);
     BOOST_TEST(parse_role("admin").value() == Role::kAdmin);
     BOOST_TEST(parse_role("server").value() == Role::kServer);
+    BOOST_TEST(parse_role("viewer").value() == Role::kViewer);
+    BOOST_TEST(std::string(to_string(Role::kViewer)) == "viewer");
     BOOST_TEST(!parse_role("ca"));
     BOOST_TEST(!parse_role(""));
 }
@@ -303,4 +308,62 @@ BOOST_AUTO_TEST_CASE(tls_contexts_load_and_reject_bad_files) {
     } catch (const std::runtime_error& e) {
         BOOST_TEST(std::string(e.what()).find("missing-ca.crt") != std::string::npos);
     }
+}
+
+// Phase 9: tdrctl pki p12 (phase9.md §3). OpenSSL parses the bundle back with the password.
+BOOST_AUTO_TEST_CASE(tls_export_pkcs12_round_trip) {
+    TempDir t;
+    BOOST_REQUIRE(create_ca(t.path, "ca"));
+    IssueOptions o;
+    o.role = Role::kViewer;
+    o.name = "vera";
+    BOOST_REQUIRE(issue(t.path, o, t.path / "vera.key", t.path / "vera.crt"));
+    const fs::path out = t.path / "vera.p12";
+    auto r = export_pkcs12(t.path / "vera.crt", t.path / "vera.key", t.path / "ca.crt", "s3cret", out);
+    BOOST_REQUIRE_MESSAGE(r, (r ? "" : r.error()));
+    BOOST_TEST(mode_of(out) == 0600u);
+
+    FILE* f = std::fopen(out.c_str(), "rb");
+    BOOST_REQUIRE(f);
+    PKCS12* p12 = d2i_PKCS12_fp(f, nullptr);
+    std::fclose(f);
+    BOOST_REQUIRE(p12);
+    BOOST_TEST(PKCS12_verify_mac(p12, "s3cret", -1) == 1);
+    BOOST_TEST(PKCS12_verify_mac(p12, "wrong", -1) != 1);
+    EVP_PKEY* key = nullptr;
+    X509* cert = nullptr;
+    STACK_OF(X509)* ca = nullptr;
+    BOOST_TEST(PKCS12_parse(p12, "wrong", &key, &cert, &ca) != 1);
+    ERR_clear_error();
+    BOOST_REQUIRE(PKCS12_parse(p12, "s3cret", &key, &cert, &ca) == 1);
+    BOOST_REQUIRE(key);
+    BOOST_REQUIRE(cert);
+    BOOST_TEST(X509_check_private_key(cert, key) == 1);
+    auto id = identity_of(cert);
+    BOOST_REQUIRE(id);
+    BOOST_TEST(id->role == Role::kViewer);
+    BOOST_TEST(id->name == "vera");
+    BOOST_REQUIRE(ca);
+    BOOST_REQUIRE(sk_X509_num(ca) == 1);
+    auto ca_file = load(t.path / "ca.crt");
+    BOOST_TEST(X509_cmp(sk_X509_value(ca, 0), ca_file.get()) == 0);
+    // Key and cert bags use AES-256-CBC (PBES2), via `openssl pkcs12 -info` when available.
+    std::string info = run("openssl pkcs12 -info -noout -passin pass:s3cret -in " + out.string() + " 2>&1");
+    if (!info.empty()) {
+        BOOST_TEST_INFO(info);
+        BOOST_TEST(info.find("AES-256-CBC") != std::string::npos);
+        BOOST_TEST(info.find("sha256") != std::string::npos);
+    }
+    sk_X509_pop_free(ca, X509_free);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+    PKCS12_free(p12);
+
+    // Refuses to overwrite, an empty password, and a key that doesn't match the cert.
+    BOOST_TEST(!export_pkcs12(t.path / "vera.crt", t.path / "vera.key", t.path / "ca.crt", "x", out));
+    BOOST_TEST(!export_pkcs12(t.path / "vera.crt", t.path / "vera.key", t.path / "ca.crt", "", t.path / "e.p12"));
+    o.name = "other";
+    BOOST_REQUIRE(issue(t.path, o, t.path / "other.key", t.path / "other.crt"));
+    BOOST_TEST(!export_pkcs12(t.path / "vera.crt", t.path / "other.key", t.path / "ca.crt", "x", t.path / "m.p12"));
+    BOOST_TEST(!fs::exists(t.path / "m.p12"));
 }

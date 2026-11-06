@@ -48,7 +48,7 @@ bottleneck, a connection pool plus worker threads goes behind the same
 ## 2. PKI and identity (mTLS)
 
 - `tdrctl pki init DIR` creates a CA (`ca.key` 0600, `ca.crt`), using ECDSA P-256, valid 10 years.
-- `tdrctl pki issue DIR --role node|admin|server NAME [--dns H]... [--ip A]...`
+- `tdrctl pki issue DIR --role node|admin|server|viewer NAME [--dns H]... [--ip A]...`
   writes `NAME.key` (0600) + `NAME.crt`, signed by the CA and valid 1 year.
 - **Subject:** `CN=<name>, OU=<role>, O=FireForge`. EKU is clientAuth for node
   and admin, serverAuth for server. Server certs carry DNS/IP SANs and clients

@@ -5,6 +5,7 @@
 #include <exception>
 #include <expected>
 #include <format>
+#include <string_view>
 
 #include <boost/json.hpp>
 
@@ -25,17 +26,22 @@ const char* role_name(tls::Role r) {
         case tls::Role::kNode: return "node";
         case tls::Role::kAdmin: return "admin";
         case tls::Role::kServer: return "server";
+        case tls::Role::kViewer: return "viewer";
     }
     return "unknown";
 }
 
 std::string actor_of(const tls::Identity& id) { return std::format("{}:{}", role_name(id.role), id.name); }
 
-enum Allow : unsigned { kNode = 1, kAdmin = 2 };
+// Phase 9: kViewer is the read-only dashboard/CLI role (phase9.md §3). kServer is never allowed.
+enum Allow : unsigned { kNode = 1, kAdmin = 2, kViewer = 4 };
+constexpr unsigned kRead = kNode | kAdmin | kViewer;  // reads open to nodes today
+constexpr unsigned kAdminRead = kAdmin | kViewer;     // reads that were admin-only (events, audit)
 
 std::optional<Response> check_role(const Request& r, unsigned allow) {
     const auto role = r.peer->role;
-    const bool ok = (role == tls::Role::kNode && (allow & kNode)) || (role == tls::Role::kAdmin && (allow & kAdmin));
+    const bool ok = (role == tls::Role::kNode && (allow & kNode)) || (role == tls::Role::kAdmin && (allow & kAdmin)) ||
+                    (role == tls::Role::kViewer && (allow & kViewer));
     if (ok) return std::nullopt;
     return error_response(403, "forbidden", std::format("role {} may not call {} {}", role_name(role), r.method, r.path));
 }
@@ -133,6 +139,44 @@ std::string check_mpi(const tv1::JobSpec& j, const cpdb::GangOptions& g) {
     return {};
 }
 
+std::string lower(std::string s) {
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string_view trim(std::string_view s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
+    return s;
+}
+
+// Browser CSRF guard and JSON-only bodies for every request that isn't GET/HEAD
+// (phase9.md §3). tdrctl and tdrd send neither Origin nor Sec-Fetch-Site, and set
+// application/json whenever the body is non-empty.
+std::optional<Response> check_browser_request(const Request& r) {
+    if (r.method == "GET" || r.method == "HEAD") return std::nullopt;
+    if (auto it = r.headers.find("sec-fetch-site"); it != r.headers.end() && lower(std::string(trim(it->second))) != "same-origin")
+        return error_response(403, "csrf", std::format("cross-site request refused (Sec-Fetch-Site: {})", it->second));
+    if (auto it = r.headers.find("origin"); it != r.headers.end()) {
+        // Origin is "scheme://host[:port]" (or "null"); its authority must equal Host.
+        const std::string origin = lower(std::string(trim(it->second)));
+        const auto sep = origin.find("://");
+        const std::string authority = sep == std::string::npos ? std::string() : origin.substr(sep + 3);
+        const std::string host = lower(std::string(trim(r.header("host"))));
+        if (authority.empty() || host.empty() || authority != host)
+            return error_response(403, "csrf",
+                                  std::format("Origin '{}' does not match Host '{}'", it->second, r.header("host")));
+    }
+    if (!r.body.empty()) {
+        std::string_view ct = r.content_type;
+        if (auto semi = ct.find(';'); semi != std::string_view::npos) ct = ct.substr(0, semi);
+        if (lower(std::string(trim(ct))) != "application/json")
+            return error_response(415, "unsupported_media_type",
+                                  std::format("request body must be application/json, not '{}'", r.content_type));
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 struct ControlApi::Impl {
@@ -140,6 +184,7 @@ struct ControlApi::Impl {
     ApiOptions options;
     std::function<std::int64_t()> clock;
     http::Router router;
+    std::vector<std::pair<std::string, std::string>> route_list;
     std::int64_t started_ms = 0;  // lease-expiry grace starts here (phase4.md §3)
 
     Impl(cpdb::IRepository& r, ApiOptions o, std::function<std::int64_t()> c)
@@ -148,8 +193,10 @@ struct ControlApi::Impl {
         started_ms = clock();
         auto add = [this](const char* method, const char* pattern, Response (Impl::*fn)(Request&)) {
             router.add(method, pattern, [this, fn](Request& req) { return (this->*fn)(req); });
+            route_list.emplace_back(method, pattern);
         };
         add("GET", "/healthz", &Impl::healthz);
+        add("GET", "/api/v1/whoami", &Impl::whoami);
         add("POST", "/api/v1/nodes/register", &Impl::register_node);
         add("POST", "/api/v1/nodes/heartbeat", &Impl::heartbeat);
         add("GET", "/api/v1/nodes", &Impl::list_nodes);
@@ -223,6 +270,15 @@ struct ControlApi::Impl {
         return Response{200, boost::json::serialize(o), "application/json"};
     }
 
+    // Any authenticated role (phase9.md §3): lets the UI show or hide admin actions.
+    Response whoami(Request& r) {
+        boost::json::object o;
+        o["role"] = role_name(r.peer->role);
+        o["name"] = r.peer->name;
+        o["fingerprint"] = r.peer->fingerprint_sha256;
+        return Response{200, boost::json::serialize(o), "application/json"};
+    }
+
     // ---- nodes ----------------------------------------------------------------
 
     Response register_node(Request& r) {
@@ -274,7 +330,7 @@ struct ControlApi::Impl {
     }
 
     Response list_nodes(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         cv1::NodeHealth h = cv1::NODE_HEALTH_UNSPECIFIED;
         if (auto it = r.query.find("health"); it != r.query.end() && !it->second.empty()) {
             if (!cv1::NodeHealth_Parse(upper(it->second), &h) || h == cv1::NODE_HEALTH_UNSPECIFIED)
@@ -286,7 +342,7 @@ struct ControlApi::Impl {
     }
 
     Response get_node(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         auto node = repo.get_node(r.params["id"]);
         if (!node) return node_not_found(r.params["id"]);
         return reply(*node);
@@ -362,7 +418,7 @@ struct ControlApi::Impl {
     }
 
     Response events(Request& r) {
-        if (auto e = check_role(r, kAdmin)) return *e;
+        if (auto e = check_role(r, kAdminRead)) return *e;
         const auto& id = r.params["id"];
         auto limit = parse_limit(r, 50, 1000);
         if (!limit) return limit.error();
@@ -391,7 +447,7 @@ struct ControlApi::Impl {
     }
 
     Response list_campaigns(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         cv1::CampaignState s = cv1::CAMPAIGN_STATE_UNSPECIFIED;
         if (auto it = r.query.find("state"); it != r.query.end() && !it->second.empty()) {
             if (!cv1::CampaignState_Parse(upper(it->second), &s) || s == cv1::CAMPAIGN_STATE_UNSPECIFIED)
@@ -403,7 +459,7 @@ struct ControlApi::Impl {
     }
 
     Response get_campaign(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         auto c = repo.get_campaign(r.params["id"]);
         if (!c) return campaign_not_found(r.params["id"]);
         return reply(*c);
@@ -488,7 +544,7 @@ struct ControlApi::Impl {
     }
 
     Response list_jobs(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         tv1::JobState s = tv1::JOB_STATE_UNSPECIFIED;
         if (auto it = r.query.find("state"); it != r.query.end() && !it->second.empty()) {
             if (!tv1::JobState_Parse(upper(it->second), &s) || s == tv1::JOB_STATE_UNSPECIFIED)
@@ -504,7 +560,7 @@ struct ControlApi::Impl {
     }
 
     Response get_job(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         auto job = repo.get_job(r.params["id"], true);
         if (!job) return job_not_found(r.params["id"]);
         return reply(*job);
@@ -676,7 +732,7 @@ struct ControlApi::Impl {
     }
 
     Response list_workflows(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         std::string state;
         if (auto it = r.query.find("state"); it != r.query.end() && !it->second.empty()) {
             state = upper(it->second);
@@ -693,7 +749,7 @@ struct ControlApi::Impl {
     }
 
     Response get_workflow(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         auto w = repo.get_workflow(r.params["id"], true);
         if (!w) return workflow_not_found(r.params["id"]);
         return reply(*w);
@@ -722,7 +778,7 @@ struct ControlApi::Impl {
     }
 
     Response list_materials(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         auto limit = parse_limit(r, 100, 1000);
         if (!limit) return limit.error();
         cv1::MaterialList out;
@@ -732,21 +788,21 @@ struct ControlApi::Impl {
     }
 
     Response get_material(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         auto m = repo.get_material(r.params["id"]);
         if (!m) return error_response(404, "not_found", "unknown material " + r.params["id"]);
         return reply(*m);
     }
 
     Response get_structure(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         auto s = repo.get_structure(r.params["id"]);
         if (!s) return error_response(404, "not_found", "unknown structure " + r.params["id"]);
         return reply(*s);
     }
 
     Response list_calculations(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         cpdb::IRepository::CalcQuery q;
         q.material_id = query(r, "material_id");
         q.structure_id = query(r, "structure_id");
@@ -767,7 +823,7 @@ struct ControlApi::Impl {
     }
 
     Response get_calculation(Request& r) {
-        if (auto e = check_role(r, kNode | kAdmin)) return *e;
+        if (auto e = check_role(r, kRead)) return *e;
         auto c = repo.get_calculation(r.params["id"]);
         if (!c) return error_response(404, "not_found", "unknown calculation " + r.params["id"]);
         return reply(*c);
@@ -788,7 +844,7 @@ struct ControlApi::Impl {
     // ---- audit ----------------------------------------------------------------
 
     Response audit(Request& r) {
-        if (auto e = check_role(r, kAdmin)) return *e;
+        if (auto e = check_role(r, kAdminRead)) return *e;
         auto limit = parse_limit(r, 100, 1000);
         if (!limit) return limit.error();
         cv1::AuditList out;
@@ -804,8 +860,14 @@ ControlApi::~ControlApi() = default;
 
 const ApiOptions& ControlApi::options() const { return impl_->options; }
 
+std::vector<std::pair<std::string, std::string>> ControlApi::routes() const { return impl_->route_list; }
+
 http::Response ControlApi::handle(http::Request& req) {
     if (!req.peer) return error_response(401, "unauthorized", "client certificate required");
+    if (auto e = check_browser_request(req)) {
+        log_info("refused {} {} from {} ({}): {}", req.method, req.path, actor_of(*req.peer), req.remote, e->status);
+        return *e;
+    }
     try {
         return impl_->router.dispatch(req);
     } catch (const cpdb::DbError& e) {

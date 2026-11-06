@@ -383,6 +383,30 @@ RECORD_KEYS = ("zt_peak_p", "zt_peak_n", "t_peak_p_k", "t_peak_n_k", "doping_pea
                "toxicity", "screen_pass")
 
 
+def _envelope(rows) -> list:
+    """Max over doping at each temperature (None where no finite value)."""
+    out = []
+    for r in rows or []:
+        vals = [x for x in r if x is not None]
+        out.append(max(vals) if vals else None)
+    return out
+
+
+def record_curves(doc: dict) -> dict[str, Any]:
+    """Compact per-temperature curves for the te.evaluate record (phase9.md §4): the
+    dashboard charts these without fetching the evaluation artifact."""
+    tables = doc.get("tables") or {}
+    kl = doc.get("kappa_l_w_mk")
+    return {
+        "t_k": list(doc.get("t_k") or []),
+        "zt_p": _envelope((tables.get("p") or {}).get("zt")),
+        "zt_n": _envelope((tables.get("n") or {}).get("zt")),
+        "pf_p_uw_cmk2": _envelope((tables.get("p") or {}).get("pf_uw_cmk2")),
+        "pf_n_uw_cmk2": _envelope((tables.get("n") or {}).get("pf_uw_cmk2")),
+        "kappa_l_w_mk": None if kl is None else [None if not math.isfinite(x) else float(x) for x in kl],
+    }
+
+
 def op_evaluate(ctx):
     p = ctx.params
     doc = evaluate(ctx)
@@ -409,6 +433,7 @@ def op_evaluate(ctx):
             v = doc.get(f"zt_avg_{name}_{kind}")
             if v is not None:
                 props[f"zt_avg_{name}_{kind}"] = v
+    props["curves"] = record_curves(doc)
     if structure is None:
         raise WorkerError("te.evaluate: the record needs a structure: give input "
                           "'structure' or 'bands'")

@@ -61,6 +61,7 @@ struct Fixture {
         r.method = method;
         r.path = path;
         r.body = std::move(body);
+        if (!r.body.empty()) r.content_type = "application/json";  // like tdrctl and tdrd
         r.peer = std::move(peer);
         return api.handle(r);
     }
@@ -138,6 +139,7 @@ BOOST_AUTO_TEST_CASE(pg_gang_flow) {
         r.method = method;
         r.path = path;
         r.body = std::move(body);
+        if (!r.body.empty()) r.content_type = "application/json";  // like tdrctl and tdrd
         r.peer = std::move(peer);
         return api.handle(r);
     };

@@ -10,6 +10,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "fireforge/control/v1/control.pb.h"
 #include "tdr/cpdb/db.hpp"
@@ -49,6 +51,9 @@ public:
 
     // Handles every /api/v1/... route and /healthz. Requests without a peer
     // identity get 401. DbError -> 500 (logged), never leaks SQL details.
+    // Phase 9: non-GET/HEAD requests carrying a cross-site Sec-Fetch-Site or an
+    // Origin that doesn't match Host get 403 "csrf"; a non-empty body that isn't
+    // application/json gets 415. GET /api/v1/whoami answers any role.
     http::Response handle(http::Request& req);
 
     // Runs repo.sweep_health and logs changes. tdrcp calls this on a timer.
@@ -62,6 +67,9 @@ public:
     std::vector<cpdb::Reservation> place_jobs();
 
     const ApiOptions& options() const;
+
+    // Every registered (method, pattern), e.g. {"GET", "/api/v1/jobs/{id}"} (tests, docs).
+    std::vector<std::pair<std::string, std::string>> routes() const;
 
 private:
     struct Impl;

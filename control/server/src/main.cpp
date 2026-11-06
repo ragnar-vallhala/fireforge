@@ -1,7 +1,7 @@
 // tdrcp — FireForge control plane (docs/design/phase2.md §8).
 //
 // Wiring only: config -> Postgres repository (runs migrations) -> ControlApi
-// -> mTLS HttpsServer, plus health/lease, workflow and placement timers. One
+// (+ the dashboard's static files, Phase 9) -> mTLS HttpsServer, plus health/lease, workflow and placement timers. One
 // io_context thread. ControlApi applies [workflows] limits and [gangs] options to
 // the repository; gangs are placed by the placement timer.
 
@@ -25,6 +25,7 @@
 #include "tdr/common/common.hpp"
 #include "tdr/common/config.hpp"
 #include "tdr/cpapi/api.hpp"
+#include "tdr/cpui/ui.hpp"
 #include "tdr/cpdb/db.hpp"
 #include "tdr/http/http.hpp"
 #include "tdr/tls/tls.hpp"
@@ -52,6 +53,8 @@ struct CpConfig {
     // Phase 7 [gangs] (seconds).
     std::uint32_t drain_timeout_seconds = 600;
     std::uint32_t ready_window_seconds = 5;
+    // Phase 9 [ui] (phase9.md §2).
+    tdr::cpui::UiOptions ui;
 };
 
 template <class T>
@@ -83,6 +86,14 @@ std::expected<CpConfig, std::string> load(const fs::path& path) {
     CpConfig c;
     using Setter = std::function<std::expected<void, std::string>(const std::string&)>;
     auto str = [](std::string& d) -> Setter { return [&d](const std::string& v) -> std::expected<void, std::string> { d = v; return {}; }; };
+    auto boolean = [](bool& d) -> Setter {
+        return [&d](const std::string& v) -> std::expected<void, std::string> {
+            if (v == "true" || v == "on" || v == "yes" || v == "1") d = true;
+            else if (v == "false" || v == "off" || v == "no" || v == "0") d = false;
+            else return std::unexpected("expected true or false, got '" + v + "'");
+            return {};
+        };
+    };
     auto pth = [](fs::path& d) -> Setter { return [&d](const std::string& v) -> std::expected<void, std::string> { d = v; return {}; }; };
     auto num = []<class T>(T& d) -> Setter {
         return [&d](const std::string& v) -> std::expected<void, std::string> {
@@ -118,6 +129,7 @@ std::expected<CpConfig, std::string> load(const fs::path& path) {
                    {"ready_window", num(c.ready_window_seconds)},
                    {"max_nodes", num(c.api.gangs.max_nodes)},
                    {"max_ranks", num(c.api.gangs.max_ranks)}}},
+        {"ui", {{"enabled", boolean(c.ui.enabled)}}},
         {"log", {{"level", str(c.log_level)}}},
     };
     for (const auto& [sec, keys] : ini->sections) {
@@ -176,9 +188,16 @@ int run(const CpConfig& cfg, const std::string& port_file) {
     tdr::http::ServerOptions sopts;
     sopts.listen_address = cfg.listen_address;
     sopts.port = cfg.port;
-    tdr::http::HttpsServer server(io, ctx, sopts, [&api](tdr::http::Request& r) { return api.handle(r); });
+    // Phase 9: the dashboard's static files under / and /ui/, everything else is the API.
+    const tdr::cpui::Ui ui(cfg.ui);
+    tdr::http::HttpsServer server(io, ctx, sopts, [&api, &ui](tdr::http::Request& r) {
+        if (auto res = ui.serve(r)) return std::move(*res);
+        return api.handle(r);
+    });
     server.start();
     tdr::log_info("tdrcp {} listening on {}:{}", TDR_VERSION, cfg.listen_address, server.bound_port());
+    if (cfg.ui.enabled) tdr::log_info("dashboard at https://{}:{}/ui/ ({} files)", cfg.listen_address, server.bound_port(),
+                                      ui.assets().size());
     if (!port_file.empty()) {
         auto tmp = port_file + ".tmp";
         { std::ofstream(tmp) << server.bound_port() << "\n"; }

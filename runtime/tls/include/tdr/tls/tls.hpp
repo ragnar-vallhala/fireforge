@@ -25,8 +25,9 @@ namespace tdr::tls {
 
 namespace fs = std::filesystem;
 
-enum class Role { kNode, kAdmin, kServer };
-const char* to_string(Role r);                       // "node" | "admin" | "server"
+// kViewer (Phase 9): read-only client role for the dashboard and read-only tdrctl use.
+enum class Role { kNode, kAdmin, kServer, kViewer };
+const char* to_string(Role r);                       // "node" | "admin" | "server" | "viewer"
 std::optional<Role> parse_role(std::string_view s);
 
 struct Identity {
@@ -61,6 +62,14 @@ std::expected<void, std::string> issue(const fs::path& ca_dir, const IssueOption
 // Extract identity from a certificate. Fails if OU is not a known role or CN is empty.
 std::expected<Identity, std::string> identity_of(X509* cert);
 std::expected<Identity, std::string> read_identity(const fs::path& cert_pem);
+
+// Phase 9: PKCS#12 bundle for browser import (`tdrctl pki p12`): cert + key + the CA
+// certificate, key and certs encrypted with AES-256-CBC (PBKDF2), HMAC-SHA256 MAC,
+// friendly name = CN. Checks the key matches the cert. Writes out (0600) and refuses to
+// overwrite it. The password must not be empty.
+std::expected<void, std::string> export_pkcs12(const fs::path& cert_pem, const fs::path& key_pem,
+                                               const fs::path& ca_pem, const std::string& password,
+                                               const fs::path& out);
 
 // ---- TLS contexts -------------------------------------------------------------
 

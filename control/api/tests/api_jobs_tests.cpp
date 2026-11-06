@@ -71,6 +71,7 @@ struct Fixture {
         r.path = path;
         r.query = std::move(query);
         r.body = std::move(body);
+        if (!r.body.empty()) r.content_type = "application/json";  // like tdrctl and tdrd
         r.peer = std::move(peer);
         r.remote = "127.0.0.1:5555";
         return api.handle(r);
@@ -439,6 +440,7 @@ BOOST_AUTO_TEST_CASE(pg_jobs_flow) {
         r.method = method;
         r.path = path;
         r.body = std::move(body);
+        if (!r.body.empty()) r.content_type = "application/json";  // like tdrctl and tdrd
         r.peer = std::move(peer);
         return api.handle(r);
     };

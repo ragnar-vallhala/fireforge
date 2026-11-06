@@ -3,8 +3,14 @@
 
 #include "remote.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cerrno>
+#include <cstring>
 #include <chrono>
 #include <fstream>
 #include <sstream>
@@ -21,6 +27,7 @@
 #include <vector>
 
 #include <google/protobuf/util/json_util.h>
+#include <openssl/rand.h>
 
 #include "fireforge/control/v1/control.pb.h"
 #include "fireforge/control/v1/materials.pb.h"
@@ -119,10 +126,37 @@ std::string health_name(cv1::NodeHealth h) {
 
 constexpr const char* kPkiUsage = R"(usage:
   tdrctl pki init DIR [--name CA_NAME]
-  tdrctl pki issue DIR --role node|admin|server NAME [--dns HOST]... [--ip ADDR]...
+  tdrctl pki issue DIR --role node|admin|viewer|server NAME [--dns HOST]... [--ip ADDR]...
                    [--days N] [--out-key PATH] [--out-cert PATH]
+                   (--dns/--ip: server certs; the name or IP browsers and nodes use)
+  tdrctl pki p12 DIR NAME [--out FILE] [--password-file F]
+                   PKCS#12 (cert, key, CA) of DIR/NAME.{crt,key} for browser import.
+                   Password: first line of F, else a random one written to FILE.pass (0600).
   tdrctl pki show CERT
 )";
+
+// 0600, exclusive create.
+void write_secret_file(const fs::path& path, const std::string& data) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) throw std::runtime_error(std::format("cannot create {}: {}", path.string(), std::strerror(errno)));
+    (void)::fchmod(fd, 0600);
+    bool ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
+    ok = ::close(fd) == 0 && ok;
+    if (!ok) {
+        ::unlink(path.c_str());
+        throw std::runtime_error("cannot write " + path.string());
+    }
+}
+
+// 24 characters from a 64-symbol alphabet (144 bits).
+std::string random_password() {
+    static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::array<unsigned char, 24> bytes{};
+    if (RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) != 1) throw std::runtime_error("RAND_bytes failed");
+    std::string out;
+    for (auto b : bytes) out += kAlphabet[b & 63];
+    return out;
+}
 
 int pki(const std::vector<std::string>& in) {
     if (in.empty()) throw UsageError(std::string("pki needs a subcommand\n") + kPkiUsage);
@@ -142,7 +176,7 @@ int pki(const std::vector<std::string>& in) {
         auto a = parse(rest, {"--role", "--dns", "--ip", "--days", "--out-key", "--out-cert"});
         if (a.positional.size() != 2) throw UsageError(std::string("pki issue needs DIR and NAME\n") + kPkiUsage);
         auto role_s = a.get("--role");
-        if (!role_s) throw UsageError("pki issue needs --role node|admin|server");
+        if (!role_s) throw UsageError("pki issue needs --role node|admin|viewer|server");
         auto role = tdr::tls::parse_role(*role_s);
         if (!role) throw UsageError("unknown role '" + *role_s + "'");
         tdr::tls::IssueOptions o;
@@ -158,6 +192,36 @@ int pki(const std::vector<std::string>& in) {
         if (!r) throw std::runtime_error(r.error());
         std::cout << "issued " << *role_s << " certificate for " << o.name << ": " << crt.string() << ", "
                   << key.string() << "\n";
+        return 0;
+    }
+    if (sub == "p12") {
+        auto a = parse(rest, {"--out", "--password-file"});
+        if (a.positional.size() != 2) throw UsageError(std::string("pki p12 needs DIR and NAME\n") + kPkiUsage);
+        fs::path dir = a.positional[0];
+        const auto& name = a.positional[1];
+        fs::path out = a.get("--out").value_or((dir / (name + ".p12")).string());
+        std::string password;
+        std::optional<fs::path> pass_out;
+        if (auto pf = a.get("--password-file")) {
+            std::ifstream pin(*pf);
+            if (!pin) throw std::runtime_error("cannot read password file " + *pf);
+            std::getline(pin, password);
+            if (!password.empty() && password.back() == '\r') password.pop_back();
+            if (password.empty()) throw std::runtime_error("password file " + *pf + " has an empty first line");
+        } else {
+            password = random_password();
+            pass_out = fs::path(out.string() + ".pass");
+            if (fs::exists(*pass_out)) throw std::runtime_error("refusing to overwrite existing " + pass_out->string());
+        }
+        auto r = tdr::tls::export_pkcs12(dir / (name + ".crt"), dir / (name + ".key"), dir / "ca.crt", password, out);
+        if (!r) throw std::runtime_error(r.error());
+        std::cout << "wrote " << out.string() << " (cert, key and CA of " << name << ")\n";
+        if (pass_out) {
+            write_secret_file(*pass_out, password + "\n");
+            std::cout << "password: " << pass_out->string() << "\n";
+        }
+        std::cout << "import it as your certificate, and trust " << (dir / "ca.crt").string()
+                  << " as an authority in the browser\n";
         return 0;
     }
     if (sub == "show") {

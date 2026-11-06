@@ -9,6 +9,7 @@ Phase 5 (artifact infrastructure: peer transfer, placement, retention, `docs/des
 Phase 6 (workflow engine: DAGs, fan-out, checkpoints, ranked placement, `docs/design/phase6.md`) is done.
 Phase 7 (multi-node MPI: gang placement, reserve-and-drain, launch agent, `docs/design/phase7.md`) is done.
 Phase 8 (scientific integration: QE/phonopy/BoltzTraP2 thermoelectric workflow, materials database, `docs/design/phase8.md`) is implemented; the validation run is in progress.
+Phase 9 (web dashboard served by tdrcp, viewer role, `docs/design/phase9.md`) is implemented.
 
 ## Memory cap — mandatory
 
@@ -24,6 +25,7 @@ tools/gen_proto.sh                 # regenerate Python protobuf code
 tools/e2e.sh [pytest args]         # real tdrd + tdrctl + tdrcp end-to-end tests
 tools/pg.sh start|stop|psql|conninfo  # private dev Postgres in build/pg (no sudo)
 tools/sci-setup.sh                 # science venv packages + SSSP pseudopotentials + doctor
+tools/capped node --test 'control/ui/web/tests/*.test.js'  # dashboard JS unit tests
 tools/capped <any other command>
 ```
 
@@ -46,6 +48,7 @@ runtime/gang              GangService: cross-node MPI launch relay between peers
 runtime/launch            tdr-launch (head/agent/member/rank) + gang file and mpirun argv builders (Phase 7)
 runtime/daemon, ctl       tdrd and tdrctl executables
 control/db, api, server   tdrcp: Postgres repository, API handlers, executable
+control/ui                tdrcp web dashboard: embeds control/ui/web (plain ES modules, vendored uPlot) and serves /ui/ (Phase 9)
 sdk/python/fireforge/     Python worker SDK (tests in sdk/python/tests)
 docs/design/              design docs
 deploy/                   systemd unit, example config

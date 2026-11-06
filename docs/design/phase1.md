@@ -305,3 +305,13 @@ CAP_KILL (cgroup.kill works without it, the fallback killpg does not).
 `CapabilityBoundingSet=` the same. **Dev:** `sudo tools/setup-job-user.sh`
 creates the user and installs a capability-enabled copy of tdrd at
 `build/caps/tdrd` (re-run with `--caps-only` after rebuilding).
+- Phase 9: `tdr::tls::Role` gains `kViewer` (`OU=viewer`, clientAuth), a read-only client role
+  for the web dashboard. `to_string`/`parse_role` handle "viewer".
+- Phase 9: `tdr::http::Request` gains `headers` (lower-case names, repeats joined with ", ") and
+  `header(name)`; `tdr::http::Response` gains `headers` (extra response headers, set as given).
+- Phase 9: `tdr::tls::export_pkcs12(cert, key, ca, password, out)` writes a PKCS#12 bundle (AES-256-CBC
+  + PBKDF2 for key and certs, HMAC-SHA256 MAC, 0600, no overwrite) for `tdrctl pki p12`.
+- Phase 9: `HttpsServer` answers HEAD with the handler's headers and the Content-Length of the body it
+  built, without sending the body.
+- Phase 9: `tdr::cpapi::ControlApi::routes()` lists every registered (method, pattern), for the
+  table-driven role tests.

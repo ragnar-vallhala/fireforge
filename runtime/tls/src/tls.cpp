@@ -16,6 +16,7 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/pkcs12.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -249,6 +250,7 @@ const char* to_string(Role r) {
         case Role::kNode: return "node";
         case Role::kAdmin: return "admin";
         case Role::kServer: return "server";
+        case Role::kViewer: return "viewer";
     }
     return "node";
 }
@@ -257,6 +259,7 @@ std::optional<Role> parse_role(std::string_view s) {
     if (s == "node") return Role::kNode;
     if (s == "admin") return Role::kAdmin;
     if (s == "server") return Role::kServer;
+    if (s == "viewer") return Role::kViewer;
     return std::nullopt;
 }
 
@@ -388,6 +391,40 @@ std::expected<Identity, std::string> read_identity(const fs::path& cert_pem_path
     auto cert = load_cert(cert_pem_path);
     if (!cert) return std::unexpected(cert.error());
     return identity_of(cert->get());
+}
+
+std::expected<void, std::string> export_pkcs12(const fs::path& cert_pem_path, const fs::path& key_pem_path,
+                                               const fs::path& ca_pem_path, const std::string& password,
+                                               const fs::path& out) {
+    if (password.empty()) return std::unexpected("PKCS#12 password must not be empty");
+    auto cert = load_cert(cert_pem_path);
+    if (!cert) return std::unexpected(cert.error());
+    auto key = load_key(key_pem_path);
+    if (!key) return std::unexpected(key.error());
+    auto ca = load_cert(ca_pem_path);
+    if (!ca) return std::unexpected(ca.error());
+    if (X509_check_private_key(cert->get(), key->get()) != 1)
+        return std::unexpected(ossl_error(std::format("{} does not match {}", key_pem_path.string(), cert_pem_path.string())));
+    auto id = identity_of(cert->get());
+    if (!id) return std::unexpected(id.error());
+
+    struct StackFree {
+        void operator()(STACK_OF(X509) * sk) const { sk_X509_free(sk); }  // elements stay owned by `ca`
+    };
+    std::unique_ptr<STACK_OF(X509), StackFree> chain(sk_X509_new_null());
+    if (!chain || sk_X509_push(chain.get(), ca->get()) <= 0) return std::unexpected(ossl_error("cannot build CA chain"));
+    // mac_iter -1: no MAC here; PKCS12_set_mac adds an explicit HMAC-SHA256 below.
+    using P12Ptr = std::unique_ptr<PKCS12, Deleter<PKCS12_free>>;
+    P12Ptr p12(PKCS12_create(password.c_str(), id->name.c_str(), key->get(), cert->get(), chain.get(), NID_aes_256_cbc,
+                             NID_aes_256_cbc, PKCS12_DEFAULT_ITER, -1, 0));
+    if (!p12) return std::unexpected(ossl_error("PKCS12_create failed"));
+    if (PKCS12_set_mac(p12.get(), password.c_str(), -1, nullptr, 0, PKCS12_DEFAULT_ITER, EVP_sha256()) != 1)
+        return std::unexpected(ossl_error("PKCS12_set_mac failed"));
+    BioPtr bio(BIO_new(BIO_s_mem()));
+    if (!bio || i2d_PKCS12_bio(bio.get(), p12.get()) != 1) return std::unexpected(ossl_error("cannot encode PKCS#12"));
+    char* data = nullptr;
+    long n = BIO_get_mem_data(bio.get(), &data);
+    return write_new_file(out, std::string(data, static_cast<std::size_t>(n)), 0600);
 }
 
 std::shared_ptr<boost::asio::ssl::context> make_server_context(const Credentials& creds) {
