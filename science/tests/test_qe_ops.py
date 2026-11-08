@@ -49,6 +49,8 @@ def test_relax_scf_nscf_chain(relaxed_zrnisn):
         assert set(outs) == {"structure", "log", "energy"}
         relaxed = Structure.from_json(json.loads((d.output_dir / outs["structure"].path).read_text()))
         assert relaxed.parent_structure_id == "st-123" and relaxed.source == "qe.relax"
+        # toy relaxes spin-polarized (Ni present) and finds no moment: marked non-magnetic
+        assert relaxed.known_nonmagnetic
         assert relaxed.matches(relaxed_zrnisn)
         [rec] = d.records
         assert rec.kind == "qe.relax" and rec.structure.parent_structure_id == "st-123"
@@ -215,3 +217,25 @@ def test_save_archive_roundtrip(tmp_path):
     assert sorted(p.name for p in got.iterdir()) == ["charge-density.dat", "data-file-schema.xml"]
     stub = ops.pack_save(None, tmp_path / "toy", {"engine": "toy"})
     assert ops.unpack_save(stub, tmp_path / "out2") is None
+
+
+def test_spin_params_and_relax_without_spin():
+    s = halfheusler(a=6.0)
+    assert ops.spin_params({}, s) == {}
+    nonmag = s.copy(magmoms=[0.0] * s.nsites)
+    assert nonmag.known_nonmagnetic and not s.known_nonmagnetic
+    assert ops.spin_params({}, nonmag) == {"spin": "off"}
+    assert ops.spin_params({"spin": "auto"}, nonmag) == {"spin": "off"}
+    assert ops.spin_params({"spin": "on"}, nonmag) == {"spin": "on"}
+    assert not s.copy(magmoms=[0.0, 0.6, 0.0]).known_nonmagnetic
+    # zero magmoms survive the JSON round trip
+    assert Structure.from_json(json.loads(json.dumps(nonmag.to_json()))).known_nonmagnetic
+    # a non-spin-polarized relax says nothing about magnetism: no marker
+    d, proc = run("qe.relax", {"spin": "off"}, {"structure": sjson(s)})
+    try:
+        assert proc.returncode == 0, proc.stderr
+        out = next(o for o in d.result.outputs if o.name == "structure")
+        relaxed = Structure.from_json(json.loads((d.output_dir / out.path).read_text()))
+        assert not relaxed.magmoms
+    finally:
+        d.__exit__(None, None, None)

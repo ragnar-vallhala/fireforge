@@ -68,6 +68,14 @@ def _t_key(t: float) -> str:
     return f"kappa_l_w_mk_{t:g}k"
 
 
+def forces_spin(p: dict, s) -> dict:
+    """Spin setting for spawned qe.forces steps. Displaced supercells carry no magmoms, so a
+    non-magnetic parent structure is passed on as spin "off"."""
+    if p.get("spin") is not None:
+        return {"spin": p["spin"]}
+    return {"spin": "off"} if s.known_nonmagnetic else {}
+
+
 def _spawn_forces(ctx, label: str, cp: dict) -> None:
     from fireforge.workflow import StepInput
     name = f"supercell.{label}"
@@ -97,6 +105,7 @@ def phonon_harmonic(ctx):
     try:
         cp = common_params(p)
         s = load_structure(_input(ctx, "structure"))
+        cp.update(forces_spin(p, s))
         plan = build_plan(s, supercell=supercell_matrix(p.get("supercell")),
                           volume_strains=p.get("volume_strains", DEFAULT_STRAINS),
                           amplitude=float(p.get("amplitude", 0.01)),
@@ -180,6 +189,7 @@ def phonon_fc3(ctx):
     try:
         cp = common_params(p)
         s = load_structure(_input(ctx, "structure"))
+        cp.update(forces_spin(p, s))
         fc2_path = _input(ctx, "fc2")
         cutoff = p.get("cutoff_pair_a", 4.0)
         plan3 = build_plan3(s, load_fc2(fc2_path), supercell=supercell_matrix(p.get("supercell")),

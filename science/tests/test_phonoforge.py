@@ -355,3 +355,28 @@ def test_qe_forces_contract(tmp_path, harmonic):
     f = common.read_forces(p, "forces#2")
     assert f["label"] == spec.name and f["forces"].shape == (24, 3)
     assert f["provenance"]["engine"] == "toy"
+
+
+def test_harmonic_passes_spin_off_for_nonmagnetic(worker_script, stable_toy):
+    # qe.relax marks a structure without a moment by all-zero magmoms; displaced supercells
+    # carry no magmoms, so the spawned force steps get spin "off" as a parameter.
+    nonmag = stable_toy.copy(magmoms=[0.0] * stable_toy.nsites)
+    params = {"engine": "toy", "preset": "screening", "cpus": 1}
+    d = run(worker_script, "phonon.harmonic", params, [(json.dumps(nonmag.to_json()), "structure")])
+    forces = [s for s in d.spawned if s.job.operation == "qe.forces"]
+    assert forces and all(json.loads(s.job.parameters_json)["spin"] == "off" for s in forces)
+    # an explicit spin parameter wins
+    d = run(worker_script, "phonon.harmonic", {**params, "spin": "on"},
+            [(json.dumps(nonmag.to_json()), "structure")])
+    assert {json.loads(s.job.parameters_json)["spin"] for s in d.spawned
+            if s.job.operation == "qe.forces"} == {"on"}
+
+
+def test_forces_spin_helper(stable_toy):
+    from fireforge_science.phonoforge import forces_spin
+    assert forces_spin({}, stable_toy) == {}                       # unknown: auto downstream
+    nonmag = stable_toy.copy(magmoms=[0.0] * stable_toy.nsites)
+    assert forces_spin({}, nonmag) == {"spin": "off"}
+    assert forces_spin({"spin": "auto"}, nonmag) == {"spin": "auto"}
+    magnetic = stable_toy.copy(magmoms=[0.0, 1.0, 0.0])
+    assert forces_spin({}, magnetic) == {}

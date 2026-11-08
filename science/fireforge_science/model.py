@@ -125,6 +125,12 @@ class Structure:
         if abs(np.linalg.det(self.lattice_array)) < 1e-6:
             raise ValueError("singular lattice")
 
+    @property
+    def known_nonmagnetic(self) -> bool:
+        """True when magmoms are given and all zero: a spin-polarized calculation found no
+        moment (qe.relax sets this), so later calculations can skip spin polarization."""
+        return bool(self.magmoms) and all(abs(m) < 1e-9 for m in self.magmoms)
+
     # ---- numpy views ------------------------------------------------------------------
     @property
     def lattice_array(self) -> np.ndarray:

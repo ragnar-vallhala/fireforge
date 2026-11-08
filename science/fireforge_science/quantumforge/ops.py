@@ -210,9 +210,20 @@ def unpack_save(archive: Path, dest: Path) -> Path | None:
 # ---------------------------------------------------------------------------------------
 # operations
 
+# A spin-polarized relaxation that ends below this moment counts as non-magnetic.
+NONMAGNETIC_MUB_PER_ATOM = 0.01
+
+
+def spin_params(params: dict[str, Any], s: Structure) -> dict[str, Any]:
+    """params with spin "off" when it is auto and `s` is known non-magnetic."""
+    if params.get("spin", "auto") == "auto" and s.known_nonmagnetic:
+        return {**params, "spin": "off"}
+    return params
+
+
 def _common(ctx, input_name: str):
-    params = ctx.params
     s, sid = input_structure(ctx, input_name)
+    params = spin_params(ctx.params, s)
     ename, eng = make_engine(ctx, params)
     st = make_settings(params, s.elements, ename)
     return params, s, sid, ename, eng, st
@@ -227,6 +238,10 @@ def _relax(ctx):
     r = eng.relax(s, st, fix_cell=fix_cell, workdir=calc_dir(ctx, "relax"))
     out = r.structure.copy(parent_structure_id=sid or s.parent_structure_id,
                            source="qe.relax")
+    if st.spin_polarized(s.elements) and \
+            abs(r.magnetization_mub) / out.nsites < NONMAGNETIC_MUB_PER_ATOM:
+        # No moment survived: mark the structure so later steps skip spin polarization.
+        out = out.copy(magmoms=[0.0] * out.nsites)
     refs = [ctx.save_output("structure", (json.dumps(out.to_json(), indent=1) + "\n").encode(),
                             "application/json", "structure.json"),
             ctx.save_output("log", r.log, "text/plain", "relax.log")]
