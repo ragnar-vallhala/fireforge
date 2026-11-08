@@ -7,7 +7,7 @@
    "addresses": [
     {
      "type": "lan",
-     "address": "100.71.64.102",
+     "address": "192.0.2.10",
      "port": 7400
     }
    ],
@@ -57,7 +57,7 @@
     "addresses": [
      {
       "type": "lan",
-      "address": "100.71.64.102",
+      "address": "192.0.2.10",
       "port": 7400
      }
     ],

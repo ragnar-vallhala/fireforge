@@ -10,6 +10,7 @@ Phase 6 (workflow engine: DAGs, fan-out, checkpoints, ranked placement, `docs/de
 Phase 7 (multi-node MPI: gang placement, reserve-and-drain, launch agent, `docs/design/phase7.md`) is done.
 Phase 8 (scientific integration: QE/phonopy/BoltzTraP2 thermoelectric workflow, materials database, `docs/design/phase8.md`) is implemented; the validation run is in progress.
 Phase 9 (web dashboard served by tdrcp, viewer role, `docs/design/phase9.md`) is implemented.
+Phase 10 (alloys and doping) is the next stage; it is not designed yet, because the project goals are still under discussion (see Description.md §20).
 
 ## Memory cap — mandatory
 

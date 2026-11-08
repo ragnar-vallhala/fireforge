@@ -861,7 +861,15 @@ Security requirements:
 | 6 | Workflow engine | Distributed DAG execution |
 | 7 | Multi-node execution | Coordinated multi-node MPI allocation and launch |
 | 8 | Scientific integration | Complete thermoelectric workflow |
-| 9 | Discovery intelligence | Automated candidate discovery |
+| 9 | Web dashboard | Browser UI served by the control plane, viewer role |
+| 10 | Alloys and doping (next) | Solid solutions, e.g. (Zr,Hf)NiSn, and dopants: supercells or SQS, a cheaper screening tier, alloy and point-defect phonon scattering for κ_l, carrier concentration from dopant chemistry |
+| 11 | Discovery intelligence | Automated candidate discovery |
+
+Phase 10 rationale (2026-11-06): public databases (AFLOW, JARVIS, Materials Project) already
+cover every 18-electron XYZ composition in the Phase 8 campaign space, and the best measured
+half-Heuslers are alloyed and doped (Zr0.5Hf0.5NiSn0.998Sb0.002, zT 1.45 at 700 K, against 0.43 for
+pure ZrNiSn). The survey data is described in `build/datasets/README.md`. Goals are still to be
+agreed before the Phase 10 design.
 
 Designs: [Phase 1](docs/design/phase1.md), [Phase 2](docs/design/phase2.md), [Phase 3](docs/design/phase3.md), [Phase 4](docs/design/phase4.md), [Phase 5](docs/design/phase5.md), [Phase 6](docs/design/phase6.md), [Phase 7](docs/design/phase7.md), [Phase 8](docs/design/phase8.md), [Phase 9](docs/design/phase9.md).
 
@@ -977,3 +985,4 @@ The platform begins by integrating established scientific solvers and validating
 | 0.5 | 2026-11-06 | Multi-node MPI described (§11): gang placement with reserve-and-drain, launch agent; Phase 7 design linked. |
 | 0.6 | 2026-11-06 | Phase 8 design linked: thermoelectric workflow (QE, Phonopy/phono3py, BoltzTraP2), materials database, half-Heusler validation. |
 | 0.7 | 2026-11-06 | Phase 9 design linked: web dashboard served by the control plane, viewer certificate role. |
+| 0.8 | 2026-11-06 | Roadmap: Phase 9 row corrected to the dashboard; Phase 10 (alloys and doping) added as the next stage; discovery intelligence moved to Phase 11. |
